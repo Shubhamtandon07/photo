@@ -1,3 +1,5 @@
+python -m pip install pywin32
+
 # -*- coding: utf-8 -*-
 """
 Convert all .msg files in a folder to .txt files (1:1) using Outlook COM.
