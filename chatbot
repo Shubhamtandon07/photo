@@ -151,3 +151,17 @@ def convert_msg_folder(msg_folder: Path):
 
 if __name__ == "__main__":
     convert_msg_folder(Path(MSG_FOLDER))
+
+
+from pathlib import Path
+
+MSG_FOLDER = r"C:\Users\SHTANDO\Desktop\MSG_Test"  # <-- your folder
+p = Path(MSG_FOLDER)
+
+print("Folder exists:", p.exists())
+print("Folder path:", p.resolve())
+print("MSG count:", len(list(p.glob("*.msg"))))
+
+print("Files (first 30):")
+for f in list(p.iterdir())[:30]:
+    print(" -", f.name)
