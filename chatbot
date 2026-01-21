@@ -1,0 +1,151 @@
+# -*- coding: utf-8 -*-
+"""
+Convert all .msg files in a folder to .txt files (1:1) using Outlook COM.
+
+- Input:  a folder containing .msg files
+- Output: creates a subfolder "converted_text" with one .txt per .msg
+- Optional: saves attachments into "converted_attachments/<msgname>/"
+
+Requirements:
+- Windows + Microsoft Outlook installed
+- pip install pywin32
+"""
+
+import re
+import sys
+from pathlib import Path
+import win32com.client as win32
+
+
+# =========================
+# EDIT THESE
+# =========================
+MSG_FOLDER = r"C:\Users\SHTANDO\Desktop\MSG_Test"  # folder containing .msg files
+OUT_TEXT_SUBFOLDER = "converted_text"
+SAVE_ATTACHMENTS = True
+OUT_ATTACH_SUBFOLDER = "converted_attachments"
+# =========================
+
+
+def clean_filename(name: str, max_len: int = 140) -> str:
+    name = name or "no_subject"
+    name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:max_len] if len(name) > max_len else name
+
+
+def html_to_text(html: str) -> str:
+    # simple HTML cleanup, good enough for emails
+    if not html:
+        return ""
+    txt = re.sub(r"<(script|style).*?>.*?</\1>", " ", html, flags=re.S | re.I)
+    txt = re.sub(r"<br\s*/?>", "\n", txt, flags=re.I)
+    txt = re.sub(r"</p\s*>", "\n", txt, flags=re.I)
+    txt = re.sub(r"<[^>]+>", " ", txt, flags=re.S)
+    txt = re.sub(r"&nbsp;", " ", txt)
+    txt = re.sub(r"&amp;", "&", txt)
+    txt = re.sub(r"\r", "", txt)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    txt = re.sub(r"[ \t]{2,}", " ", txt)
+    return txt.strip()
+
+
+def save_attachments(mail_item, attach_root: Path, base_name: str) -> int:
+    """Save attachments into attach_root/<base_name>/"""
+    try:
+        atts = mail_item.Attachments
+        if atts.Count == 0:
+            return 0
+        target_dir = attach_root / base_name
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        saved = 0
+        for i in range(1, atts.Count + 1):
+            att = atts.Item(i)
+            fname = clean_filename(att.FileName or f"attachment_{i}")
+            out = target_dir / fname
+            # avoid overwrite
+            if out.exists():
+                out = target_dir / f"{out.stem}_{i}{out.suffix}"
+            att.SaveAsFile(str(out))
+            saved += 1
+        return saved
+    except Exception:
+        return 0
+
+
+def convert_msg_folder(msg_folder: Path):
+    if not msg_folder.exists() or not msg_folder.is_dir():
+        raise SystemExit(f"Folder not found: {msg_folder}")
+
+    out_text_dir = msg_folder / OUT_TEXT_SUBFOLDER
+    out_text_dir.mkdir(parents=True, exist_ok=True)
+
+    out_attach_dir = msg_folder / OUT_ATTACH_SUBFOLDER
+    if SAVE_ATTACHMENTS:
+        out_attach_dir.mkdir(parents=True, exist_ok=True)
+
+    # Start Outlook COM
+    outlook = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+    msg_files = sorted(msg_folder.glob("*.msg"))
+    if not msg_files:
+        print("No .msg files found in:", msg_folder)
+        return
+
+    print(f"Found {len(msg_files)} .msg files.")
+    converted = 0
+
+    for f in msg_files:
+        try:
+            mail = outlook.OpenSharedItem(str(f))  # opens .msg as a MailItem
+            subject = getattr(mail, "Subject", "") or f.stem
+            sender = getattr(mail, "SenderName", "") or ""
+            sender_email = ""
+            try:
+                sender_email = getattr(mail, "SenderEmailAddress", "") or ""
+            except Exception:
+                pass
+            received = ""
+            try:
+                received = str(getattr(mail, "ReceivedTime", "") or "")
+            except Exception:
+                pass
+
+            # Prefer plain Body; fallback to HTMLBody -> text
+            body_plain = getattr(mail, "Body", "") or ""
+            if not body_plain.strip():
+                body_plain = html_to_text(getattr(mail, "HTMLBody", "") or "")
+
+            base_name = clean_filename(f.stem)
+            out_txt = out_text_dir / f"{base_name}.txt"
+
+            content = (
+                f"FILE: {f.name}\n"
+                f"SUBJECT: {subject}\n"
+                f"FROM: {sender} {('<'+sender_email+'>') if sender_email else ''}\n"
+                f"RECEIVED: {received}\n"
+                f"\n--- BODY ---\n"
+                f"{body_plain}\n"
+            )
+
+            out_txt.write_text(content, encoding="utf-8", errors="ignore")
+
+            att_saved = 0
+            if SAVE_ATTACHMENTS:
+                att_saved = save_attachments(mail, out_attach_dir, base_name)
+
+            converted += 1
+            print(f"[OK] {f.name} -> {out_txt.name} (attachments saved: {att_saved})")
+
+        except Exception as e:
+            print(f"[FAIL] {f.name} -> {e}")
+
+    print(f"\nDone. Converted: {converted}/{len(msg_files)}")
+    print("Text output folder:", out_text_dir)
+    if SAVE_ATTACHMENTS:
+        print("Attachments folder:", out_attach_dir)
+
+
+if __name__ == "__main__":
+    convert_msg_folder(Path(MSG_FOLDER))
