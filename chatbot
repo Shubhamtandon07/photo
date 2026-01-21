@@ -1,33 +1,12 @@
-python -m pip install pywin32
-
 # -*- coding: utf-8 -*-
-"""
-Convert all .msg files in a folder to .txt files (1:1) using Outlook COM.
-
-- Input:  a folder containing .msg files
-- Output: creates a subfolder "converted_text" with one .txt per .msg
-- Optional: saves attachments into "converted_attachments/<msgname>/"
-
-Requirements:
-- Windows + Microsoft Outlook installed
-- pip install pywin32
-"""
-
 import re
-import sys
 from pathlib import Path
 import win32com.client as win32
 
-
-# =========================
-# EDIT THESE
-# =========================
-MSG_FOLDER = r"C:\Users\SHTANDO\Desktop\MSG_Test"  # folder containing .msg files
+# ===== EDIT =====
+MSG_FOLDER = r"C:\Users\SHTANDO\Desktop\MSG_Test"
 OUT_TEXT_SUBFOLDER = "converted_text"
-SAVE_ATTACHMENTS = True
-OUT_ATTACH_SUBFOLDER = "converted_attachments"
-# =========================
-
+# ===============
 
 def clean_filename(name: str, max_len: int = 140) -> str:
     name = name or "no_subject"
@@ -35,133 +14,72 @@ def clean_filename(name: str, max_len: int = 140) -> str:
     name = re.sub(r"\s+", " ", name).strip()
     return name[:max_len] if len(name) > max_len else name
 
+def main():
+    msg_folder = Path(MSG_FOLDER)
+    print("MSG_FOLDER =", MSG_FOLDER)
+    print("Resolved  =", msg_folder.resolve())
+    print("Exists    =", msg_folder.exists(), "Is dir =", msg_folder.is_dir())
 
-def html_to_text(html: str) -> str:
-    # simple HTML cleanup, good enough for emails
-    if not html:
-        return ""
-    txt = re.sub(r"<(script|style).*?>.*?</\1>", " ", html, flags=re.S | re.I)
-    txt = re.sub(r"<br\s*/?>", "\n", txt, flags=re.I)
-    txt = re.sub(r"</p\s*>", "\n", txt, flags=re.I)
-    txt = re.sub(r"<[^>]+>", " ", txt, flags=re.S)
-    txt = re.sub(r"&nbsp;", " ", txt)
-    txt = re.sub(r"&amp;", "&", txt)
-    txt = re.sub(r"\r", "", txt)
-    txt = re.sub(r"\n{3,}", "\n\n", txt)
-    txt = re.sub(r"[ \t]{2,}", " ", txt)
-    return txt.strip()
-
-
-def save_attachments(mail_item, attach_root: Path, base_name: str) -> int:
-    """Save attachments into attach_root/<base_name>/"""
-    try:
-        atts = mail_item.Attachments
-        if atts.Count == 0:
-            return 0
-        target_dir = attach_root / base_name
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        saved = 0
-        for i in range(1, atts.Count + 1):
-            att = atts.Item(i)
-            fname = clean_filename(att.FileName or f"attachment_{i}")
-            out = target_dir / fname
-            # avoid overwrite
-            if out.exists():
-                out = target_dir / f"{out.stem}_{i}{out.suffix}"
-            att.SaveAsFile(str(out))
-            saved += 1
-        return saved
-    except Exception:
-        return 0
-
-
-def convert_msg_folder(msg_folder: Path):
-    if not msg_folder.exists() or not msg_folder.is_dir():
-        raise SystemExit(f"Folder not found: {msg_folder}")
+    msg_files = sorted(msg_folder.glob("*.msg"))
+    print("Found .msg:", len(msg_files))
+    if msg_files:
+        print("First 3:", [f.name for f in msg_files[:3]])
 
     out_text_dir = msg_folder / OUT_TEXT_SUBFOLDER
     out_text_dir.mkdir(parents=True, exist_ok=True)
-
-    out_attach_dir = msg_folder / OUT_ATTACH_SUBFOLDER
-    if SAVE_ATTACHMENTS:
-        out_attach_dir.mkdir(parents=True, exist_ok=True)
+    print("Output dir:", out_text_dir.resolve())
 
     # Start Outlook COM
-    outlook = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    print("Starting Outlook COM…")
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    print("Outlook COM OK.")
 
-    msg_files = sorted(msg_folder.glob("*.msg"))
-    if not msg_files:
-        print("No .msg files found in:", msg_folder)
-        return
-
-    print(f"Found {len(msg_files)} .msg files.")
     converted = 0
+    failed = 0
 
-    for f in msg_files:
+    for i, f in enumerate(msg_files, start=1):
         try:
-            mail = outlook.OpenSharedItem(str(f))  # opens .msg as a MailItem
-            subject = getattr(mail, "Subject", "") or f.stem
-            sender = getattr(mail, "SenderName", "") or ""
-            sender_email = ""
-            try:
-                sender_email = getattr(mail, "SenderEmailAddress", "") or ""
-            except Exception:
-                pass
-            received = ""
-            try:
-                received = str(getattr(mail, "ReceivedTime", "") or "")
-            except Exception:
-                pass
+            print(f"[{i}/{len(msg_files)}] Opening:", f.name)
+            item = ns.OpenSharedItem(str(f))
 
-            # Prefer plain Body; fallback to HTMLBody -> text
-            body_plain = getattr(mail, "Body", "") or ""
-            if not body_plain.strip():
-                body_plain = html_to_text(getattr(mail, "HTMLBody", "") or "")
+            # Basic inspection
+            cls = getattr(item, "Class", None)
+            msg_class = getattr(item, "MessageClass", "")
+            subj = getattr(item, "Subject", "") or f.stem
+
+            print("    Class =", cls, "| MessageClass =", msg_class, "| Subject =", subj[:60])
+
+            # Extract body
+            body = getattr(item, "Body", "") or ""
+            if not body.strip():
+                html = getattr(item, "HTMLBody", "") or ""
+                body = re.sub(r"<[^>]+>", " ", html)
+                body = re.sub(r"\s+", " ", body).strip()
 
             base_name = clean_filename(f.stem)
             out_txt = out_text_dir / f"{base_name}.txt"
 
             content = (
                 f"FILE: {f.name}\n"
-                f"SUBJECT: {subject}\n"
-                f"FROM: {sender} {('<'+sender_email+'>') if sender_email else ''}\n"
-                f"RECEIVED: {received}\n"
+                f"SUBJECT: {subj}\n"
+                f"MESSAGECLASS: {msg_class}\n"
                 f"\n--- BODY ---\n"
-                f"{body_plain}\n"
+                f"{body}\n"
             )
 
             out_txt.write_text(content, encoding="utf-8", errors="ignore")
-
-            att_saved = 0
-            if SAVE_ATTACHMENTS:
-                att_saved = save_attachments(mail, out_attach_dir, base_name)
+            print("    Wrote:", out_txt.name)
 
             converted += 1
-            print(f"[OK] {f.name} -> {out_txt.name} (attachments saved: {att_saved})")
 
         except Exception as e:
-            print(f"[FAIL] {f.name} -> {e}")
+            failed += 1
+            print("    FAIL:", f.name, "|", repr(e))
 
-    print(f"\nDone. Converted: {converted}/{len(msg_files)}")
-    print("Text output folder:", out_text_dir)
-    if SAVE_ATTACHMENTS:
-        print("Attachments folder:", out_attach_dir)
-
+    print("\nDone.")
+    print("Converted:", converted)
+    print("Failed   :", failed)
+    print("Check output folder:", out_text_dir.resolve())
 
 if __name__ == "__main__":
-    convert_msg_folder(Path(MSG_FOLDER))
-
-
-from pathlib import Path
-
-MSG_FOLDER = r"C:\Users\SHTANDO\Desktop\MSG_Test"  # <-- your folder
-p = Path(MSG_FOLDER)
-
-print("Folder exists:", p.exists())
-print("Folder path:", p.resolve())
-print("MSG count:", len(list(p.glob("*.msg"))))
-
-print("Files (first 30):")
-for f in list(p.iterdir())[:30]:
-    print(" -", f.name)
+    main()
