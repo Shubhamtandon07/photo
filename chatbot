@@ -695,3 +695,134 @@ Collecting spacy<3.8.0,>=3.7.0 (from en-core-web-sm==3.7.0)
   
   note: This error originates from a subprocess, and is likely not a problem with pip.
 ERROR: Failed to build 'spacy' when installing build dependencies for spacy
+
+
+
+cell with the main code
+C:\Users\SHTANDO\AppData\Roaming\Python\Python314\site-packages\confection\__init__.py:38: UserWarning: Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.
+  from pydantic.v1 import BaseModel, Extra, ValidationError, create_model
+---------------------------------------------------------------------------
+ConfigError                               Traceback (most recent call last)
+Cell In[4], line 33
+     30 from pypdf import PdfReader
+     31 from dotenv import load_dotenv
+---> 33 import spacy
+     34 import de_core_news_sm
+     35 import en_core_web_sm
+
+File ~\AppData\Roaming\Python\Python314\site-packages\spacy\__init__.py:13
+     10 # These are imported as part of the API
+     11 from thinc.api import Config, prefer_gpu, require_cpu, require_gpu  # noqa: F401
+---> 13 from . import pipeline  # noqa: F401
+     14 from . import util
+     15 from .about import __version__  # noqa: F401
+
+File ~\AppData\Roaming\Python\Python314\site-packages\spacy\pipeline\__init__.py:1
+----> 1 from .attributeruler import AttributeRuler
+      2 from .dep_parser import DependencyParser
+      3 from .edit_tree_lemmatizer import EditTreeLemmatizer
+
+File ~\AppData\Roaming\Python\Python314\site-packages\spacy\pipeline\attributeruler.py:10
+      8 from .. import util
+      9 from ..errors import Errors
+---> 10 from ..language import Language
+     11 from ..matcher import Matcher
+     12 from ..scorer import Scorer
+
+File ~\AppData\Roaming\Python\Python314\site-packages\spacy\language.py:46
+     44 from .lang.tokenizer_exceptions import BASE_EXCEPTIONS, URL_MATCH
+     45 from .lookups import load_lookups
+---> 46 from .pipe_analysis import analyze_pipes, print_pipe_analysis, validate_attrs
+     47 from .schemas import (
+     48     ConfigSchema,
+     49     ConfigSchemaInit,
+   (...)     52     validate_init_settings,
+     53 )
+     54 from .scorer import Scorer
+
+File ~\AppData\Roaming\Python\Python314\site-packages\spacy\pipe_analysis.py:6
+      3 from wasabi import msg
+      5 from .errors import Errors
+----> 6 from .tokens import Doc, Span, Token
+      7 from .util import dot_to_dict
+      9 if TYPE_CHECKING:
+     10     # This lets us add type hints for mypy etc. without causing circular imports
+
+File ~\AppData\Roaming\Python\Python314\site-packages\spacy\tokens\__init__.py:1
+----> 1 from ._serialize import DocBin
+      2 from .doc import Doc
+      3 from .morphanalysis import MorphAnalysis
+
+File ~\AppData\Roaming\Python\Python314\site-packages\spacy\tokens\_serialize.py:14
+     12 from ..errors import Errors
+     13 from ..util import SimpleFrozenList, ensure_path
+---> 14 from ..vocab import Vocab
+     15 from ._dict_proxies import SpanGroups
+     16 from .doc import DOCBIN_ALL_ATTRS as ALL_ATTRS
+
+File ~\AppData\Roaming\Python\Python314\site-packages\spacy\vocab.pyx:1, in init spacy.vocab()
+
+File ~\AppData\Roaming\Python\Python314\site-packages\spacy\tokens\doc.pyx:49, in init spacy.tokens.doc()
+
+File ~\AppData\Roaming\Python\Python314\site-packages\spacy\schemas.py:195
+    191         obj = converted
+    192     return validate(TokenPatternSchema, {"pattern": obj})
+--> 195 class TokenPatternString(BaseModel):
+    196     REGEX: Optional[Union[StrictStr, "TokenPatternString"]] = Field(None, alias="regex")
+    197     IN: Optional[List[StrictStr]] = Field(None, alias="in")
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\pydantic\v1\main.py:221, in ModelMetaclass.__new__(mcs, name, bases, namespace, **kwargs)
+    219 elif is_valid_field(var_name) and var_name not in annotations and can_be_changed:
+    220     validate_field_name(bases, var_name)
+--> 221     inferred = ModelField.infer(
+    222         name=var_name,
+    223         value=value,
+    224         annotation=annotations.get(var_name, Undefined),
+    225         class_validators=vg.get_validators(var_name),
+    226         config=config,
+    227     )
+    228     if var_name in fields:
+    229         if lenient_issubclass(inferred.type_, fields[var_name].type_):
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\pydantic\v1\fields.py:504, in ModelField.infer(cls, name, value, annotation, class_validators, config)
+    501     required = False
+    502 annotation = get_annotation_from_field_info(annotation, field_info, name, config.validate_assignment)
+--> 504 return cls(
+    505     name=name,
+    506     type_=annotation,
+    507     alias=field_info.alias,
+    508     class_validators=class_validators,
+    509     default=value,
+    510     default_factory=field_info.default_factory,
+    511     required=required,
+    512     model_config=config,
+    513     field_info=field_info,
+    514 )
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\pydantic\v1\fields.py:434, in ModelField.__init__(self, name, type_, class_validators, model_config, default, default_factory, required, final, alias, field_info)
+    432 self.shape: int = SHAPE_SINGLETON
+    433 self.model_config.prepare_field(self)
+--> 434 self.prepare()
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\pydantic\v1\fields.py:544, in ModelField.prepare(self)
+    537 def prepare(self) -> None:
+    538     """
+    539     Prepare the field but inspecting self.default, self.type_ etc.
+    540 
+    541     Note: this method is **not** idempotent (because _type_analysis is not idempotent),
+    542     e.g. calling it it multiple times may modify the field and configure it incorrectly.
+    543     """
+--> 544     self._set_default_and_type()
+    545     if self.type_.__class__ is ForwardRef or self.type_.__class__ is DeferredType:
+    546         # self.type_ is currently a ForwardRef and there's nothing we can do now,
+    547         # user will need to call model.update_forward_refs()
+    548         return
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\pydantic\v1\fields.py:576, in ModelField._set_default_and_type(self)
+    573     self.annotation = self.type_
+    575 if self.type_ is Undefined:
+--> 576     raise errors_.ConfigError(f'unable to infer type for attribute "{self.name}"')
+    578 if self.required is False and default_value is None:
+    579     self.allow_none = True
+
+ConfigError: unable to infer type for attribute "REGEX"
