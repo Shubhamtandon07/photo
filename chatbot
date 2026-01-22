@@ -1,10 +1,2 @@
----------------------------------------------------------------------------
-ModuleNotFoundError                       Traceback (most recent call last)
-Cell In[3], line 24
-     21 from pathlib import Path
-     22 from typing import List, Tuple, Optional, Dict
----> 24 import win32com.client as win32
-     25 from openai import AzureOpenAI
-     26 from docx import Document as DocxDocument
-
-ModuleNotFoundError: No module named 'win32com'
+python -m pip install --upgrade pip
+python -m pip install pywin32 openai python-docx pypdf python-dotenv spacy
