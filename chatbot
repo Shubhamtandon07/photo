@@ -1,3 +1,10 @@
+python -m pip install --user spacy
+python -m pip install --user "spacy[transformers]"
+python -m pip install --user https://github.com/explosion/spacy-models/releases/download/de_core_news_sm-3.7.0/de_core_news_sm-3.7.0-py3-none-any.whl
+python -m pip install --user https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.0/en_core_web_sm-3.7.0-py3-none-any.whl
+
+
+
 # -*- coding: utf-8 -*-
 """
 Outlook -> Azure OpenAI (genai-nexus) -> Draft reply (RUN ONCE) + Self notification
