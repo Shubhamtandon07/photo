@@ -1,27 +1,190 @@
----------------------------------------------------------------------------
-FileNotFoundError                         Traceback (most recent call last)
-Cell In[1], line 169
-    165     print("Done. Output folder:", out_dir)
-    168 if __name__ == "__main__":
---> 169     main()
+# -*- coding: utf-8 -*-
+"""
+Highlight sensitive patterns in .txt files and export as colored HTML.
 
-Cell In[1], line 162, in main()
-    159     html = apply_highlights(txt)
-    161     out_path = out_dir / (f.stem + ".html")
---> 162     out_path.write_text(html, encoding="utf-8")
-    163     print("Wrote:", out_path)
-    165 print("Done. Output folder:", out_dir)
+Fixes:
+- Safe output filenames (short + hash) to avoid Windows path/filename limits
+Adds:
+- Highlight for titles + names: Mr/Mrs/Ms/Dr/Herr/Frau + First Last
+"""
 
-File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py:814, in Path.write_text(self, data, encoding, errors, newline)
-    811 if not isinstance(data, str):
-    812     raise TypeError('data must be str, not %s' %
-    813                     data.__class__.__name__)
---> 814 with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:
-    815     return f.write(data)
+import re
+import hashlib
+from pathlib import Path
+from html import escape
 
-File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py:776, in Path.open(self, mode, buffering, encoding, errors, newline)
-    774 if "b" not in mode:
-    775     encoding = io.text_encoding(encoding)
---> 776 return io.open(self, mode, buffering, encoding, errors, newline)
+# =========================
+# EDIT THESE
+# =========================
+TXT_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails\converted_text"
+OUT_SUBFOLDER = "highlighted_html"
 
-FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails\\converted_text\\highlighted_html\\AW_ proQ Notification_ Round has been published by for 2-9058 - Portal ID_ xTAaeyo - Supplier ID_ 11500022.html'
+HIGHLIGHT_NAMES = True          # enable name highlighting
+HIGHLIGHT_TITLES = True         # highlight Mr/Mrs/Herr/Frau patterns
+# =========================
+
+# ---- Patterns ----
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+
+PHONE_RE = re.compile(
+    r"(?<!\w)(?:\+?\d{1,3}[\s\-\/]?)?(?:\(?\d{2,5}\)?[\s\-\/]?)?\d{3,4}[\s\-\/]?\d{3,4}(?!\w)"
+)
+
+ADDRESS_RE = re.compile(
+    r"\b([A-ZÄÖÜ][a-zäöüß]+(?:\s[A-ZÄÖÜ][a-zäöüß]+){0,3})\s"
+    r"(Straße|Strasse|Str\.|Weg|Allee|Platz|Ring|Gasse|Damm|Ufer)\s"
+    r"\d{1,5}[a-zA-Z]?\b"
+)
+
+NUMBER_RE = re.compile(r"\b\d+(?:[.,]\d+)?\b")
+
+# Heuristic person name: Firstname Lastname (can miss names / false positives)
+NAME_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{1,}\s[A-ZÄÖÜ][a-zäöüß]{1,}\b")
+
+# Titles + name: Mr John Smith, Mrs. Jane Doe, Herr Max Mustermann, Frau Erika Mustermann
+TITLE_NAME_RE = re.compile(
+    r"\b(?:Mr|Mrs|Ms|Miss|Dr|Prof|Herr|Frau)\.?\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b"
+)
+
+# Optional: “First Last (Company)” etc. You can extend later.
+
+
+def safe_output_name(source_txt_path: Path) -> str:
+    """
+    Create a safe, short filename derived from the original, avoiding:
+    - Windows invalid characters
+    - Overly long filenames/paths
+    """
+    raw = source_txt_path.stem
+    # Keep only safe-ish characters
+    cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    # Hash ensures uniqueness even after truncation
+    h = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:8]
+
+    # Truncate aggressively to avoid path issues
+    cleaned = cleaned[:60] if len(cleaned) > 60 else cleaned
+    if not cleaned:
+        cleaned = "file"
+
+    return f"{cleaned}__{h}.html"
+
+
+def apply_highlights(text: str) -> str:
+    """
+    Convert plain text to HTML with colored spans.
+    We collect spans, sort, drop overlaps, then render.
+    """
+    original = text
+    hits = []
+
+    def mark(regex, label):
+        for m in regex.finditer(original):
+            hits.append((m.start(), m.end(), label))
+
+    # Order: more specific first
+    mark(EMAIL_RE, "email")
+    mark(PHONE_RE, "phone")
+    mark(ADDRESS_RE, "address")
+
+    if HIGHLIGHT_TITLES:
+        mark(TITLE_NAME_RE, "title_name")
+    if HIGHLIGHT_NAMES:
+        mark(NAME_RE, "name")
+
+    mark(NUMBER_RE, "number")
+
+    # Sort spans by start, prefer longer if same start
+    hits.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+
+    # Remove overlaps
+    merged = []
+    last_end = -1
+    for s, e, label in hits:
+        if s < last_end:
+            continue
+        merged.append((s, e, label))
+        last_end = e
+
+    color = {
+        "email": "#fff59d",       # yellow
+        "phone": "#c8e6c9",       # green
+        "address": "#bbdefb",     # blue
+        "title_name": "#ffccbc",  # orange-ish
+        "name": "#f8bbd0",        # pink
+        "number": "#eeeeee",      # gray
+    }
+
+    parts = []
+    cur = 0
+    for s, e, label in merged:
+        parts.append(escape(original[cur:s]))
+        parts.append(
+            f'<span style="background:{color.get(label,"#ffffcc")}; padding:0 2px; border-radius:3px;">'
+            f'{escape(original[s:e])}</span>'
+        )
+        cur = e
+    parts.append(escape(original[cur:]))
+
+    body_html = "".join(parts).replace("\n", "<br>\n")
+
+    legend_bits = [
+        ('Email', color["email"]),
+        ('Phone', color["phone"]),
+        ('Address', color["address"]),
+        ('Title+Name', color["title_name"]) if HIGHLIGHT_TITLES else None,
+        ('Name', color["name"]) if HIGHLIGHT_NAMES else None,
+        ('Number', color["number"]),
+    ]
+    legend_bits = [b for b in legend_bits if b is not None]
+
+    legend = '<div style="font-family:Segoe UI,Arial; font-size:13px; margin-bottom:12px;"><b>Legend:</b> '
+    for label, c in legend_bits:
+        legend += f'<span style="background:{c};padding:2px 6px;border-radius:3px;margin-left:6px;">{label}</span>'
+    legend += "</div>"
+
+    return f"""<html>
+<head><meta charset="utf-8"><title>Highlighted Text</title></head>
+<body style="font-family:Segoe UI,Arial; font-size:13px; line-height:1.35; padding:16px;">
+{legend}
+<div>{body_html}</div>
+</body>
+</html>"""
+
+
+def main():
+    base = Path(TXT_DIR)
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"TXT_DIR not found or not a folder: {TXT_DIR}")
+
+    out_dir = base / OUT_SUBFOLDER
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    txt_files = sorted(base.glob("*.txt"))
+    print("Found .txt files:", len(txt_files))
+    if not txt_files:
+        print("No .txt files in folder.")
+        return
+
+    written = 0
+    for f in txt_files:
+        try:
+            txt = f.read_text(encoding="utf-8", errors="ignore")
+            html = apply_highlights(txt)
+
+            out_name = safe_output_name(f)
+            out_path = out_dir / out_name
+
+            out_path.write_text(html, encoding="utf-8")
+            written += 1
+
+        except Exception as e:
+            print("FAIL:", f.name, "-", e)
+
+    print("Done. Written:", written, "HTML files")
+    print("Output folder:", out_dir.resolve())
+
+
+if __name__ == "__main__":
+    main()
