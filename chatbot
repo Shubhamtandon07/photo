@@ -1,660 +1,697 @@
-# -*- coding: utf-8 -*-
-"""
-Outlook -> Azure OpenAI (genai-nexus) -> Draft reply (RUN ONCE)
-with:
-- Local spaCy NER redaction (DE+EN)
-- No filename leakage to the model (only KB-IDs)
-- Traceability via local CSV logs (KB-ID -> file + used IDs per drafted mail)
-- Special DOCX table parser for "2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx"
-
-REQUIREMENTS (you said installed):
-- spacy
-- de_core_news_sm
-- en_core_web_sm
-- python-docx
-- pypdf
-- pywin32
-- openai (AzureOpenAI)
-"""
-
-import os
-import re
-import csv
-import time
-from pathlib import Path
-from typing import List, Tuple, Optional, Dict
-
-import win32com.client as win32
-from openai import AzureOpenAI
-from docx import Document as DocxDocument
-from pypdf import PdfReader
-from dotenv import load_dotenv
-
-import spacy
-import de_core_news_sm
-import en_core_web_sm
-
-load_dotenv()
-
-# =========================
-# EDIT THESE
-# =========================
-TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"  # substring match to Outlook store DisplayName
-WATCH_FOLDER_NAME = "Inbox"                          # "Inbox" or subfolder under Inbox
-
-KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
-
-SUBJECT_TOKEN = "[bot]"     # set "" to disable gating by subject
-REQUIRE_UNREAD = True
-AUTO_SEND = False           # keep False: Draft only
-PROCESS_PER_RUN = 3
-SCAN_LIMIT = 200
-STARTUP_DELAY_SEC = 3
-
-# Optional: allow-list senders. Keep empty to allow anyone.
-ALLOWED_SENDERS = set()     # e.g. {"person.a@...", "person.b@..."}
-
-# Azure OpenAI (corporate) settings
-AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net/apikey/"
-AZURE_API_VERSION = "2024-06-01"
-AZURE_DEPLOYMENT_NAME = "gpt-4o"  # your org deployment name
-
-# Traceability logs (local)
-LOG_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Logs"
-KB_CATALOG_CSV = "kb_catalog.csv"     # mapping KB-ID -> filename
-RUN_LOG_CSV = "draft_log.csv"         # per processed email: subject, sender, used KB-IDs, timestamp
-
-# Optional self-notification
-SELF_NOTIFY = True
-SELF_NOTIFY_TO = TARGET_MAILBOX
-# =========================
-
-PROCESSED_CATEGORY = "AI-Drafted"
-SUPPORTED_EXTS = {".txt", ".docx", ".pdf"}
-
-MAX_FILES = 6
-MAX_CHARS_PER_FILE = 4500
-MAX_TOTAL_CHARS = 12000
-
-SPECIAL_QA_DOC_NAME = "2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx"
-
-# -------------------------
-# spaCy models (local)
-# -------------------------
-NLP_DE = de_core_news_sm.load()
-NLP_EN = en_core_news_sm.load()
-
-# What to remove by NER (tuneable)
-NER_REMOVE_LABELS = {"PERSON", "ORG", "GPE", "LOC", "FAC"}
-
-# -------------------------
-# Non-NER sensitive patterns
-# -------------------------
-RE_EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-RE_URL = re.compile(r"\bhttps?://[^\s<>()]+\b|\bwww\.[^\s<>()]+\b", re.IGNORECASE)
-RE_PHONE = re.compile(r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d")
-RE_IDLIKE = re.compile(r"\b(?:PO|PR|NCR|Ticket|Case|Req|Request|Material|Part)\s*[:#]?\s*[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b", re.IGNORECASE)
-RE_MONEY = re.compile(r"(?i)\b(?:EUR|USD|GBP|CHF)\s*\d[\d\.\,\s]*\b|\b\d[\d\.\,\s]*\s*(?:€|EUR|USD|GBP|CHF)\b|\b€\s*\d[\d\.\,\s]*\b")
-
-# Optional company terms: remove these *exact strings* (not tokens)
-COMPANY_TERMS = [
-    "Mercedes-Benz",
-    "Mercedes Benz",
-    "Daimler",
-    "corpinter",
-]
-
-# -------------------------
-# Utility: whitespace cleanup
-# -------------------------
-def clean_ws(s: str) -> str:
-    s = re.sub(r"\s+", " ", s or "").strip()
-    s = re.sub(r"\s+([,.;:])", r"\1", s)
-    s = re.sub(r"([,.;:]){2,}", r"\1", s)
-    s = re.sub(r"\(\s*\)", "", s)
-    return s.strip()
-
-# -------------------------
-# NER redaction (remove spans, not replace with tokens)
-# -------------------------
-def _remove_spans(text: str, spans: List[Tuple[int, int]]) -> str:
-    """Remove spans (start,end) from text, merge remaining parts."""
-    if not spans:
-        return text
-    spans = sorted(spans, key=lambda x: x[0])
-    out = []
-    last = 0
-    for s, e in spans:
-        if s < last:
-            continue
-        out.append(text[last:s])
-        last = e
-    out.append(text[last:])
-    return "".join(out)
-
-def redact_with_spacy(text: str) -> str:
-    """
-    Remove PERSON/ORG/etc using both DE+EN models.
-    Removes the detected entity strings entirely.
-    """
-    if not text:
-        return ""
-
-    spans: List[Tuple[int, int]] = []
-
-    # Run both pipelines; take union of spans
-    for nlp in (NLP_DE, NLP_EN):
-        doc = nlp(text)
-        for ent in doc.ents:
-            if ent.label_ in NER_REMOVE_LABELS:
-                # Avoid removing 1-2 letter "entities" to reduce damage
-                if len(ent.text.strip()) >= 3:
-                    spans.append((ent.start_char, ent.end_char))
-
-    redacted = _remove_spans(text, spans)
-    return redacted
-
-def redact_patterns(text: str) -> str:
-    """Remove obvious sensitive patterns and money/IDs."""
-    if not text:
-        return ""
-    t = text
-
-    # remove company terms (exact-ish)
-    for term in COMPANY_TERMS:
-        if term:
-            t = re.sub(re.escape(term), "", t, flags=re.IGNORECASE)
-
-    t = RE_EMAIL.sub("", t)
-    t = RE_URL.sub("", t)
-    t = RE_PHONE.sub("", t)
-    t = RE_IDLIKE.sub("the relevant reference", t)
-    t = RE_MONEY.sub("an amount", t)
-
-    return t
-
-def redact_sensitive(text: str) -> str:
-    """
-    Full local redaction: patterns first (reduces NER load), then NER,
-    then cleanup.
-    """
-    if not text:
-        return ""
-    t = redact_patterns(text)
-    t = redact_with_spacy(t)
-    t = clean_ws(t)
-    return t
-
-# -------------------------
-# Azure OpenAI client
-# -------------------------
-def build_azure_client() -> AzureOpenAI:
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        raise SystemExit("OPENAI_API_KEY env var missing (corporate Azure key).")
-    return AzureOpenAI(
-        api_version=AZURE_API_VERSION,
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        api_key=key,
-    )
-
-# -------------------------
-# KB file readers
-# -------------------------
-def read_txt(p: Path) -> str:
-    return p.read_text(encoding="utf-8", errors="ignore")
-
-def extract_docx_tables_as_text(doc: DocxDocument) -> str:
-    out = []
-    for table in doc.tables:
-        for row in table.rows:
-            cells = [clean_ws(c.text) for c in row.cells]
-            if any(cells):
-                out.append(" | ".join(cells))
-    return "\n".join(out)
-
-def find_col_index(headers: List[str], target: str) -> Optional[int]:
-    target_norm = re.sub(r"\s+", "", target).lower()
-    for i, h in enumerate(headers):
-        hn = re.sub(r"\s+", "", (h or "")).lower()
-        if hn == target_norm:
-            return i
-    return None
-
-def read_special_qa_docx(p: Path) -> str:
-    """
-    Special parsing for the Frageliste doc: Fragen -> Antwort/ Erklärung
-    Output as Q/A pairs.
-    """
-    doc = DocxDocument(str(p))
-    qa_lines = []
-
-    for table in doc.tables:
-        if not table.rows:
-            continue
-
-        header_cells = [clean_ws(c.text) for c in table.rows[0].cells]
-        if not any(header_cells):
-            continue
-
-        q_idx = find_col_index(header_cells, "Fragen")
-        a_idx = (
-            find_col_index(header_cells, "Antwort/ Erklärung")
-            or find_col_index(header_cells, "Antwort/Erklärung")
-            or find_col_index(header_cells, "Antwort")
-            or find_col_index(header_cells, "Erklärung")
-        )
-
-        if q_idx is None or a_idx is None:
-            continue
-
-        for row in table.rows[1:]:
-            cells = [clean_ws(c.text) for c in row.cells]
-            if q_idx >= len(cells) or a_idx >= len(cells):
-                continue
-            q = clean_ws(cells[q_idx])
-            a = clean_ws(cells[a_idx])
-            if not q and not a:
-                continue
-            if q and a:
-                qa_lines.append(f"Q: {q}\nA: {a}")
-            elif q and not a:
-                qa_lines.append(f"Q: {q}\nA: (no answer provided)")
-            elif a and not q:
-                qa_lines.append(f"Q: (missing question)\nA: {a}")
-
-    if qa_lines:
-        return "\n\n".join(qa_lines)
-
-    # fallback
-    paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
-    tables = extract_docx_tables_as_text(doc)
-    return clean_ws(paras + "\n" + tables)
-
-def read_docx(p: Path) -> str:
-    if p.name.strip().lower() == SPECIAL_QA_DOC_NAME.strip().lower():
-        return read_special_qa_docx(p)
-
-    doc = DocxDocument(str(p))
-    paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
-    tables = extract_docx_tables_as_text(doc)
-    return clean_ws(paras + "\n" + tables)
-
-def read_pdf(p: Path) -> str:
-    out = []
-    r = PdfReader(str(p))
-    for pg in r.pages:
-        try:
-            out.append(pg.extract_text() or "")
-        except Exception:
-            pass
-    return "\n".join(out)
-
-# -------------------------
-# KB catalog & loader (KB-ID mapping)
-# -------------------------
-def ensure_log_dir() -> Path:
-    d = Path(LOG_DIR)
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-def load_or_build_kb_catalog(kb_files: List[Path]) -> Dict[str, str]:
-    """
-    Returns dict: kb_id -> filename
-    Creates/updates catalog CSV in LOG_DIR for traceability.
-    """
-    logdir = ensure_log_dir()
-    cat_path = logdir / KB_CATALOG_CSV
-
-    existing: Dict[str, str] = {}
-    if cat_path.exists():
-        with cat_path.open("r", encoding="utf-8-sig", newline="") as f:
-            r = csv.DictReader(f)
-            for row in r:
-                if row.get("kb_id") and row.get("filename"):
-                    existing[row["kb_id"]] = row["filename"]
-
-    # build reverse map
-    filename_to_id = {v: k for k, v in existing.items()}
-
-    next_id_num = 1
-    if existing:
-        # find max numeric suffix
-        nums = []
-        for kid in existing.keys():
-            m = re.match(r"KB-(\d+)", kid)
-            if m:
-                nums.append(int(m.group(1)))
-        if nums:
-            next_id_num = max(nums) + 1
-
-    updated = dict(existing)
-
-    for p in kb_files:
-        fn = p.name
-        if fn in filename_to_id:
-            continue
-        kid = f"KB-{next_id_num:03d}"
-        next_id_num += 1
-        updated[kid] = fn
-
-    # write back
-    with cat_path.open("w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["kb_id", "filename"])
-        w.writeheader()
-        for kid in sorted(updated.keys()):
-            w.writerow({"kb_id": kid, "filename": updated[kid]})
-
-    return updated
-
-def load_kb(dirpath: str) -> List[Tuple[str, str, str]]:
-    """
-    Loads KB files and returns list of tuples:
-    (kb_id, filename, extracted_text)
-    NOTE: extracted_text is NOT redacted yet (redaction happens per request).
-    """
-    base = Path(dirpath)
-    if not base.exists() or not base.is_dir():
-        raise SystemExit(f"KB_DIR not found or not a folder: {dirpath}")
-
-    paths = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
-    if not paths:
-        raise SystemExit(f"No .txt/.docx/.pdf found in: {dirpath}")
-
-    catalog = load_or_build_kb_catalog(paths)
-    filename_to_kbid = {fn: kid for kid, fn in catalog.items()}
-
-    out: List[Tuple[str, str, str]] = []
-    for p in sorted(paths):
-        try:
-            ext = p.suffix.lower()
-            txt = read_txt(p) if ext == ".txt" else (read_docx(p) if ext == ".docx" else read_pdf(p))
-            txt = clean_ws(txt)
-            if txt:
-                kid = filename_to_kbid.get(p.name, "KB-000")
-                out.append((kid, p.name, txt[:MAX_CHARS_PER_FILE]))
-        except Exception as e:
-            print("Skip KB file:", p.name, "-", e)
-
-    if not out:
-        raise SystemExit("Docs found, but no extractable text. Use text PDFs or .txt/.docx.")
-    return out
-
-# -------------------------
-# Simple retrieval (no filenames leaked; we keep IDs internally)
-# -------------------------
-def pick_relevant(files: List[Tuple[str, str, str]], subject: str, body_text: str) -> List[Tuple[str, str]]:
-    """
-    Returns list of (kb_id, redacted_snippet_text)
-    """
-    q = (subject + " " + body_text).lower()
-    scored = []
-    for kb_id, filename, text in files:
-        score = 0
-        for token in re.split(r"[^a-z0-9]+", Path(filename).stem.lower()):
-            if token and token in q:
-                score += 6
-        for token in set(re.split(r"[^a-z0-9]+", q)):
-            if token and token in text.lower():
-                score += 1
-        scored.append((score, kb_id, text))
-
-    scored.sort(reverse=True)
-    picked = [(kb_id, txt) for s, kb_id, txt in scored[:MAX_FILES]]
-
-    # redaction happens HERE, before LLM
-    redacted = [(kb_id, redact_sensitive(txt)) for kb_id, txt in picked]
-
-    # char budget
-    total = 0
-    cut: List[Tuple[str, str]] = []
-    for kb_id, t in redacted:
-        if total + len(t) > MAX_TOTAL_CHARS:
-            cut.append((kb_id, t[: max(0, MAX_TOTAL_CHARS - total)]))
-            break
-        cut.append((kb_id, t))
-        total += len(t)
-
-    return cut
-
-# -------------------------
-# Prompt (forces reasoning; no copy-paste; no filenames)
-# -------------------------
-def make_prompt(snips: List[Tuple[str, str]], subject: str, email_text: str) -> str:
-    rs = redact_sensitive(subject)
-    rb = redact_sensitive(email_text)
-
-    # Only KB IDs visible
-    block = "\n\n---\n\n".join([f"[{kb_id}]\n{txt}" for kb_id, txt in snips]) if snips else "(no snippets)"
-
-    return f"""
-You are drafting an email reply for a corporate environment.
-
-Hard rules:
-- Use ONLY the information contained in SNIPPETS.
-- Do NOT output personal data, company names, email addresses, phone numbers, IDs, or monetary amounts.
-- Do NOT paste long blocks verbatim from snippets. Summarize in your own words.
-- If the answer is not explicitly supported by the snippets, reply exactly:
-"I don't have that information in the provided documents."
-- Keep the reply short (max 130 words).
-
-Output format:
-1) 1–2 sentence direct answer
-2) 2–4 bullet points with key details (only if supported)
-3) If needed: 1–2 clarifying questions
-
-SNIPPETS:
-{block}
-
-EMAIL SUBJECT:
-{rs}
-
-EMAIL QUESTION (plain text):
-{rb}
-""".strip()
-
-def call_azure_openai(client: AzureOpenAI, prompt: str) -> str:
-    r = client.chat.completions.create(
-        model=AZURE_DEPLOYMENT_NAME,
-        temperature=0.1,
-        messages=[
-            {"role": "system", "content": "Be concise. Obey the hard rules. Never invent beyond snippets."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    return r.choices[0].message.content or ""
-
-# -------------------------
-# Outlook helpers
-# -------------------------
-def clean_html_to_text(html: str) -> str:
-    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
-    return clean_ws(txt)
-
-def get_sender_smtp(mail) -> str:
-    try:
-        addr = (mail.SenderEmailAddress or "").lower()
-        if addr.startswith("/o="):
-            ex = mail.Sender.GetExchangeUser()
-            if ex:
-                return (ex.PrimarySmtpAddress or "").lower()
-        return addr
-    except Exception:
-        return (mail.SenderEmailAddress or "").lower()
-
-def add_processed_category(mail):
-    try:
-        cats = mail.Categories or ""
-        if PROCESSED_CATEGORY.lower() not in cats.lower():
-            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
-            mail.Save()
-    except Exception:
-        pass
-
-def get_target_folder():
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-
-    target_store = None
-    for st in ns.Stores:
-        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
-            target_store = st
-            break
-
-    if not target_store:
-        print("Available stores:")
-        for st in ns.Stores:
-            print(" -", st.DisplayName)
-        raise SystemExit("Target mailbox not found. Adjust TARGET_MAILBOX.")
-
-    inbox = target_store.GetDefaultFolder(6)  # Inbox
-    if WATCH_FOLDER_NAME.lower() == "inbox":
-        return inbox, target_store.DisplayName, "Inbox"
-
-    for f in inbox.Folders:
-        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
-            return f, target_store.DisplayName, f.Name
-
-    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox.")
-
-# -------------------------
-# Logging
-# -------------------------
-def log_run(subject: str, sender: str, used_kb_ids: List[str], drafted: bool):
-    logdir = ensure_log_dir()
-    path = logdir / RUN_LOG_CSV
-    exists = path.exists()
-
-    with path.open("a", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["timestamp", "subject", "sender", "used_kb_ids", "drafted"])
-        if not exists:
-            w.writeheader()
-        w.writerow({
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "subject": subject,
-            "sender": sender,
-            "used_kb_ids": ",".join(used_kb_ids),
-            "drafted": "yes" if drafted else "no",
-        })
-
-# -------------------------
-# Self notification (optional, no PII expansion)
-# -------------------------
-def name_from_email(email: str) -> str:
-    email = (email or "").strip().lower()
-    local = email.split("@")[0] if "@" in email else email
-    first = local.split(".")[0] if local else ""
-    return (first[:1].upper() + first[1:]) if first else "Colleague"
-
-def send_self_notification(ns, to_addr: str, orig_subject: str, requester_email: str, used_ids: List[str]):
-    requester_name = name_from_email(requester_email)
-    msg = ns.Application.CreateItem(0)
-    msg.To = to_addr
-    msg.Subject = f"Draft created (review needed): {orig_subject}"
-    msg.HTMLBody = (
-        f"<p>A draft reply has been created. Please review and then send it to <b>{requester_name}</b>.</p>"
-        f"<p><b>KB sources used (IDs):</b> {', '.join(used_ids) if used_ids else '(none)'}</p>"
-    )
-    msg.Send()
-
-# =========================
-# MAIN (RUN ONCE)
-# =========================
-def main():
-    time.sleep(STARTUP_DELAY_SEC)
-
-    print("Loading KB from:", KB_DIR)
-    kb_files = load_kb(KB_DIR)
-    print("KB loaded:", len(kb_files), "documents")
-
-    folder, store_name, folder_name = get_target_folder()
-    print(f"Mailbox={store_name} | Folder={folder_name}")
-
-    client = build_azure_client()
-    allowed = {a.lower() for a in ALLOWED_SENDERS}
-
-    items = folder.Items
-    items.Sort("[ReceivedTime]", True)
-
-    drafted = 0
-    checked = 0
-
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-
-    for mail in items:
-        checked += 1
-        if checked > SCAN_LIMIT:
-            break
-        if drafted >= PROCESS_PER_RUN:
-            break
-
-        try:
-            if getattr(mail, "Class", None) != 43:
-                continue
-
-            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
-                continue
-
-            if REQUIRE_UNREAD and not mail.UnRead:
-                continue
-
-            sender = get_sender_smtp(mail)
-            if allowed and sender not in allowed:
-                continue
-
-            subject = mail.Subject or ""
-            if SUBJECT_TOKEN and SUBJECT_TOKEN.lower() not in subject.lower():
-                continue
-
-            body_text = clean_html_to_text(mail.HTMLBody or "")
-
-            snips = pick_relevant(kb_files, subject, body_text)  # returns (kb_id, redacted_snip_text)
-            used_ids = [kb_id for kb_id, _ in snips]
-
-            prompt = make_prompt(snips, subject, body_text)
-            answer = call_azure_openai(client, prompt)
-
-            # Final local safety pass (remove anything that slips through)
-            answer = redact_sensitive(answer)
-            answer = clean_ws(answer)
-
-            reply = mail.Reply()
-            reply.HTMLBody = f"<p>{answer}</p><hr>" + reply.HTMLBody
-
-            if AUTO_SEND:
-                reply.Send()
-                print("Sent:", subject)
-            else:
-                reply.Save()
-                print("Draft created:", subject)
-
-                if SELF_NOTIFY:
-                    try:
-                        send_self_notification(
-                            ns=ns,
-                            to_addr=SELF_NOTIFY_TO,
-                            orig_subject=subject,
-                            requester_email=sender,
-                            used_ids=used_ids,
-                        )
-                        print("Self-notification sent.")
-                    except Exception as e:
-                        print("Self-notification error:", e)
-
-            add_processed_category(mail)
-            log_run(subject=subject, sender=sender, used_kb_ids=used_ids, drafted=True)
-            drafted += 1
-
-        except Exception as e:
-            subj = getattr(mail, "Subject", "<no subject>")
-            print("Mail error:", subj, "-", e)
-            try:
-                log_run(subject=subj, sender=get_sender_smtp(mail), used_kb_ids=[], drafted=False)
-            except Exception:
-                pass
-
-    print(f"Done. Checked={checked}, Drafted={drafted}")
-    print("Logs in:", Path(LOG_DIR).resolve())
-
-
-if __name__ == "__main__":
-    main()
+Collecting spacy
+  Downloading spacy-3.8.11-cp314-cp314-win_amd64.whl.metadata (28 kB)
+Collecting spacy-legacy<3.1.0,>=3.0.11 (from spacy)
+  Downloading spacy_legacy-3.0.12-py2.py3-none-any.whl.metadata (2.8 kB)
+Collecting spacy-loggers<2.0.0,>=1.0.0 (from spacy)
+  Downloading spacy_loggers-1.0.5-py3-none-any.whl.metadata (23 kB)
+Collecting murmurhash<1.1.0,>=0.28.0 (from spacy)
+  Downloading murmurhash-1.0.15-cp314-cp314-win_amd64.whl.metadata (2.3 kB)
+Collecting cymem<2.1.0,>=2.0.2 (from spacy)
+  Downloading cymem-2.0.13-cp314-cp314-win_amd64.whl.metadata (9.9 kB)
+Collecting preshed<3.1.0,>=3.0.2 (from spacy)
+  Downloading preshed-3.0.12-cp314-cp314-win_amd64.whl.metadata (2.6 kB)
+Collecting thinc<8.4.0,>=8.3.4 (from spacy)
+  Downloading thinc-8.3.10-cp314-cp314-win_amd64.whl.metadata (15 kB)
+Collecting wasabi<1.2.0,>=0.9.1 (from spacy)
+  Downloading wasabi-1.1.3-py3-none-any.whl.metadata (28 kB)
+Collecting srsly<3.0.0,>=2.4.3 (from spacy)
+  Downloading srsly-2.5.2-cp314-cp314-win_amd64.whl.metadata (20 kB)
+Collecting catalogue<2.1.0,>=2.0.6 (from spacy)
+  Downloading catalogue-2.0.10-py3-none-any.whl.metadata (14 kB)
+Collecting weasel<0.5.0,>=0.4.2 (from spacy)
+  Downloading weasel-0.4.3-py3-none-any.whl.metadata (4.6 kB)
+Collecting typer-slim<1.0.0,>=0.3.0 (from spacy)
+  Downloading typer_slim-0.21.1-py3-none-any.whl.metadata (16 kB)
+Requirement already satisfied: tqdm<5.0.0,>=4.38.0 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from spacy) (4.67.1)
+Requirement already satisfied: numpy>=1.19.0 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from spacy) (2.3.4)
+Requirement already satisfied: requests<3.0.0,>=2.13.0 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from spacy) (2.32.5)
+Requirement already satisfied: pydantic!=1.8,!=1.8.1,<3.0.0,>=1.7.4 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from spacy) (2.12.3)
+Requirement already satisfied: jinja2 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from spacy) (3.1.6)
+Requirement already satisfied: setuptools in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from spacy) (80.9.0)
+Requirement already satisfied: packaging>=20.0 in c:\users\shtando\appdata\roaming\python\python314\site-packages (from spacy) (25.0)
+Requirement already satisfied: annotated-types>=0.6.0 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from pydantic!=1.8,!=1.8.1,<3.0.0,>=1.7.4->spacy) (0.7.0)
+Requirement already satisfied: pydantic-core==2.41.4 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from pydantic!=1.8,!=1.8.1,<3.0.0,>=1.7.4->spacy) (2.41.4)
+Requirement already satisfied: typing-extensions>=4.14.1 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from pydantic!=1.8,!=1.8.1,<3.0.0,>=1.7.4->spacy) (4.15.0)
+Requirement already satisfied: typing-inspection>=0.4.2 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from pydantic!=1.8,!=1.8.1,<3.0.0,>=1.7.4->spacy) (0.4.2)
+Requirement already satisfied: charset_normalizer<4,>=2 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from requests<3.0.0,>=2.13.0->spacy) (3.4.4)
+Requirement already satisfied: idna<4,>=2.5 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from requests<3.0.0,>=2.13.0->spacy) (3.11)
+Requirement already satisfied: urllib3<3,>=1.21.1 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from requests<3.0.0,>=2.13.0->spacy) (2.5.0)
+Requirement already satisfied: certifi>=2017.4.17 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from requests<3.0.0,>=2.13.0->spacy) (2025.10.5)
+Collecting blis<1.4.0,>=1.3.0 (from thinc<8.4.0,>=8.3.4->spacy)
+  Downloading blis-1.3.3-cp314-cp314-win_amd64.whl.metadata (7.7 kB)
+Collecting confection<1.0.0,>=0.0.1 (from thinc<8.4.0,>=8.3.4->spacy)
+  Downloading confection-0.1.5-py3-none-any.whl.metadata (19 kB)
+Requirement already satisfied: colorama in c:\users\shtando\appdata\roaming\python\python314\site-packages (from tqdm<5.0.0,>=4.38.0->spacy) (0.4.6)
+Requirement already satisfied: click>=8.0.0 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from typer-slim<1.0.0,>=0.3.0->spacy) (8.3.0)
+Collecting cloudpathlib<1.0.0,>=0.7.0 (from weasel<0.5.0,>=0.4.2->spacy)
+  Downloading cloudpathlib-0.23.0-py3-none-any.whl.metadata (16 kB)
+Collecting smart-open<8.0.0,>=5.2.1 (from weasel<0.5.0,>=0.4.2->spacy)
+  Downloading smart_open-7.5.0-py3-none-any.whl.metadata (24 kB)
+Collecting wrapt (from smart-open<8.0.0,>=5.2.1->weasel<0.5.0,>=0.4.2->spacy)
+  Downloading wrapt-2.0.1-cp314-cp314-win_amd64.whl.metadata (9.2 kB)
+Requirement already satisfied: MarkupSafe>=2.0 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from jinja2->spacy) (3.0.3)
+Downloading spacy-3.8.11-cp314-cp314-win_amd64.whl (14.4 MB)
+   ---------------------------------------- 0.0/14.4 MB ? eta -:--:--
+   -- ------------------------------------- 1.0/14.4 MB 6.1 MB/s eta 0:00:03
+   -------- ------------------------------- 3.1/14.4 MB 8.3 MB/s eta 0:00:02
+   --------------- ------------------------ 5.5/14.4 MB 8.9 MB/s eta 0:00:01
+   ---------------------- ----------------- 8.1/14.4 MB 9.8 MB/s eta 0:00:01
+   ----------------------------- ---------- 10.7/14.4 MB 10.4 MB/s eta 0:00:01
+   ------------------------------------- -- 13.6/14.4 MB 10.8 MB/s eta 0:00:01
+   ---------------------------------------- 14.4/14.4 MB 10.6 MB/s  0:00:01
+Downloading catalogue-2.0.10-py3-none-any.whl (17 kB)
+Downloading cymem-2.0.13-cp314-cp314-win_amd64.whl (40 kB)
+Downloading murmurhash-1.0.15-cp314-cp314-win_amd64.whl (26 kB)
+Downloading preshed-3.0.12-cp314-cp314-win_amd64.whl (120 kB)
+Downloading spacy_legacy-3.0.12-py2.py3-none-any.whl (29 kB)
+Downloading spacy_loggers-1.0.5-py3-none-any.whl (22 kB)
+Downloading srsly-2.5.2-cp314-cp314-win_amd64.whl (658 kB)
+   ---------------------------------------- 0.0/658.9 kB ? eta -:--:--
+   ---------------------------------------- 658.9/658.9 kB 8.6 MB/s  0:00:00
+Downloading thinc-8.3.10-cp314-cp314-win_amd64.whl (1.7 MB)
+   ---------------------------------------- 0.0/1.7 MB ? eta -:--:--
+   ---------------------------------------- 1.7/1.7 MB 10.5 MB/s  0:00:00
+Downloading blis-1.3.3-cp314-cp314-win_amd64.whl (6.3 MB)
+   ---------------------------------------- 0.0/6.3 MB ? eta -:--:--
+   ---------------- ----------------------- 2.6/6.3 MB 12.9 MB/s eta 0:00:01
+   ---------------------------- ----------- 4.5/6.3 MB 11.1 MB/s eta 0:00:01
+   ---------------------------------------- 6.3/6.3 MB 11.0 MB/s  0:00:00
+Downloading confection-0.1.5-py3-none-any.whl (35 kB)
+Downloading typer_slim-0.21.1-py3-none-any.whl (47 kB)
+Downloading wasabi-1.1.3-py3-none-any.whl (27 kB)
+Downloading weasel-0.4.3-py3-none-any.whl (50 kB)
+Downloading cloudpathlib-0.23.0-py3-none-any.whl (62 kB)
+Downloading smart_open-7.5.0-py3-none-any.whl (63 kB)
+Downloading wrapt-2.0.1-cp314-cp314-win_amd64.whl (60 kB)
+Installing collected packages: wrapt, wasabi, spacy-loggers, spacy-legacy, murmurhash, cymem, cloudpathlib, catalogue, blis, typer-slim, srsly, smart-open, preshed, confection, weasel, thinc, spacy
+
+   ----------------------------------------  0/17 [wrapt]
+   -- -------------------------------------  1/17 [wasabi]
+   -- -------------------------------------  1/17 [wasabi]
+   -- -------------------------------------  1/17 [wasabi]
+   ---- -----------------------------------  2/17 [spacy-loggers]
+   ---- -----------------------------------  2/17 [spacy-loggers]
+   ---- -----------------------------------  2/17 [spacy-loggers]
+   ------- --------------------------------  3/17 [spacy-legacy]
+   ------- --------------------------------  3/17 [spacy-legacy]
+   ------- --------------------------------  3/17 [spacy-legacy]
+   --------- ------------------------------  4/17 [murmurhash]
+   ----------- ----------------------------  5/17 [cymem]
+   -------------- -------------------------  6/17 [cloudpathlib]
+   -------------- -------------------------  6/17 [cloudpathlib]
+   -------------- -------------------------  6/17 [cloudpathlib]
+   -------------- -------------------------  6/17 [cloudpathlib]
+   -------------- -------------------------  6/17 [cloudpathlib]
+   ---------------- -----------------------  7/17 [catalogue]
+   ------------------ ---------------------  8/17 [blis]
+   ------------------ ---------------------  8/17 [blis]
+   --------------------- ------------------  9/17 [typer-slim]
+   --------------------- ------------------  9/17 [typer-slim]
+   --------------------- ------------------  9/17 [typer-slim]
+   --------------------- ------------------  9/17 [typer-slim]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ----------------------- ---------------- 10/17 [srsly]
+   ------------------------- -------------- 11/17 [smart-open]
+   ------------------------- -------------- 11/17 [smart-open]
+   ------------------------- -------------- 11/17 [smart-open]
+   ---------------------------- ----------- 12/17 [preshed]
+   ------------------------------ --------- 13/17 [confection]
+   ------------------------------ --------- 13/17 [confection]
+   -------------------------------- ------- 14/17 [weasel]
+   -------------------------------- ------- 14/17 [weasel]
+   -------------------------------- ------- 14/17 [weasel]
+   -------------------------------- ------- 14/17 [weasel]
+   -------------------------------- ------- 14/17 [weasel]
+   -------------------------------- ------- 14/17 [weasel]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ----------------------------------- ---- 15/17 [thinc]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ------------------------------------- -- 16/17 [spacy]
+   ---------------------------------------- 17/17 [spacy]
+
+Successfully installed blis-1.3.3 catalogue-2.0.10 cloudpathlib-0.23.0 confection-0.1.5 cymem-2.0.13 murmurhash-1.0.15 preshed-3.0.12 smart-open-7.5.0 spacy-3.8.11 spacy-legacy-3.0.12 spacy-loggers-1.0.5 srsly-2.5.2 thinc-8.3.10 typer-slim-0.21.1 wasabi-1.1.3 weasel-0.4.3 wrapt-2.0.1
+Requirement already satisfied: spacy[transformers] in c:\users\shtando\appdata\roaming\python\python314\site-packages (3.8.11)
+Requirement already satisfied: spacy-legacy<3.1.0,>=3.0.11 in c:\users\shtando\appdata\roaming\python\python314\site-packages (from spacy[transformers]) (3.0.12)
+Requirement already satisfied: spacy-loggers<2.0.0,>=1.0.0 in c:\users\shtando\appdata\roaming\python\python314\site-packages (from spacy[transformers]) (1.0.5)
+Requirement already satisfied: murmurhash<1.1.0,>=0.28.0 in c:\users\shtando\appdata\roaming\python\python314\site-packages (from spacy[transformers]) (1.0.15)
+Requirement already satisfied: cymem<2.1.0,>=2.0.2 in c:\users\shtando\appdata\roaming\python\python314\site-packages (from spacy[transformers]) (2.0.13)
+Requirement already satisfied: preshed<3.1.0,>=3.0.2 in c:\users\shtando\appdata\roaming\python\python314\site-packages (from spacy[transformers]) (3.0.12)
+Requirement already satisfied: thinc<8.4.0,>=8.3.4 in c:\users\shtando\appdata\roaming\python\python314\site-packages (from spacy[transformers]) (8.3.10)
+Requirement already satisfied: wasabi<1.2.0,>=0.9.1 in c:\users\shtando\appdata\roaming\python\python314\site-packages (from spacy[transformers]) (1.1.3)
+Requirement already satisfied: srsly<3.0.0,>=2.4.3 in c:\users\shtando\appdata\roaming\python\python314\site-packages (from spacy[transformers]) (2.5.2)
+Requirement already satisfied: catalogue<2.1.0,>=2.0.6 in c:\users\shtando\appdata\roaming\python\python314\site-packages (from spacy[transformers]) (2.0.10)
+Requirement already satisfied: weasel<0.5.0,>=0.4.2 in c:\users\shtando\appdata\roaming\python\python314\site-packages (from spacy[transformers]) (0.4.3)
+Requirement already satisfied: typer-slim<1.0.0,>=0.3.0 in c:\users\shtando\appdata\roaming\python\python314\site-packages (from spacy[transformers]) (0.21.1)
+Requirement already satisfied: tqdm<5.0.0,>=4.38.0 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from spacy[transformers]) (4.67.1)
+Requirement already satisfied: numpy>=1.19.0 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from spacy[transformers]) (2.3.4)
+Requirement already satisfied: requests<3.0.0,>=2.13.0 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from spacy[transformers]) (2.32.5)
+Requirement already satisfied: pydantic!=1.8,!=1.8.1,<3.0.0,>=1.7.4 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from spacy[transformers]) (2.12.3)
+Requirement already satisfied: jinja2 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from spacy[transformers]) (3.1.6)
+Requirement already satisfied: setuptools in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from spacy[transformers]) (80.9.0)
+Requirement already satisfied: packaging>=20.0 in c:\users\shtando\appdata\roaming\python\python314\site-packages (from spacy[transformers]) (25.0)
+Collecting spacy_transformers<1.4.0,>=1.1.2 (from spacy[transformers])
+  Downloading spacy_transformers-1.3.5.tar.gz (49 kB)
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: annotated-types>=0.6.0 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from pydantic!=1.8,!=1.8.1,<3.0.0,>=1.7.4->spacy[transformers]) (0.7.0)
+Requirement already satisfied: pydantic-core==2.41.4 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from pydantic!=1.8,!=1.8.1,<3.0.0,>=1.7.4->spacy[transformers]) (2.41.4)
+Requirement already satisfied: typing-extensions>=4.14.1 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from pydantic!=1.8,!=1.8.1,<3.0.0,>=1.7.4->spacy[transformers]) (4.15.0)
+Requirement already satisfied: typing-inspection>=0.4.2 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from pydantic!=1.8,!=1.8.1,<3.0.0,>=1.7.4->spacy[transformers]) (0.4.2)
+Requirement already satisfied: charset_normalizer<4,>=2 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from requests<3.0.0,>=2.13.0->spacy[transformers]) (3.4.4)
+Requirement already satisfied: idna<4,>=2.5 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from requests<3.0.0,>=2.13.0->spacy[transformers]) (3.11)
+Requirement already satisfied: urllib3<3,>=1.21.1 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from requests<3.0.0,>=2.13.0->spacy[transformers]) (2.5.0)
+Requirement already satisfied: certifi>=2017.4.17 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from requests<3.0.0,>=2.13.0->spacy[transformers]) (2025.10.5)
+Collecting transformers<4.37.0,>=3.4.0 (from spacy_transformers<1.4.0,>=1.1.2->spacy[transformers])
+  Downloading transformers-4.36.2-py3-none-any.whl.metadata (126 kB)
+Requirement already satisfied: torch>=1.8.0 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from spacy_transformers<1.4.0,>=1.1.2->spacy[transformers]) (2.9.0)
+Collecting spacy-alignments<1.0.0,>=0.7.2 (from spacy_transformers<1.4.0,>=1.1.2->spacy[transformers])
+  Downloading spacy-alignments-0.9.1.tar.gz (7.0 kB)
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: blis<1.4.0,>=1.3.0 in c:\users\shtando\appdata\roaming\python\python314\site-packages (from thinc<8.4.0,>=8.3.4->spacy[transformers]) (1.3.3)
+Requirement already satisfied: confection<1.0.0,>=0.0.1 in c:\users\shtando\appdata\roaming\python\python314\site-packages (from thinc<8.4.0,>=8.3.4->spacy[transformers]) (0.1.5)
+Requirement already satisfied: colorama in c:\users\shtando\appdata\roaming\python\python314\site-packages (from tqdm<5.0.0,>=4.38.0->spacy[transformers]) (0.4.6)
+Requirement already satisfied: filelock in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from transformers<4.37.0,>=3.4.0->spacy_transformers<1.4.0,>=1.1.2->spacy[transformers]) (3.20.0)
+Requirement already satisfied: huggingface-hub<1.0,>=0.19.3 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from transformers<4.37.0,>=3.4.0->spacy_transformers<1.4.0,>=1.1.2->spacy[transformers]) (0.35.3)
+Requirement already satisfied: pyyaml>=5.1 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from transformers<4.37.0,>=3.4.0->spacy_transformers<1.4.0,>=1.1.2->spacy[transformers]) (6.0.3)
+Requirement already satisfied: regex!=2019.12.17 in c:\users\shtando\appdata\local\programs\python\python314\lib\site-packages (from transformers<4.37.0,>=3.4.0->spacy_transformers<1.4.0,>=1.1.2->spacy[transformers]) (2025.9.18)
+Collecting tokenizers<0.19,>=0.14 (from transformers<4.37.0,>=3.4.0->spacy_transformers<1.4.0,>=1.1.2->spacy[transformers])
+  Downloading tokenizers-0.15.2.tar.gz (320 kB)
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Installing backend dependencies: started
+  Installing backend dependencies: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'error'
+  error: subprocess-exited-with-error
+  
+  × Preparing metadata (pyproject.toml) did not run successfully.
+  │ exit code: 1
+  ╰─> [92 lines of output]
+      pip_system_certs: ERROR: truststore not available
+      Checking for Rust toolchain....
+      Rust not found, installing into a temporary directory
+      Python reports SOABI: cp314-win_amd64
+      Computed rustc target triple: x86_64-pc-windows-msvc
+      Installation directory: C:\Users\SHTANDO\AppData\Local\puccinialin\puccinialin\Cache
+      Downloading rustup-init from https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe
+      Traceback (most recent call last):
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpx\_transports\default.py"[0m, line [35m101[0m, in [35mmap_httpcore_exceptions[0m
+          yield
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpx\_transports\default.py"[0m, line [35m250[0m, in [35mhandle_request[0m
+          resp = self._pool.handle_request(req)
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpcore\_sync\connection_pool.py"[0m, line [35m256[0m, in [35mhandle_request[0m
+          raise exc from None
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpcore\_sync\connection_pool.py"[0m, line [35m236[0m, in [35mhandle_request[0m
+          response = connection.handle_request(
+              pool_request.request
+          )
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpcore\_sync\connection.py"[0m, line [35m101[0m, in [35mhandle_request[0m
+          raise exc
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpcore\_sync\connection.py"[0m, line [35m78[0m, in [35mhandle_request[0m
+          stream = self._connect(request)
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpcore\_sync\connection.py"[0m, line [35m156[0m, in [35m_connect[0m
+          stream = stream.start_tls(**kwargs)
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpcore\_backends\sync.py"[0m, line [35m154[0m, in [35mstart_tls[0m
+          with [31mmap_exceptions[0m[1;31m(exc_map)[0m:
+               [31m~~~~~~~~~~~~~~[0m[1;31m^^^^^^^^^[0m
+        File [35m"c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\contextlib.py"[0m, line [35m162[0m, in [35m__exit__[0m
+          [31mself.gen.throw[0m[1;31m(value)[0m
+          [31m~~~~~~~~~~~~~~[0m[1;31m^^^^^^^[0m
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpcore\_exceptions.py"[0m, line [35m14[0m, in [35mmap_exceptions[0m
+          raise to_exc(exc) from exc
+      [1;35mhttpcore.ConnectError[0m: [35m[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1077)[0m
+      
+      The above exception was the direct cause of the following exception:
+      
+      Traceback (most recent call last):
+        File [35m"c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\pip\_vendor\pyproject_hooks\_in_process\_in_process.py"[0m, line [35m389[0m, in [35m<module>[0m
+          [31mmain[0m[1;31m()[0m
+          [31m~~~~[0m[1;31m^^[0m
+        File [35m"c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\pip\_vendor\pyproject_hooks\_in_process\_in_process.py"[0m, line [35m373[0m, in [35mmain[0m
+          json_out["return_val"] = [31mhook[0m[1;31m(**hook_input["kwargs"])[0m
+                                   [31m~~~~[0m[1;31m^^^^^^^^^^^^^^^^^^^^^^^^[0m
+        File [35m"c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\pip\_vendor\pyproject_hooks\_in_process\_in_process.py"[0m, line [35m175[0m, in [35mprepare_metadata_for_build_wheel[0m
+          return hook(metadata_directory, config_settings)
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\overlay\Lib\site-packages\maturin\__init__.py"[0m, line [35m190[0m, in [35mprepare_metadata_for_build_wheel[0m
+          output = subprocess.check_output(["cargo", "--version"], env=[31m_get_env[0m[1;31m()[0m).decode("utf-8", "ignore")
+                                                                       [31m~~~~~~~~[0m[1;31m^^[0m
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\overlay\Lib\site-packages\maturin\__init__.py"[0m, line [35m75[0m, in [35m_get_env[0m
+          extra_env = setup_rust()
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\puccinialin\_setup_rust.py"[0m, line [35m124[0m, in [35msetup_rust[0m
+          rustup_init = download_rustup(url, rustup_init, target, file)
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\puccinialin\_setup_rust.py"[0m, line [35m34[0m, in [35mdownload_rustup[0m
+          response = client.head(url)
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpx\_client.py"[0m, line [35m1111[0m, in [35mhead[0m
+          return [31mself.request[0m[1;31m([0m
+                 [31m~~~~~~~~~~~~[0m[1;31m^[0m
+              [1;31m"HEAD",[0m
+              [1;31m^^^^^^^[0m
+          ...<7 lines>...
+              [1;31mextensions=extensions,[0m
+              [1;31m^^^^^^^^^^^^^^^^^^^^^^[0m
+          [1;31m)[0m
+          [1;31m^[0m
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpx\_client.py"[0m, line [35m825[0m, in [35mrequest[0m
+          return [31mself.send[0m[1;31m(request, auth=auth, follow_redirects=follow_redirects)[0m
+                 [31m~~~~~~~~~[0m[1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpx\_client.py"[0m, line [35m914[0m, in [35msend[0m
+          response = self._send_handling_auth(
+              request,
+          ...<2 lines>...
+              history=[],
+          )
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpx\_client.py"[0m, line [35m942[0m, in [35m_send_handling_auth[0m
+          response = self._send_handling_redirects(
+              request,
+              follow_redirects=follow_redirects,
+              history=history,
+          )
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpx\_client.py"[0m, line [35m979[0m, in [35m_send_handling_redirects[0m
+          response = self._send_single_request(request)
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpx\_client.py"[0m, line [35m1014[0m, in [35m_send_single_request[0m
+          response = transport.handle_request(request)
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpx\_transports\default.py"[0m, line [35m249[0m, in [35mhandle_request[0m
+          with [31mmap_httpcore_exceptions[0m[1;31m()[0m:
+               [31m~~~~~~~~~~~~~~~~~~~~~~~[0m[1;31m^^[0m
+        File [35m"c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\contextlib.py"[0m, line [35m162[0m, in [35m__exit__[0m
+          [31mself.gen.throw[0m[1;31m(value)[0m
+          [31m~~~~~~~~~~~~~~[0m[1;31m^^^^^^^[0m
+        File [35m"C:\Users\SHTANDO\AppData\Local\Temp\pip-build-env-kepaeodl\normal\Lib\site-packages\httpx\_transports\default.py"[0m, line [35m118[0m, in [35mmap_httpcore_exceptions[0m
+          raise mapped_exc(message) from exc
+      [1;35mhttpx.ConnectError[0m: [35m[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1077)[0m
+      [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+error: metadata-generation-failed
+
+× Encountered error while generating package metadata.
+╰─> tokenizers
+
+note: This is an issue with the package mentioned above, not pip.
+hint: See above for details.
+Collecting de-core-news-sm==3.7.0
+  Downloading https://github.com/explosion/spacy-models/releases/download/de_core_news_sm-3.7.0/de_core_news_sm-3.7.0-py3-none-any.whl (14.6 MB)
+     ---------------------------------------- 0.0/14.6 MB ? eta -:--:--
+     -- ------------------------------------- 1.0/14.6 MB 6.2 MB/s eta 0:00:03
+     ------- -------------------------------- 2.9/14.6 MB 7.9 MB/s eta 0:00:02
+     ------------- -------------------------- 5.0/14.6 MB 8.6 MB/s eta 0:00:02
+     -------------------- ------------------- 7.3/14.6 MB 9.5 MB/s eta 0:00:01
+     -------------------------- ------------- 9.7/14.6 MB 10.0 MB/s eta 0:00:01
+     -------------------------------- ------ 12.3/14.6 MB 10.4 MB/s eta 0:00:01
+     --------------------------------------  14.4/14.6 MB 10.5 MB/s eta 0:00:01
+     ---------------------------------------- 14.6/14.6 MB 10.3 MB/s  0:00:01
+Collecting spacy<3.8.0,>=3.7.0 (from de-core-news-sm==3.7.0)
+  Downloading spacy-3.7.5.tar.gz (1.3 MB)
+     ---------------------------------------- 0.0/1.3 MB ? eta -:--:--
+     ------------------------ --------------- 0.8/1.3 MB 4.8 MB/s eta 0:00:01
+     ---------------------------------------- 1.3/1.3 MB 5.2 MB/s  0:00:00
+  Installing build dependencies: started
+  Installing build dependencies: still running...
+  Installing build dependencies: finished with status 'error'
+  error: subprocess-exited-with-error
+  
+  × installing build dependencies for spacy did not run successfully.
+  │ exit code: 1
+  ╰─> [87 lines of output]
+      Ignoring numpy: markers 'python_version < "3.9"' don't match your environment
+      Collecting setuptools
+        Using cached setuptools-80.10.1-py3-none-any.whl.metadata (6.7 kB)
+      Collecting cython<3.0,>=0.25
+        Downloading Cython-0.29.37-py2.py3-none-any.whl.metadata (3.1 kB)
+      Collecting cymem<2.1.0,>=2.0.2
+        Using cached cymem-2.0.13-cp314-cp314-win_amd64.whl.metadata (9.9 kB)
+      Collecting preshed<3.1.0,>=3.0.2
+        Using cached preshed-3.0.12-cp314-cp314-win_amd64.whl.metadata (2.6 kB)
+      Collecting murmurhash<1.1.0,>=0.28.0
+        Using cached murmurhash-1.0.15-cp314-cp314-win_amd64.whl.metadata (2.3 kB)
+      Collecting thinc<8.3.0,>=8.2.2
+        Downloading thinc-8.2.5.tar.gz (193 kB)
+        Installing build dependencies: started
+        Installing build dependencies: still running...
+        Installing build dependencies: finished with status 'error'
+        error: subprocess-exited-with-error
+      
+        Ã— installing build dependencies for thinc did not run successfully.
+        â”‚ exit code: 1
+        â•°â”€> [62 lines of output]
+            Ignoring numpy: markers 'python_version < "3.9"' don't match your environment
+            Collecting setuptools
+              Using cached setuptools-80.10.1-py3-none-any.whl.metadata (6.7 kB)
+            Collecting cython<3.0,>=0.25
+              Using cached Cython-0.29.37-py2.py3-none-any.whl.metadata (3.1 kB)
+            Collecting murmurhash<1.1.0,>=1.0.2
+              Using cached murmurhash-1.0.15-cp314-cp314-win_amd64.whl.metadata (2.3 kB)
+            Collecting cymem<2.1.0,>=2.0.2
+              Using cached cymem-2.0.13-cp314-cp314-win_amd64.whl.metadata (9.9 kB)
+            Collecting preshed<3.1.0,>=3.0.2
+              Using cached preshed-3.0.12-cp314-cp314-win_amd64.whl.metadata (2.6 kB)
+            Collecting blis<0.8.0,>=0.7.8
+              Downloading blis-0.7.11.tar.gz (2.9 MB)
+                 ---------------------------------------- 0.0/2.9 MB ? eta -:--:--
+                 -------------- ------------------------- 1.0/2.9 MB 5.8 MB/s eta 0:00:01
+                 ------------------------------------ --- 2.6/2.9 MB 7.0 MB/s eta 0:00:01
+                 ---------------------------------------- 2.9/2.9 MB 7.0 MB/s  0:00:00
+              Installing build dependencies: started
+              Installing build dependencies: finished with status 'done'
+              Getting requirements to build wheel: started
+              Getting requirements to build wheel: finished with status 'done'
+              Preparing metadata (pyproject.toml): started
+              Preparing metadata (pyproject.toml): finished with status 'done'
+            Collecting numpy<2.0.0,>=1.25.0
+              Downloading numpy-1.26.4.tar.gz (15.8 MB)
+                 ---------------------------------------- 0.0/15.8 MB ? eta -:--:--
+                 ---- ----------------------------------- 1.8/15.8 MB 9.9 MB/s eta 0:00:02
+                 ---------- ----------------------------- 4.2/15.8 MB 10.6 MB/s eta 0:00:02
+                 ----------------- ---------------------- 6.8/15.8 MB 11.1 MB/s eta 0:00:01
+                 ----------------------- ---------------- 9.2/15.8 MB 11.0 MB/s eta 0:00:01
+                 ----------------------------- --------- 11.8/15.8 MB 11.3 MB/s eta 0:00:01
+                 ----------------------------------- --- 14.4/15.8 MB 11.5 MB/s eta 0:00:01
+                 --------------------------------------  15.7/15.8 MB 11.0 MB/s eta 0:00:01
+                 ---------------------------------------- 15.8/15.8 MB 10.7 MB/s  0:00:01
+              Installing build dependencies: started
+              Installing build dependencies: finished with status 'done'
+              Getting requirements to build wheel: started
+              Getting requirements to build wheel: finished with status 'done'
+              Installing backend dependencies: started
+              Installing backend dependencies: finished with status 'done'
+              Preparing metadata (pyproject.toml): started
+              Preparing metadata (pyproject.toml): finished with status 'error'
+              error: subprocess-exited-with-error
+      
+              Ãƒâ€” Preparing metadata (pyproject.toml) did not run successfully.
+              Ã¢â€\x9dâ€š exit code: 1
+              Ã¢â€¢Â°Ã¢â€\x9dâ‚¬> [5 lines of output]
+                  pip_system_certs: ERROR: truststore not available
+      
+                  ('\x1b[31m',)meson-python: error: Could not find meson version 0.63.3 or newer, found pip_system_certs: ERROR: truststore not available
+                  ('\x1b[31m',)meson-python: error: 1.2.99
+                  ('\x1b[31m',)meson-python: error: .
+                  [end of output]
+      
+              note: This error originates from a subprocess, and is likely not a problem with pip.
+            error: metadata-generation-failed
+      
+            Ãƒâ€” Encountered error while generating package metadata.
+            Ã¢â€¢Â°Ã¢â€\x9dâ‚¬> numpy
+      
+            note: This is an issue with the package mentioned above, not pip.
+            hint: See above for details.
+            [end of output]
+      
+        note: This error originates from a subprocess, and is likely not a problem with pip.
+      ERROR: Failed to build 'thinc' when installing build dependencies for thinc
+      [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+ERROR: Failed to build 'spacy' when installing build dependencies for spacy
+Collecting en-core-web-sm==3.7.0
+  Downloading https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.0/en_core_web_sm-3.7.0-py3-none-any.whl (12.8 MB)
+     ---------------------------------------- 0.0/12.8 MB ? eta -:--:--
+     --- ------------------------------------ 1.0/12.8 MB 7.1 MB/s eta 0:00:02
+     --------- ------------------------------ 2.9/12.8 MB 8.4 MB/s eta 0:00:02
+     ---------------- ----------------------- 5.2/12.8 MB 9.2 MB/s eta 0:00:01
+     ---------------------- ----------------- 7.3/12.8 MB 9.4 MB/s eta 0:00:01
+     ------------------------------ -------- 10.0/12.8 MB 10.1 MB/s eta 0:00:01
+     ------------------------------------- - 12.3/12.8 MB 10.5 MB/s eta 0:00:01
+     ---------------------------------------- 12.8/12.8 MB 10.1 MB/s  0:00:01
+Collecting spacy<3.8.0,>=3.7.0 (from en-core-web-sm==3.7.0)
+  Using cached spacy-3.7.5.tar.gz (1.3 MB)
+  Installing build dependencies: started
+  Installing build dependencies: still running...
+  Installing build dependencies: finished with status 'error'
+  error: subprocess-exited-with-error
+  
+  × installing build dependencies for spacy did not run successfully.
+  │ exit code: 1
+  ╰─> [74 lines of output]
+      Ignoring numpy: markers 'python_version < "3.9"' don't match your environment
+      Collecting setuptools
+        Using cached setuptools-80.10.1-py3-none-any.whl.metadata (6.7 kB)
+      Collecting cython<3.0,>=0.25
+        Using cached Cython-0.29.37-py2.py3-none-any.whl.metadata (3.1 kB)
+      Collecting cymem<2.1.0,>=2.0.2
+        Using cached cymem-2.0.13-cp314-cp314-win_amd64.whl.metadata (9.9 kB)
+      Collecting preshed<3.1.0,>=3.0.2
+        Using cached preshed-3.0.12-cp314-cp314-win_amd64.whl.metadata (2.6 kB)
+      Collecting murmurhash<1.1.0,>=0.28.0
+        Using cached murmurhash-1.0.15-cp314-cp314-win_amd64.whl.metadata (2.3 kB)
+      Collecting thinc<8.3.0,>=8.2.2
+        Using cached thinc-8.2.5.tar.gz (193 kB)
+        Installing build dependencies: started
+        Installing build dependencies: still running...
+        Installing build dependencies: finished with status 'error'
+        error: subprocess-exited-with-error
+      
+        Ã— installing build dependencies for thinc did not run successfully.
+        â”‚ exit code: 1
+        â•°â”€> [49 lines of output]
+            Ignoring numpy: markers 'python_version < "3.9"' don't match your environment
+            Collecting setuptools
+              Using cached setuptools-80.10.1-py3-none-any.whl.metadata (6.7 kB)
+            Collecting cython<3.0,>=0.25
+              Using cached Cython-0.29.37-py2.py3-none-any.whl.metadata (3.1 kB)
+            Collecting murmurhash<1.1.0,>=1.0.2
+              Using cached murmurhash-1.0.15-cp314-cp314-win_amd64.whl.metadata (2.3 kB)
+            Collecting cymem<2.1.0,>=2.0.2
+              Using cached cymem-2.0.13-cp314-cp314-win_amd64.whl.metadata (9.9 kB)
+            Collecting preshed<3.1.0,>=3.0.2
+              Using cached preshed-3.0.12-cp314-cp314-win_amd64.whl.metadata (2.6 kB)
+            Collecting blis<0.8.0,>=0.7.8
+              Using cached blis-0.7.11.tar.gz (2.9 MB)
+              Installing build dependencies: started
+              Installing build dependencies: finished with status 'done'
+              Getting requirements to build wheel: started
+              Getting requirements to build wheel: finished with status 'done'
+              Preparing metadata (pyproject.toml): started
+              Preparing metadata (pyproject.toml): finished with status 'done'
+            Collecting numpy<2.0.0,>=1.25.0
+              Using cached numpy-1.26.4.tar.gz (15.8 MB)
+              Installing build dependencies: started
+              Installing build dependencies: finished with status 'done'
+              Getting requirements to build wheel: started
+              Getting requirements to build wheel: finished with status 'done'
+              Installing backend dependencies: started
+              Installing backend dependencies: finished with status 'done'
+              Preparing metadata (pyproject.toml): started
+              Preparing metadata (pyproject.toml): finished with status 'error'
+              error: subprocess-exited-with-error
+      
+              Ãƒâ€” Preparing metadata (pyproject.toml) did not run successfully.
+              Ã¢â€\x9dâ€š exit code: 1
+              Ã¢â€¢Â°Ã¢â€\x9dâ‚¬> [5 lines of output]
+                  pip_system_certs: ERROR: truststore not available
+      
+                  ('\x1b[31m',)meson-python: error: Could not find meson version 0.63.3 or newer, found pip_system_certs: ERROR: truststore not available
+                  ('\x1b[31m',)meson-python: error: 1.2.99
+                  ('\x1b[31m',)meson-python: error: .
+                  [end of output]
+      
+              note: This error originates from a subprocess, and is likely not a problem with pip.
+            error: metadata-generation-failed
+      
+            Ãƒâ€” Encountered error while generating package metadata.
+            Ã¢â€¢Â°Ã¢â€\x9dâ‚¬> numpy
+      
+            note: This is an issue with the package mentioned above, not pip.
+            hint: See above for details.
+            [end of output]
+      
+        note: This error originates from a subprocess, and is likely not a problem with pip.
+      ERROR: Failed to build 'thinc' when installing build dependencies for thinc
+      [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+ERROR: Failed to build 'spacy' when installing build dependencies for spacy
