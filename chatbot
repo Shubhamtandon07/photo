@@ -1,15 +1,9 @@
-python -c "import sys; print(sys.executable); print(sys.version)"
-
-python -m pip uninstall -y pywin32 pypiwin32
-python -m pip install --upgrade pip
-python -m pip install --upgrade pywin32
-
-python -m pywin32_postinstall -install
-
-python -c "import win32com.client as win32; import pywintypes; print('pywin32 OK')"
-
-import sys
-print(sys.executable)
-
-"<PASTE_THE_PATH_FROM_ABOVE>" -m pip install --upgrade pywin32
-"<PASTE_THE_PATH_FROM_ABOVE>" -m pywin32_postinstall -install
+WARNING: spaCy NER models not loaded. Using regex-only redaction.
+If you want NER, install models in this Python env:
+  python -m spacy download de_core_news_sm
+  python -m spacy download en_core_web_sm
+Loading KB from: C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data
+Skip KB file: AW_ 2-2023-00801 - Wheel House Trim Cover Rear­­_done E@MBEAM__1355ee51done.docx - Package not found at 'C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data\AW_ 2-2023-00801 - Wheel House Trim Cover Rear­­_done E@MBEAM__1355ee51done.docx'
+KB loaded: 5 documents
+Mailbox=shubham.tandon@mercedes-benz.com | Folder=Inbox
+Done. Checked=251, Drafted=0
