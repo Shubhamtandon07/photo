@@ -1,32 +1,28 @@
-python -m pip install --user spacy
-python -m pip install --user "spacy[transformers]"
-python -m pip install --user https://github.com/explosion/spacy-models/releases/download/de_core_news_sm-3.7.0/de_core_news_sm-3.7.0-py3-none-any.whl
-python -m pip install --user https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.0/en_core_web_sm-3.7.0-py3-none-any.whl
-
-
-
 # -*- coding: utf-8 -*-
 """
-Outlook -> Azure OpenAI (genai-nexus) -> Draft reply (RUN ONCE) + Self notification
+Outlook -> Azure OpenAI (genai-nexus) -> Draft reply (RUN ONCE)
+with:
+- Local spaCy NER redaction (DE+EN)
+- No filename leakage to the model (only KB-IDs)
+- Traceability via local CSV logs (KB-ID -> file + used IDs per drafted mail)
+- Special DOCX table parser for "2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx"
 
-Enhancements in this version:
-- Redacts sensitive information BEFORE sending anything to Azure OpenAI:
-  - emails, URLs, phone numbers
-  - company terms (configurable)
-  - IDs / references (only if they contain digits)
-  - monetary amounts (€, EUR, USD, etc.)
-- Does NOT leave [REDACTED_*] tokens in the drafted reply:
-  - redactions are removed or replaced with neutral wording (e.g., "an amount")
-- Special DOCX table parser for:
-  "2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx"
-  where column "Fragen" = questions and column "Antwort/ Erklärung" = answers
+REQUIREMENTS (you said installed):
+- spacy
+- de_core_news_sm
+- en_core_web_sm
+- python-docx
+- pypdf
+- pywin32
+- openai (AzureOpenAI)
 """
 
 import os
 import re
+import csv
 import time
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import win32com.client as win32
 from openai import AzureOpenAI
@@ -34,123 +30,164 @@ from docx import Document as DocxDocument
 from pypdf import PdfReader
 from dotenv import load_dotenv
 
+import spacy
+import de_core_news_sm
+import en_core_web_sm
+
 load_dotenv()
 
 # =========================
 # EDIT THESE
 # =========================
-TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"   # must match Outlook store DisplayName (substring match)
-WATCH_FOLDER_NAME = "Inbox"                           # "Inbox" or subfolder under Inbox
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"  # substring match to Outlook store DisplayName
+WATCH_FOLDER_NAME = "Inbox"                          # "Inbox" or subfolder under Inbox
 
 KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
 
-SUBJECT_TOKEN = "[bot]"       # set "" to disable subject gating
+SUBJECT_TOKEN = "[bot]"     # set "" to disable gating by subject
 REQUIRE_UNREAD = True
-AUTO_SEND = False             # Draft only
+AUTO_SEND = False           # keep False: Draft only
 PROCESS_PER_RUN = 3
 SCAN_LIMIT = 200
-STARTUP_DELAY_SEC = 5
+STARTUP_DELAY_SEC = 3
 
-ALLOWED_SENDERS = set()       # empty = allow anyone
+# Optional: allow-list senders. Keep empty to allow anyone.
+ALLOWED_SENDERS = set()     # e.g. {"person.a@...", "person.b@..."}
 
 # Azure OpenAI (corporate) settings
 AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net/apikey/"
 AZURE_API_VERSION = "2024-06-01"
-AZURE_DEPLOYMENT_NAME = "gpt-4o"   # DEPLOYMENT NAME in your org
+AZURE_DEPLOYMENT_NAME = "gpt-4o"  # your org deployment name
 
-# Notify yourself after draft created
+# Traceability logs (local)
+LOG_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Logs"
+KB_CATALOG_CSV = "kb_catalog.csv"     # mapping KB-ID -> filename
+RUN_LOG_CSV = "draft_log.csv"         # per processed email: subject, sender, used KB-IDs, timestamp
+
+# Optional self-notification
 SELF_NOTIFY = True
 SELF_NOTIFY_TO = TARGET_MAILBOX
 # =========================
 
 PROCESSED_CATEGORY = "AI-Drafted"
-MAX_FILES = 6
-MAX_CHARS_PER_FILE = 4000
-MAX_TOTAL_CHARS = 12000
 SUPPORTED_EXTS = {".txt", ".docx", ".pdf"}
+
+MAX_FILES = 6
+MAX_CHARS_PER_FILE = 4500
+MAX_TOTAL_CHARS = 12000
 
 SPECIAL_QA_DOC_NAME = "2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx"
 
 # -------------------------
-# Redaction configuration
+# spaCy models (local)
 # -------------------------
-REDACT_COMPANY_TERMS = [
+NLP_DE = de_core_news_sm.load()
+NLP_EN = en_core_news_sm.load()
+
+# What to remove by NER (tuneable)
+NER_REMOVE_LABELS = {"PERSON", "ORG", "GPE", "LOC", "FAC"}
+
+# -------------------------
+# Non-NER sensitive patterns
+# -------------------------
+RE_EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+RE_URL = re.compile(r"\bhttps?://[^\s<>()]+\b|\bwww\.[^\s<>()]+\b", re.IGNORECASE)
+RE_PHONE = re.compile(r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d")
+RE_IDLIKE = re.compile(r"\b(?:PO|PR|NCR|Ticket|Case|Req|Request|Material|Part)\s*[:#]?\s*[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b", re.IGNORECASE)
+RE_MONEY = re.compile(r"(?i)\b(?:EUR|USD|GBP|CHF)\s*\d[\d\.\,\s]*\b|\b\d[\d\.\,\s]*\s*(?:€|EUR|USD|GBP|CHF)\b|\b€\s*\d[\d\.\,\s]*\b")
+
+# Optional company terms: remove these *exact strings* (not tokens)
+COMPANY_TERMS = [
     "Mercedes-Benz",
     "Mercedes Benz",
-    "Mercedes",
     "Daimler",
     "corpinter",
-    "Catena-X",
-    "Catena X",
 ]
 
-# Replace or remove sensitive info BEFORE sending to LLM.
-# (No [REDACTED_*] placeholders will survive into the final drafted email.)
-REDACT_PATTERNS = [
-    # Email addresses -> remove
-    (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", ""),
+# -------------------------
+# Utility: whitespace cleanup
+# -------------------------
+def clean_ws(s: str) -> str:
+    s = re.sub(r"\s+", " ", s or "").strip()
+    s = re.sub(r"\s+([,.;:])", r"\1", s)
+    s = re.sub(r"([,.;:]){2,}", r"\1", s)
+    s = re.sub(r"\(\s*\)", "", s)
+    return s.strip()
 
-    # URLs -> remove
-    (r"\bhttps?://[^\s<>()]+\b", ""),
-    (r"\bwww\.[^\s<>()]+\b", ""),
+# -------------------------
+# NER redaction (remove spans, not replace with tokens)
+# -------------------------
+def _remove_spans(text: str, spans: List[Tuple[int, int]]) -> str:
+    """Remove spans (start,end) from text, merge remaining parts."""
+    if not spans:
+        return text
+    spans = sorted(spans, key=lambda x: x[0])
+    out = []
+    last = 0
+    for s, e in spans:
+        if s < last:
+            continue
+        out.append(text[last:s])
+        last = e
+    out.append(text[last:])
+    return "".join(out)
 
-    # Phone numbers -> remove (broad)
-    (r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d", ""),
-
-    # IDs / references -> neutral text (requires at least one digit to avoid matching names)
-    (r"\b(?:PO|PR|NCR|Ticket|Case|Req|Request|Material|Part)\s*[:#]?\s*[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b",
-     "the relevant reference"),
-
-    # Money / amounts -> replace with neutral phrase
-    (r"(?i)\b(?:EUR|USD|GBP|CHF)\s*\d[\d\.\,\s]*\b", "an amount"),
-    (r"\b\d[\d\.\,\s]*\s*(?:€|EUR|USD|GBP|CHF)\b", "an amount"),
-    (r"\b€\s*\d[\d\.\,\s]*\b", "an amount"),
-]
-
-# Optional: aggressive "Firstname Lastname" deletion (can over-delete German text)
-AGGRESSIVE_NAME_REDACTION = False
-NAME_LIKE_PATTERN = r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b"
-
-
-def redact_sensitive(text: str) -> str:
-    """Redact/neutralize sensitive content. Used for subject/body/snippets AND final answer."""
+def redact_with_spacy(text: str) -> str:
+    """
+    Remove PERSON/ORG/etc using both DE+EN models.
+    Removes the detected entity strings entirely.
+    """
     if not text:
         return ""
 
+    spans: List[Tuple[int, int]] = []
+
+    # Run both pipelines; take union of spans
+    for nlp in (NLP_DE, NLP_EN):
+        doc = nlp(text)
+        for ent in doc.ents:
+            if ent.label_ in NER_REMOVE_LABELS:
+                # Avoid removing 1-2 letter "entities" to reduce damage
+                if len(ent.text.strip()) >= 3:
+                    spans.append((ent.start_char, ent.end_char))
+
+    redacted = _remove_spans(text, spans)
+    return redacted
+
+def redact_patterns(text: str) -> str:
+    """Remove obvious sensitive patterns and money/IDs."""
+    if not text:
+        return ""
     t = text
 
-    # Remove company terms
-    for term in REDACT_COMPANY_TERMS:
+    # remove company terms (exact-ish)
+    for term in COMPANY_TERMS:
         if term:
             t = re.sub(re.escape(term), "", t, flags=re.IGNORECASE)
 
-    # Apply regex redactions
-    for pat, repl in REDACT_PATTERNS:
-        t = re.sub(pat, repl, t)
+    t = RE_EMAIL.sub("", t)
+    t = RE_URL.sub("", t)
+    t = RE_PHONE.sub("", t)
+    t = RE_IDLIKE.sub("the relevant reference", t)
+    t = RE_MONEY.sub("an amount", t)
 
-    # Optional: aggressive name-like removal
-    if AGGRESSIVE_NAME_REDACTION:
-        t = re.sub(NAME_LIKE_PATTERN, "", t)
-
-    # Cleanup punctuation/whitespace
-    t = re.sub(r"\s+", " ", t).strip()
-    t = re.sub(r"\s+([,.;:])", r"\1", t)
-    t = re.sub(r"([,.;:]){2,}", r"\1", t)
-    t = re.sub(r"\(\s*\)", "", t)
-
-    return t.strip()
-
-
-def strip_redaction_tokens(text: str) -> str:
-    """Safety: remove any leftover [REDACTED_*] markers if they appear."""
-    if not text:
-        return ""
-    t = re.sub(r"\[REDACTED_[A-Z_]+\]", "", text)
-    t = re.sub(r"\s+", " ", t).strip()
     return t
 
+def redact_sensitive(text: str) -> str:
+    """
+    Full local redaction: patterns first (reduces NER load), then NER,
+    then cleanup.
+    """
+    if not text:
+        return ""
+    t = redact_patterns(text)
+    t = redact_with_spacy(t)
+    t = clean_ws(t)
+    return t
 
-# ---------- Azure OpenAI client ----------
+# -------------------------
+# Azure OpenAI client
+# -------------------------
 def build_azure_client() -> AzureOpenAI:
     key = os.getenv("OPENAI_API_KEY")
     if not key:
@@ -161,15 +198,11 @@ def build_azure_client() -> AzureOpenAI:
         api_key=key,
     )
 
-
-# ---------- KB readers ----------
-def clean_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
-
-
+# -------------------------
+# KB file readers
+# -------------------------
 def read_txt(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="ignore")
-
 
 def extract_docx_tables_as_text(doc: DocxDocument) -> str:
     out = []
@@ -180,7 +213,6 @@ def extract_docx_tables_as_text(doc: DocxDocument) -> str:
                 out.append(" | ".join(cells))
     return "\n".join(out)
 
-
 def find_col_index(headers: List[str], target: str) -> Optional[int]:
     target_norm = re.sub(r"\s+", "", target).lower()
     for i, h in enumerate(headers):
@@ -189,13 +221,10 @@ def find_col_index(headers: List[str], target: str) -> Optional[int]:
             return i
     return None
 
-
 def read_special_qa_docx(p: Path) -> str:
     """
-    For SPECIAL_QA_DOC_NAME:
-    Column "Fragen" -> Q
-    Column "Antwort/ Erklärung" (and variants) -> A
-    Output: Q/A pairs
+    Special parsing for the Frageliste doc: Fragen -> Antwort/ Erklärung
+    Output as Q/A pairs.
     """
     doc = DocxDocument(str(p))
     qa_lines = []
@@ -234,14 +263,13 @@ def read_special_qa_docx(p: Path) -> str:
             elif a and not q:
                 qa_lines.append(f"Q: (missing question)\nA: {a}")
 
-    if not qa_lines:
-        # fallback
-        paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
-        tables = extract_docx_tables_as_text(doc)
-        return clean_ws(paras + "\n" + tables)
+    if qa_lines:
+        return "\n\n".join(qa_lines)
 
-    return "\n\n".join(qa_lines)
-
+    # fallback
+    paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
+    tables = extract_docx_tables_as_text(doc)
+    return clean_ws(paras + "\n" + tables)
 
 def read_docx(p: Path) -> str:
     if p.name.strip().lower() == SPECIAL_QA_DOC_NAME.strip().lower():
@@ -251,7 +279,6 @@ def read_docx(p: Path) -> str:
     paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
     tables = extract_docx_tables_as_text(doc)
     return clean_ws(paras + "\n" + tables)
-
 
 def read_pdf(p: Path) -> str:
     out = []
@@ -263,24 +290,89 @@ def read_pdf(p: Path) -> str:
             pass
     return "\n".join(out)
 
+# -------------------------
+# KB catalog & loader (KB-ID mapping)
+# -------------------------
+def ensure_log_dir() -> Path:
+    d = Path(LOG_DIR)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
-def load_kb(dirpath: str) -> List[Tuple[str, str]]:
+def load_or_build_kb_catalog(kb_files: List[Path]) -> Dict[str, str]:
+    """
+    Returns dict: kb_id -> filename
+    Creates/updates catalog CSV in LOG_DIR for traceability.
+    """
+    logdir = ensure_log_dir()
+    cat_path = logdir / KB_CATALOG_CSV
+
+    existing: Dict[str, str] = {}
+    if cat_path.exists():
+        with cat_path.open("r", encoding="utf-8-sig", newline="") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                if row.get("kb_id") and row.get("filename"):
+                    existing[row["kb_id"]] = row["filename"]
+
+    # build reverse map
+    filename_to_id = {v: k for k, v in existing.items()}
+
+    next_id_num = 1
+    if existing:
+        # find max numeric suffix
+        nums = []
+        for kid in existing.keys():
+            m = re.match(r"KB-(\d+)", kid)
+            if m:
+                nums.append(int(m.group(1)))
+        if nums:
+            next_id_num = max(nums) + 1
+
+    updated = dict(existing)
+
+    for p in kb_files:
+        fn = p.name
+        if fn in filename_to_id:
+            continue
+        kid = f"KB-{next_id_num:03d}"
+        next_id_num += 1
+        updated[kid] = fn
+
+    # write back
+    with cat_path.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["kb_id", "filename"])
+        w.writeheader()
+        for kid in sorted(updated.keys()):
+            w.writerow({"kb_id": kid, "filename": updated[kid]})
+
+    return updated
+
+def load_kb(dirpath: str) -> List[Tuple[str, str, str]]:
+    """
+    Loads KB files and returns list of tuples:
+    (kb_id, filename, extracted_text)
+    NOTE: extracted_text is NOT redacted yet (redaction happens per request).
+    """
     base = Path(dirpath)
     if not base.exists() or not base.is_dir():
         raise SystemExit(f"KB_DIR not found or not a folder: {dirpath}")
 
-    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
-    if not files:
+    paths = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    if not paths:
         raise SystemExit(f"No .txt/.docx/.pdf found in: {dirpath}")
 
-    out: List[Tuple[str, str]] = []
-    for p in sorted(files):
+    catalog = load_or_build_kb_catalog(paths)
+    filename_to_kbid = {fn: kid for kid, fn in catalog.items()}
+
+    out: List[Tuple[str, str, str]] = []
+    for p in sorted(paths):
         try:
             ext = p.suffix.lower()
             txt = read_txt(p) if ext == ".txt" else (read_docx(p) if ext == ".docx" else read_pdf(p))
             txt = clean_ws(txt)
             if txt:
-                out.append((p.name, txt[:MAX_CHARS_PER_FILE]))
+                kid = filename_to_kbid.get(p.name, "KB-000")
+                out.append((kid, p.name, txt[:MAX_CHARS_PER_FILE]))
         except Exception as e:
             print("Skip KB file:", p.name, "-", e)
 
@@ -288,89 +380,96 @@ def load_kb(dirpath: str) -> List[Tuple[str, str]]:
         raise SystemExit("Docs found, but no extractable text. Use text PDFs or .txt/.docx.")
     return out
 
-
-# ---------- simple retrieval ----------
-def pick_relevant(files: List[Tuple[str, str]], subject: str, body_text: str) -> List[Tuple[str, str]]:
+# -------------------------
+# Simple retrieval (no filenames leaked; we keep IDs internally)
+# -------------------------
+def pick_relevant(files: List[Tuple[str, str, str]], subject: str, body_text: str) -> List[Tuple[str, str]]:
+    """
+    Returns list of (kb_id, redacted_snippet_text)
+    """
     q = (subject + " " + body_text).lower()
-    scores = []
-    for name, text in files:
+    scored = []
+    for kb_id, filename, text in files:
         score = 0
-        for token in re.split(r"[^a-z0-9]+", Path(name).stem.lower()):
+        for token in re.split(r"[^a-z0-9]+", Path(filename).stem.lower()):
             if token and token in q:
                 score += 6
         for token in set(re.split(r"[^a-z0-9]+", q)):
             if token and token in text.lower():
                 score += 1
-        scores.append((score, name, text))
+        scored.append((score, kb_id, text))
 
-    scores.sort(reverse=True)
-    picked = [(n, t) for s, n, t in scores[:MAX_FILES]]
+    scored.sort(reverse=True)
+    picked = [(kb_id, txt) for s, kb_id, txt in scored[:MAX_FILES]]
 
+    # redaction happens HERE, before LLM
+    redacted = [(kb_id, redact_sensitive(txt)) for kb_id, txt in picked]
+
+    # char budget
     total = 0
     cut: List[Tuple[str, str]] = []
-    for n, t in picked:
+    for kb_id, t in redacted:
         if total + len(t) > MAX_TOTAL_CHARS:
-            cut.append((n, t[: max(0, MAX_TOTAL_CHARS - total)]))
+            cut.append((kb_id, t[: max(0, MAX_TOTAL_CHARS - total)]))
             break
-        cut.append((n, t))
+        cut.append((kb_id, t))
         total += len(t)
+
     return cut
 
-
-# ---------- prompt forcing snippet-only + redaction ----------
+# -------------------------
+# Prompt (forces reasoning; no copy-paste; no filenames)
+# -------------------------
 def make_prompt(snips: List[Tuple[str, str]], subject: str, email_text: str) -> str:
-    # Redact before LLM
-    redacted_subject = redact_sensitive(subject)
-    redacted_email_text = redact_sensitive(email_text)
+    rs = redact_sensitive(subject)
+    rb = redact_sensitive(email_text)
 
-    redacted_snips = [(n, redact_sensitive(t)) for n, t in snips]
-    block = "\n\n---\n\n".join([f"[{n}]\n{t}" for n, t in redacted_snips]) if redacted_snips else "(no snippets)"
+    # Only KB IDs visible
+    block = "\n\n---\n\n".join([f"[{kb_id}]\n{txt}" for kb_id, txt in snips]) if snips else "(no snippets)"
 
-    return f"""You MUST answer using ONLY the SNIPPETS below.
-If the answer is not explicitly supported by the snippets, reply exactly:
+    return f"""
+You are drafting an email reply for a corporate environment.
+
+Hard rules:
+- Use ONLY the information contained in SNIPPETS.
+- Do NOT output personal data, company names, email addresses, phone numbers, IDs, or monetary amounts.
+- Do NOT paste long blocks verbatim from snippets. Summarize in your own words.
+- If the answer is not explicitly supported by the snippets, reply exactly:
 "I don't have that information in the provided documents."
+- Keep the reply short (max 130 words).
 
-Write a short email reply (max 140 words). Be factual.
-If you need missing details, ask 1–2 questions.
-Do NOT include any personal data, email addresses, phone numbers, company names, IDs, or money amounts.
-
-End with: (Based on: <file names used>)
+Output format:
+1) 1–2 sentence direct answer
+2) 2–4 bullet points with key details (only if supported)
+3) If needed: 1–2 clarifying questions
 
 SNIPPETS:
 {block}
 
 EMAIL SUBJECT:
-{redacted_subject}
+{rs}
 
 EMAIL QUESTION (plain text):
-{redacted_email_text}
-"""
-
+{rb}
+""".strip()
 
 def call_azure_openai(client: AzureOpenAI, prompt: str) -> str:
     r = client.chat.completions.create(
-        model=AZURE_DEPLOYMENT_NAME,  # Azure uses DEPLOYMENT NAME
+        model=AZURE_DEPLOYMENT_NAME,
         temperature=0.1,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Strictly use only snippets. Never invent. "
-                    "Never output personal data, emails, phone numbers, company names, IDs, or monetary amounts. "
-                    "If needed, ask for missing details instead."
-                ),
-            },
+            {"role": "system", "content": "Be concise. Obey the hard rules. Never invent beyond snippets."},
             {"role": "user", "content": prompt},
         ],
     )
     return r.choices[0].message.content or ""
 
-
-# ---------- Outlook helpers ----------
+# -------------------------
+# Outlook helpers
+# -------------------------
 def clean_html_to_text(html: str) -> str:
     txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
     return clean_ws(txt)
-
 
 def get_sender_smtp(mail) -> str:
     try:
@@ -383,7 +482,6 @@ def get_sender_smtp(mail) -> str:
     except Exception:
         return (mail.SenderEmailAddress or "").lower()
 
-
 def add_processed_category(mail):
     try:
         cats = mail.Categories or ""
@@ -392,7 +490,6 @@ def add_processed_category(mail):
             mail.Save()
     except Exception:
         pass
-
 
 def get_target_folder():
     ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
@@ -404,13 +501,12 @@ def get_target_folder():
             break
 
     if not target_store:
-        print("Available stores (use one of these in TARGET_MAILBOX):")
+        print("Available stores:")
         for st in ns.Stores:
             print(" -", st.DisplayName)
-        raise SystemExit("Target mailbox not found.")
+        raise SystemExit("Target mailbox not found. Adjust TARGET_MAILBOX.")
 
     inbox = target_store.GetDefaultFolder(6)  # Inbox
-
     if WATCH_FOLDER_NAME.lower() == "inbox":
         return inbox, target_store.DisplayName, "Inbox"
 
@@ -418,52 +514,47 @@ def get_target_folder():
         if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
             return f, target_store.DisplayName, f.Name
 
-    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
+    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox.")
 
+# -------------------------
+# Logging
+# -------------------------
+def log_run(subject: str, sender: str, used_kb_ids: List[str], drafted: bool):
+    logdir = ensure_log_dir()
+    path = logdir / RUN_LOG_CSV
+    exists = path.exists()
 
-# ---------- Self notification ----------
+    with path.open("a", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["timestamp", "subject", "sender", "used_kb_ids", "drafted"])
+        if not exists:
+            w.writeheader()
+        w.writerow({
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "subject": subject,
+            "sender": sender,
+            "used_kb_ids": ",".join(used_kb_ids),
+            "drafted": "yes" if drafted else "no",
+        })
+
+# -------------------------
+# Self notification (optional, no PII expansion)
+# -------------------------
 def name_from_email(email: str) -> str:
     email = (email or "").strip().lower()
     local = email.split("@")[0] if "@" in email else email
     first = local.split(".")[0] if local else ""
     return (first[:1].upper() + first[1:]) if first else "Colleague"
 
-
-def get_account_for_mailbox(ns, mailbox_substring: str):
-    try:
-        for acc in ns.Session.Accounts:
-            smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
-            if mailbox_substring.lower() in smtp or smtp in mailbox_substring.lower():
-                return acc
-    except Exception:
-        pass
-    return None
-
-
-def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
+def send_self_notification(ns, to_addr: str, orig_subject: str, requester_email: str, used_ids: List[str]):
     requester_name = name_from_email(requester_email)
-
-    msg = ns.Application.CreateItem(0)  # MailItem
+    msg = ns.Application.CreateItem(0)
     msg.To = to_addr
     msg.Subject = f"Draft created (review needed): {orig_subject}"
     msg.HTMLBody = (
-        f"<p>A draft reply has been created.</p>"
-        f"<ul>"
-        f"<li><b>Original subject:</b> {orig_subject}</li>"
-        f"<li><b>Requester:</b> {requester_email}</li>"
-        f"</ul>"
-        f"<p>Please verify the information and then send it to <b>{requester_name}</b>.</p>"
+        f"<p>A draft reply has been created. Please review and then send it to <b>{requester_name}</b>.</p>"
+        f"<p><b>KB sources used (IDs):</b> {', '.join(used_ids) if used_ids else '(none)'}</p>"
     )
-
-    acc = get_account_for_mailbox(ns, from_mailbox)
-    if acc:
-        try:
-            msg.SendUsingAccount = acc
-        except Exception:
-            pass
-
     msg.Send()
-
 
 # =========================
 # MAIN (RUN ONCE)
@@ -475,7 +566,6 @@ def main():
     kb_files = load_kb(KB_DIR)
     print("KB loaded:", len(kb_files), "documents")
 
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
     folder, store_name, folder_name = get_target_folder()
     print(f"Mailbox={store_name} | Folder={folder_name}")
 
@@ -487,6 +577,8 @@ def main():
 
     drafted = 0
     checked = 0
+
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
 
     for mail in items:
         checked += 1
@@ -515,15 +607,15 @@ def main():
 
             body_text = clean_html_to_text(mail.HTMLBody or "")
 
-            # Retrieve locally using original text
-            snips = pick_relevant(kb_files, subject, body_text)
+            snips = pick_relevant(kb_files, subject, body_text)  # returns (kb_id, redacted_snip_text)
+            used_ids = [kb_id for kb_id, _ in snips]
 
             prompt = make_prompt(snips, subject, body_text)
             answer = call_azure_openai(client, prompt)
 
-            # Ensure output contains no sensitive remnants
+            # Final local safety pass (remove anything that slips through)
             answer = redact_sensitive(answer)
-            answer = strip_redaction_tokens(answer)
+            answer = clean_ws(answer)
 
             reply = mail.Reply()
             reply.HTMLBody = f"<p>{answer}</p><hr>" + reply.HTMLBody
@@ -539,22 +631,29 @@ def main():
                     try:
                         send_self_notification(
                             ns=ns,
-                            from_mailbox=TARGET_MAILBOX,
                             to_addr=SELF_NOTIFY_TO,
                             orig_subject=subject,
                             requester_email=sender,
+                            used_ids=used_ids,
                         )
-                        print("Self-notification sent for:", subject)
+                        print("Self-notification sent.")
                     except Exception as e:
                         print("Self-notification error:", e)
 
             add_processed_category(mail)
+            log_run(subject=subject, sender=sender, used_kb_ids=used_ids, drafted=True)
             drafted += 1
 
         except Exception as e:
-            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", e)
+            subj = getattr(mail, "Subject", "<no subject>")
+            print("Mail error:", subj, "-", e)
+            try:
+                log_run(subject=subj, sender=get_sender_smtp(mail), used_kb_ids=[], drafted=False)
+            except Exception:
+                pass
 
     print(f"Done. Checked={checked}, Drafted={drafted}")
+    print("Logs in:", Path(LOG_DIR).resolve())
 
 
 if __name__ == "__main__":
