@@ -1,22 +1,15 @@
----------------------------------------------------------------------------
-ModuleNotFoundError                       Traceback (most recent call last)
-Cell In[8], line 24
-     21 from pathlib import Path
-     22 from typing import List, Tuple, Optional
----> 24 import win32com.client as win32
-     25 from openai import AzureOpenAI
-     26 from docx import Document as DocxDocument
+python -c "import sys; print(sys.executable); print(sys.version)"
 
-File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python311\Lib\site-packages\win32com\__init__.py:9
-      6 import os
-      7 import sys
-----> 9 import pythoncom
-     10 import win32api
-     12 # flag if we are in a "frozen" build.
+python -m pip uninstall -y pywin32 pypiwin32
+python -m pip install --upgrade pip
+python -m pip install --upgrade pywin32
 
-File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python311\Lib\site-packages\pythoncom.py:2
-      1 # Magic utility that "redirects" to pythoncomXX.dll
-----> 2 import pywintypes
-      4 pywintypes.__import_pywin32_system_module__("pythoncom", globals())
+python -m pywin32_postinstall -install
 
-ModuleNotFoundError: No module named 'pywintypes'
+python -c "import win32com.client as win32; import pywintypes; print('pywin32 OK')"
+
+import sys
+print(sys.executable)
+
+"<PASTE_THE_PATH_FROM_ABOVE>" -m pip install --upgrade pywin32
+"<PASTE_THE_PATH_FROM_ABOVE>" -m pywin32_postinstall -install
