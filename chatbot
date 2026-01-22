@@ -1,85 +1,169 @@
 # -*- coding: utf-8 -*-
+"""
+Highlight sensitive patterns in .txt files and export as colored HTML.
+
+Inputs:
+- A folder with .txt files
+
+Outputs:
+- A subfolder "highlighted_html" with one .html file per .txt
+- Original .txt files are NOT modified
+
+Highlights:
+- Emails (yellow)
+- Phone numbers (light green)
+- Addresses (light blue, heuristic)
+- Numbers (light gray)
+- Names (pink, optional heuristic; OFF by default)
+"""
+
 import re
 from pathlib import Path
-import win32com.client as win32
+from html import escape
 
-# ===== EDIT =====
-MSG_FOLDER = r"C:\Users\SHTANDO\Desktop\MSG_Test"
-OUT_TEXT_SUBFOLDER = "converted_text"
-# ===============
+# =========================
+# EDIT THESE
+# =========================
+TXT_DIR = r"C:\Users\SHTANDO\KB_Test"   # folder containing .txt files
+OUT_SUBFOLDER = "highlighted_html"
+HIGHLIGHT_NAMES = False                # set True only if you accept false positives
+# =========================
 
-def clean_filename(name: str, max_len: int = 140) -> str:
-    name = name or "no_subject"
-    name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name[:max_len] if len(name) > max_len else name
+# ---- Patterns (tune as needed) ----
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+
+# Phone: tolerant (international +49, spaces, /, -)
+PHONE_RE = re.compile(
+    r"(?<!\w)(?:\+?\d{1,3}[\s\-\/]?)?(?:\(?\d{2,5}\)?[\s\-\/]?)?\d{3,4}[\s\-\/]?\d{3,4}(?!\w)"
+)
+
+# Address heuristic (DE-focused): street + number
+ADDRESS_RE = re.compile(
+    r"\b([A-ZÄÖÜ][a-zäöüß]+(?:\s[A-ZÄÖÜ][a-zäöüß]+){0,3})\s"
+    r"(Straße|Strasse|Str\.|Weg|Allee|Platz|Ring|Gasse|Damm|Ufer)\s"
+    r"\d{1,5}[a-zA-Z]?\b"
+)
+
+# Numbers (avoid matching inside emails/phones too aggressively)
+NUMBER_RE = re.compile(r"\b\d+(?:[.,]\d+)?\b")
+
+# Names (very heuristic): "Firstname Lastname" with capitals
+NAME_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{1,}\s[A-ZÄÖÜ][a-zäöüß]{1,}\b")
+
+
+def apply_highlights(text: str) -> str:
+    """
+    Convert plain text to HTML with colored spans.
+    Approach: protect matches with placeholders, then replace.
+    Order matters (emails first, phones next, addresses, names, numbers).
+    """
+
+    original = text
+    work = original
+
+    hits = []
+
+    def mark(regex, label):
+        nonlocal work, hits
+        for m in list(regex.finditer(work)):
+            hits.append((m.start(), m.end(), label, m.group(0)))
+
+    # Collect spans on the current string
+    mark(EMAIL_RE, "email")
+    mark(PHONE_RE, "phone")
+    mark(ADDRESS_RE, "address")
+    if HIGHLIGHT_NAMES:
+        mark(NAME_RE, "name")
+    mark(NUMBER_RE, "number")
+
+    # Sort spans by start, longer first if same start
+    hits.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+
+    # Remove overlaps (keep first, skip overlapping)
+    merged = []
+    last_end = -1
+    for s, e, label, val in hits:
+        if s < last_end:
+            continue
+        merged.append((s, e, label, val))
+        last_end = e
+
+    # Build HTML with escaped text
+    parts = []
+    cur = 0
+    for s, e, label, val in merged:
+        parts.append(escape(original[cur:s]))
+
+        color = {
+            "email":  "#fff59d",  # yellow
+            "phone":  "#c8e6c9",  # green
+            "address":"#bbdefb",  # blue
+            "name":   "#f8bbd0",  # pink
+            "number": "#eeeeee",  # gray
+        }.get(label, "#ffffcc")
+
+        parts.append(f'<span class="hl {label}" style="background:{color}; padding:0 2px; border-radius:3px;">{escape(original[s:e])}</span>')
+        cur = e
+
+    parts.append(escape(original[cur:]))
+
+    # Preserve line breaks
+    body_html = "".join(parts).replace("\n", "<br>\n")
+
+    # Simple legend
+    legend = """
+    <div style="font-family:Segoe UI,Arial; font-size:13px; margin-bottom:12px;">
+      <b>Legend:</b>
+      <span style="background:#fff59d;padding:2px 6px;border-radius:3px;">Email</span>
+      <span style="background:#c8e6c9;padding:2px 6px;border-radius:3px;margin-left:6px;">Phone</span>
+      <span style="background:#bbdefb;padding:2px 6px;border-radius:3px;margin-left:6px;">Address</span>
+      <span style="background:#eeeeee;padding:2px 6px;border-radius:3px;margin-left:6px;">Number</span>
+    </div>
+    """
+    if HIGHLIGHT_NAMES:
+        legend = legend.replace("</div>", ' <span style="background:#f8bbd0;padding:2px 6px;border-radius:3px;margin-left:6px;">Name</span></div>')
+
+    html = f"""
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Highlighted Text</title>
+    </head>
+    <body style="font-family:Segoe UI,Arial; font-size:13px; line-height:1.35; padding:16px;">
+      {legend}
+      <div style="white-space:normal;">
+        {body_html}
+      </div>
+    </body>
+    </html>
+    """
+    return html
+
 
 def main():
-    msg_folder = Path(MSG_FOLDER)
-    print("MSG_FOLDER =", MSG_FOLDER)
-    print("Resolved  =", msg_folder.resolve())
-    print("Exists    =", msg_folder.exists(), "Is dir =", msg_folder.is_dir())
+    base = Path(TXT_DIR)
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"TXT_DIR not found or not a folder: {TXT_DIR}")
 
-    msg_files = sorted(msg_folder.glob("*.msg"))
-    print("Found .msg:", len(msg_files))
-    if msg_files:
-        print("First 3:", [f.name for f in msg_files[:3]])
+    out_dir = base / OUT_SUBFOLDER
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_text_dir = msg_folder / OUT_TEXT_SUBFOLDER
-    out_text_dir.mkdir(parents=True, exist_ok=True)
-    print("Output dir:", out_text_dir.resolve())
+    txt_files = sorted(base.glob("*.txt"))
+    print("Found .txt files:", len(txt_files))
+    if not txt_files:
+        print("No .txt files in folder.")
+        return
 
-    # Start Outlook COM
-    print("Starting Outlook COM…")
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-    print("Outlook COM OK.")
+    for f in txt_files:
+        txt = f.read_text(encoding="utf-8", errors="ignore")
+        html = apply_highlights(txt)
 
-    converted = 0
-    failed = 0
+        out_path = out_dir / (f.stem + ".html")
+        out_path.write_text(html, encoding="utf-8")
+        print("Wrote:", out_path)
 
-    for i, f in enumerate(msg_files, start=1):
-        try:
-            print(f"[{i}/{len(msg_files)}] Opening:", f.name)
-            item = ns.OpenSharedItem(str(f))
+    print("Done. Output folder:", out_dir)
 
-            # Basic inspection
-            cls = getattr(item, "Class", None)
-            msg_class = getattr(item, "MessageClass", "")
-            subj = getattr(item, "Subject", "") or f.stem
-
-            print("    Class =", cls, "| MessageClass =", msg_class, "| Subject =", subj[:60])
-
-            # Extract body
-            body = getattr(item, "Body", "") or ""
-            if not body.strip():
-                html = getattr(item, "HTMLBody", "") or ""
-                body = re.sub(r"<[^>]+>", " ", html)
-                body = re.sub(r"\s+", " ", body).strip()
-
-            base_name = clean_filename(f.stem)
-            out_txt = out_text_dir / f"{base_name}.txt"
-
-            content = (
-                f"FILE: {f.name}\n"
-                f"SUBJECT: {subj}\n"
-                f"MESSAGECLASS: {msg_class}\n"
-                f"\n--- BODY ---\n"
-                f"{body}\n"
-            )
-
-            out_txt.write_text(content, encoding="utf-8", errors="ignore")
-            print("    Wrote:", out_txt.name)
-
-            converted += 1
-
-        except Exception as e:
-            failed += 1
-            print("    FAIL:", f.name, "|", repr(e))
-
-    print("\nDone.")
-    print("Converted:", converted)
-    print("Failed   :", failed)
-    print("Check output folder:", out_text_dir.resolve())
 
 if __name__ == "__main__":
     main()
