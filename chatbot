@@ -13,6 +13,11 @@ Enhancements in this version:
 - Special DOCX table parser for:
   "2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx"
   where column "Fragen" = questions and column "Antwort/ Erklärung" = answers
+
+Small changes added (no change to the main flow):
+1) Process ONLY if subject is exactly "bot" (case-insensitive). NOT "RE: bot", "AW: bot", etc.
+2) Adds "Hello <SenderFirstName>," + "Best regards, <YourFirstName>"
+3) Encourages paragraphs and => bullets for multi-step answers
 """
 
 import os
@@ -37,7 +42,9 @@ WATCH_FOLDER_NAME = "Inbox"                           # "Inbox" or subfolder und
 
 KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
 
-SUBJECT_TOKEN = "[bot]"       # set "" to disable subject gating
+# Subject must be exactly this (case-insensitive), no prefixes like RE:/AW:
+STRICT_SUBJECT = "bot"
+
 REQUIRE_UNREAD = True
 AUTO_SEND = False             # Draft only
 PROCESS_PER_RUN = 3
@@ -77,8 +84,6 @@ REDACT_COMPANY_TERMS = [
     "Catena X",
 ]
 
-# Replace or remove sensitive info BEFORE sending to LLM.
-# (No [REDACTED_*] placeholders will survive into the final drafted email.)
 REDACT_PATTERNS = [
     # Email addresses -> remove
     (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", ""),
@@ -90,7 +95,7 @@ REDACT_PATTERNS = [
     # Phone numbers -> remove (broad)
     (r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d", ""),
 
-    # IDs / references -> neutral text (requires at least one digit to avoid matching names)
+    # IDs / references -> neutral text (requires at least one digit)
     (r"\b(?:PO|PR|NCR|Ticket|Case|Req|Request|Material|Part)\s*[:#]?\s*[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b",
      "the relevant reference"),
 
@@ -100,9 +105,36 @@ REDACT_PATTERNS = [
     (r"\b€\s*\d[\d\.\,\s]*\b", "an amount"),
 ]
 
-# Optional: aggressive "Firstname Lastname" deletion (can over-delete German text)
 AGGRESSIVE_NAME_REDACTION = False
 NAME_LIKE_PATTERN = r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b"
+
+
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def is_strict_subject(subject: str) -> bool:
+    """
+    Only allow subject exactly == STRICT_SUBJECT (case-insensitive), after trimming.
+    Rejects 'RE: bot', 'AW: bot', etc.
+    """
+    s = (subject or "").strip()
+    return s.casefold() == STRICT_SUBJECT.casefold()
+
+
+def first_name_from_email(email: str) -> str:
+    """
+    Extract first name from email like 'rahul.singh@...' -> 'Rahul'
+    Fallback: 'there'
+    """
+    e = (email or "").strip().lower()
+    if "@" not in e:
+        return "there"
+    local = e.split("@", 1)[0]
+    first = local.split(".", 1)[0].strip()
+    if not first:
+        return "there"
+    return first[:1].upper() + first[1:]
 
 
 def redact_sensitive(text: str) -> str:
@@ -112,20 +144,16 @@ def redact_sensitive(text: str) -> str:
 
     t = text
 
-    # Remove company terms
     for term in REDACT_COMPANY_TERMS:
         if term:
             t = re.sub(re.escape(term), "", t, flags=re.IGNORECASE)
 
-    # Apply regex redactions
     for pat, repl in REDACT_PATTERNS:
         t = re.sub(pat, repl, t)
 
-    # Optional: aggressive name-like removal
     if AGGRESSIVE_NAME_REDACTION:
         t = re.sub(NAME_LIKE_PATTERN, "", t)
 
-    # Cleanup punctuation/whitespace
     t = re.sub(r"\s+", " ", t).strip()
     t = re.sub(r"\s+([,.;:])", r"\1", t)
     t = re.sub(r"([,.;:]){2,}", r"\1", t)
@@ -156,10 +184,6 @@ def build_azure_client() -> AzureOpenAI:
 
 
 # ---------- KB readers ----------
-def clean_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
-
-
 def read_txt(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="ignore")
 
@@ -184,12 +208,6 @@ def find_col_index(headers: List[str], target: str) -> Optional[int]:
 
 
 def read_special_qa_docx(p: Path) -> str:
-    """
-    For SPECIAL_QA_DOC_NAME:
-    Column "Fragen" -> Q
-    Column "Antwort/ Erklärung" (and variants) -> A
-    Output: Q/A pairs
-    """
     doc = DocxDocument(str(p))
     qa_lines = []
 
@@ -228,7 +246,6 @@ def read_special_qa_docx(p: Path) -> str:
                 qa_lines.append(f"Q: (missing question)\nA: {a}")
 
     if not qa_lines:
-        # fallback
         paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
         tables = extract_docx_tables_as_text(doc)
         return clean_ws(paras + "\n" + tables)
@@ -312,22 +329,27 @@ def pick_relevant(files: List[Tuple[str, str]], subject: str, body_text: str) ->
 
 # ---------- prompt forcing snippet-only + redaction ----------
 def make_prompt(snips: List[Tuple[str, str]], subject: str, email_text: str) -> str:
-    # Redact before LLM
     redacted_subject = redact_sensitive(subject)
     redacted_email_text = redact_sensitive(email_text)
 
     redacted_snips = [(n, redact_sensitive(t)) for n, t in snips]
     block = "\n\n---\n\n".join([f"[{n}]\n{t}" for n, t in redacted_snips]) if redacted_snips else "(no snippets)"
 
+    # NOTE: This prompt is intentionally less "self-sabotaging" than the earlier strict version.
+    # It still forces snippet-only grounding, but it allows answering + asking 1-2 clarifying questions.
     return f"""You MUST answer using ONLY the SNIPPETS below.
-If the answer is not explicitly supported by the snippets, reply exactly:
-"I don't have that information in the provided documents."
 
-Write a short email reply (max 140 words). Be factual.
-If you need missing details, ask 1–2 questions.
-Do NOT include any personal data, email addresses, phone numbers, company names, IDs, or money amounts.
+Rules:
+- Use only the snippets as grounding. Do not invent facts.
+- If snippets are insufficient for a complete answer, write what you can supported by snippets,
+  then ask 1–2 short clarifying questions.
+- Keep it professional and concise (max ~160 words).
+- Use paragraphs (blank line) when the topic changes.
+- If there are multiple steps/items, use bullet points prefixed exactly with "=> ".
+- Do NOT include personal data, email addresses, phone numbers, company/supplier names, IDs, or money amounts.
+- Paraphrase; do not copy long phrases from snippets.
 
-End with: (Based on: <file names used>)
+Return ONLY the email body text.
 
 SNIPPETS:
 {block}
@@ -342,15 +364,15 @@ EMAIL QUESTION (plain text):
 
 def call_azure_openai(client: AzureOpenAI, prompt: str) -> str:
     r = client.chat.completions.create(
-        model=AZURE_DEPLOYMENT_NAME,  # Azure uses DEPLOYMENT NAME
+        model=AZURE_DEPLOYMENT_NAME,
         temperature=0.1,
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "Strictly use only snippets. Never invent. "
-                    "Never output personal data, emails, phone numbers, company names, IDs, or monetary amounts. "
-                    "If needed, ask for missing details instead."
+                    "Use only snippets. Do not invent facts. "
+                    "Format as a ready-to-send email body with paragraphs and => bullets if needed. "
+                    "Never include personal data, emails, phone numbers, company/supplier names, IDs, or money amounts."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -415,13 +437,6 @@ def get_target_folder():
 
 
 # ---------- Self notification ----------
-def name_from_email(email: str) -> str:
-    email = (email or "").strip().lower()
-    local = email.split("@")[0] if "@" in email else email
-    first = local.split(".")[0] if local else ""
-    return (first[:1].upper() + first[1:]) if first else "Colleague"
-
-
 def get_account_for_mailbox(ns, mailbox_substring: str):
     try:
         for acc in ns.Session.Accounts:
@@ -434,7 +449,7 @@ def get_account_for_mailbox(ns, mailbox_substring: str):
 
 
 def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
-    requester_name = name_from_email(requester_email)
+    requester_name = first_name_from_email(requester_email)
 
     msg = ns.Application.CreateItem(0)  # MailItem
     msg.To = to_addr
@@ -445,7 +460,7 @@ def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: st
         f"<li><b>Original subject:</b> {orig_subject}</li>"
         f"<li><b>Requester:</b> {requester_email}</li>"
         f"</ul>"
-        f"<p>Please verify the information and then send it to <b>{requester_name}</b>.</p>"
+        f"<p>Please review the draft before sending it to <b>{requester_name}</b>.</p>"
     )
 
     acc = get_account_for_mailbox(ns, from_mailbox)
@@ -456,6 +471,10 @@ def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: st
             pass
 
     msg.Send()
+
+
+def html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # =========================
@@ -481,6 +500,8 @@ def main():
     drafted = 0
     checked = 0
 
+    your_first_name = first_name_from_email(TARGET_MAILBOX)
+
     for mail in items:
         checked += 1
         if checked > SCAN_LIMIT:
@@ -503,23 +524,36 @@ def main():
                 continue
 
             subject = mail.Subject or ""
-            if SUBJECT_TOKEN and SUBJECT_TOKEN.lower() not in subject.lower():
+
+            # STRICT subject gating: ONLY "bot" (case-insensitive), no "RE:" / "AW:"
+            if not is_strict_subject(subject):
                 continue
 
             body_text = clean_html_to_text(mail.HTMLBody or "")
 
-            # Retrieve locally using original text
+            # Retrieve locally using original text (unchanged)
             snips = pick_relevant(kb_files, subject, body_text)
 
             prompt = make_prompt(snips, subject, body_text)
             answer = call_azure_openai(client, prompt)
 
-            # Ensure output contains no sensitive remnants
+            # Ensure output contains no sensitive remnants (unchanged)
             answer = redact_sensitive(answer)
             answer = strip_redaction_tokens(answer)
 
+            # Add greeting + signature (small change)
+            sender_first = first_name_from_email(sender)
+            final_body = (
+                f"Hello {sender_first},\n\n"
+                f"{answer}\n\n"
+                f"Best regards,\n"
+                f"{your_first_name}"
+            )
+
+            # Draft reply with line breaks preserved (small change)
             reply = mail.Reply()
-            reply.HTMLBody = f"<p>{answer}</p><hr>" + reply.HTMLBody
+            html_body = "<br>".join(html_escape(line) for line in final_body.split("\n"))
+            reply.HTMLBody = f"<p>{html_body}</p><hr>" + reply.HTMLBody
 
             if AUTO_SEND:
                 reply.Send()
