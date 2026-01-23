@@ -13,6 +13,12 @@ Enhancements in this version:
 - Special DOCX table parser for:
   "2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx"
   where column "Fragen" = questions and column "Antwort/ Erklärung" = answers
+
+Additional small changes (requested):
+1) Draft reply supports paragraphs (blank lines -> separate <p> blocks in Outlook)
+2) Adds greeting: "Hello <SenderFirstName>," (sender first name derived from email local-part)
+   Adds sign-off: "Best regards,\n<MyFirstName>" (your first name derived from TARGET_MAILBOX)
+3) Forces bullet formatting for steps/items (uses '=>' bullets)
 """
 
 import os
@@ -55,6 +61,9 @@ AZURE_DEPLOYMENT_NAME = "gpt-4o"   # DEPLOYMENT NAME in your org
 SELF_NOTIFY = True
 SELF_NOTIFY_TO = TARGET_MAILBOX
 # =========================
+
+# Derive your first name for sign-off
+MY_EMAIL = TARGET_MAILBOX
 
 PROCESSED_CATEGORY = "AI-Drafted"
 MAX_FILES = 6
@@ -105,6 +114,10 @@ AGGRESSIVE_NAME_REDACTION = False
 NAME_LIKE_PATTERN = r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b"
 
 
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
 def redact_sensitive(text: str) -> str:
     """Redact/neutralize sensitive content. Used for subject/body/snippets AND final answer."""
     if not text:
@@ -143,6 +156,33 @@ def strip_redaction_tokens(text: str) -> str:
     return t
 
 
+def first_name_from_email(email: str) -> str:
+    """
+    Derive "Rahul" from "rahul.singh@..." (also handles underscores/hyphens).
+    """
+    email = (email or "").strip().lower()
+    local = email.split("@")[0] if "@" in email else email
+    token = re.split(r"[._-]", local)[0] if local else ""
+    return (token[:1].upper() + token[1:]) if token else "Colleague"
+
+
+def esc_html(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def text_to_html_paragraphs(text: str) -> str:
+    """
+    Convert plain text into HTML paragraphs for Outlook:
+    - blank lines -> separate paragraphs (<p>)
+    - single newlines inside a paragraph -> <br>
+    """
+    text = (text or "").strip()
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    html_parts = [f"<p>{esc_html(p).replace('\n', '<br>')}</p>" for p in parts]
+    return "\n".join(html_parts) if html_parts else "<p></p>"
+
+
 # ---------- Azure OpenAI client ----------
 def build_azure_client() -> AzureOpenAI:
     key = os.getenv("OPENAI_API_KEY")
@@ -156,10 +196,6 @@ def build_azure_client() -> AzureOpenAI:
 
 
 # ---------- KB readers ----------
-def clean_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
-
-
 def read_txt(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="ignore")
 
@@ -311,7 +347,7 @@ def pick_relevant(files: List[Tuple[str, str]], subject: str, body_text: str) ->
 
 
 # ---------- prompt forcing snippet-only + redaction ----------
-def make_prompt(snips: List[Tuple[str, str]], subject: str, email_text: str) -> str:
+def make_prompt(snips: List[Tuple[str, str]], subject: str, email_text: str, sender_first: str, my_first: str) -> str:
     # Redact before LLM
     redacted_subject = redact_sensitive(subject)
     redacted_email_text = redact_sensitive(email_text)
@@ -327,7 +363,15 @@ Write a short email reply (max 140 words). Be factual.
 If you need missing details, ask 1–2 questions.
 Do NOT include any personal data, email addresses, phone numbers, company names, IDs, or money amounts.
 
-End with: (Based on: <file names used>)
+Formatting requirements:
+- Start with: "Hello {sender_first},"
+- Use short paragraphs (blank line between paragraphs when appropriate).
+- For multiple steps/items, use bullets like:
+=> Step 1
+=> Step 2
+- End with:
+Best regards,
+{my_first}
 
 SNIPPETS:
 {block}
@@ -350,7 +394,8 @@ def call_azure_openai(client: AzureOpenAI, prompt: str) -> str:
                 "content": (
                     "Strictly use only snippets. Never invent. "
                     "Never output personal data, emails, phone numbers, company names, IDs, or monetary amounts. "
-                    "If needed, ask for missing details instead."
+                    "If needed, ask for missing details instead. "
+                    "Follow the requested formatting (greeting, paragraphs, bullets, sign-off)."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -508,18 +553,25 @@ def main():
 
             body_text = clean_html_to_text(mail.HTMLBody or "")
 
+            # Names for greeting/sign-off
+            sender_first = first_name_from_email(sender)
+            my_first = first_name_from_email(MY_EMAIL)
+
             # Retrieve locally using original text
             snips = pick_relevant(kb_files, subject, body_text)
 
-            prompt = make_prompt(snips, subject, body_text)
+            prompt = make_prompt(snips, subject, body_text, sender_first=sender_first, my_first=my_first)
             answer = call_azure_openai(client, prompt)
 
             # Ensure output contains no sensitive remnants
             answer = redact_sensitive(answer)
             answer = strip_redaction_tokens(answer)
 
+            # Convert to HTML paragraphs for Outlook
+            answer_html = text_to_html_paragraphs(answer)
+
             reply = mail.Reply()
-            reply.HTMLBody = f"<p>{answer}</p><hr>" + reply.HTMLBody
+            reply.HTMLBody = answer_html + "<hr>" + reply.HTMLBody
 
             if AUTO_SEND:
                 reply.Send()
