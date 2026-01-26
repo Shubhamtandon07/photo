@@ -1,10 +1,910 @@
-[1;34musage: [0m[1;35mipykernel_launcher.py[0m [[32m-h[0m] [32m[{bot,highlight}][0m
-ipykernel_launcher.py: error: unrecognized arguments: --f=c:\Users\SHTANDO\AppData\Roaming\jupyter\runtime\kernel-v39b09a689b90526bd7c1a757d5fa2eec4586c0175.json
+# -*- coding: utf-8 -*-
+"""
+ONE FILE, TWO MODES:
 
-An exception has occurred, use %tb to see the full traceback.
+1) BOT MODE (default):
+   Outlook -> Azure OpenAI -> Draft reply (RUN ONCE) + Self notification
+   - Uses KB folder + attachment text (including nested .msg attachments)
+   - Redacts sensitive info before sending to LLM
+   - Strict subject gate: subject must be exactly "bot" (case-insensitive),
+     NOT "RE: bot", NOT "AW: bot", etc.
+   - Adds greeting "Hello <FirstName>," derived from sender email local-part before dot
+   - Adds "Best regards" + your first name (from TARGET_MAILBOX local-part before dot)
+   - Encourages paragraphs and bullet points when appropriate
 
-SystemExit: 2
+2) HIGHLIGHT MODE:
+   Highlight sensitive patterns in .txt files and export colored HTML.
 
+Usage:
+  python script.py bot
+  python script.py highlight
+"""
 
-C:\Users\SHTANDO\AppData\Roaming\Python\Python314\site-packages\IPython\core\interactiveshell.py:3707: UserWarning: To exit: use 'exit', 'quit', or Ctrl-D.
-  warn("To exit: use 'exit', 'quit', or Ctrl-D.", stacklevel=1)
+import os
+import re
+import time
+import hashlib
+import tempfile
+import argparse
+from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple, Optional
+from html import escape
+
+import win32com.client as win32
+from openai import AzureOpenAI
+from docx import Document as DocxDocument
+from pypdf import PdfReader
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# =========================================================
+# BOT MODE SETTINGS (EDIT THESE)
+# =========================================================
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"   # Outlook store DisplayName substring match
+WATCH_FOLDER_NAME = "Inbox"                           # "Inbox" or subfolder under Inbox
+
+KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
+
+REQUIRE_UNREAD = True
+AUTO_SEND = False              # Draft only
+PROCESS_PER_RUN = 3
+SCAN_LIMIT = 200
+STARTUP_DELAY_SEC = 3
+
+ALLOWED_SENDERS = set()        # empty = allow anyone
+
+# Azure OpenAI (corporate)
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net/apikey/"
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-4o"   # your Azure deployment name
+
+# Self notification after draft created
+SELF_NOTIFY = True
+SELF_NOTIFY_TO = TARGET_MAILBOX
+
+# Retrieval limits
+PROCESSED_CATEGORY = "AI-Drafted"
+MAX_FILES = 6
+MAX_CHARS_PER_FILE = 4000
+MAX_TOTAL_CHARS = 12000
+SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}  # KB types
+
+SPECIAL_QA_DOC_NAME = "2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx"
+
+# Attachments extraction
+SUPPORTED_ATTACHMENT_EXTS = {".txt", ".pdf", ".docx", ".xlsx", ".msg"}  # can extend
+ATTACH_MAX_FILES = 8
+ATTACH_MAX_CHARS_PER_FILE = 5000
+ATTACH_MAX_TOTAL_CHARS = 12000
+ATTACH_MSG_DEPTH_LIMIT = 2
+
+ATTACH_TEMP_DIR = os.path.join(tempfile.gettempdir(), "aoai_outlook_attachments")
+os.makedirs(ATTACH_TEMP_DIR, exist_ok=True)
+
+# Redaction configuration (bot)
+REDACT_COMPANY_TERMS = [
+    "Mercedes-Benz", "Mercedes Benz", "Mercedes", "Daimler", "corpinter", "Catena-X", "Catena X"
+]
+REDACT_PATTERNS = [
+    (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", ""),  # emails
+    (r"\bhttps?://[^\s<>()]+\b", ""),                              # URLs
+    (r"\bwww\.[^\s<>()]+\b", ""),                                  # URLs
+    (r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d", ""),  # phones
+    (
+        r"\b(?:PO|PR|NCR|Ticket|Case|Req|Request|Material|Part|Supplier|Portal|Round|ID|Ref)\s*[:#]?\s*"
+        r"[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b",
+        "the relevant reference"
+    ),
+    (r"(?i)\b(?:EUR|USD|GBP|CHF)\s*\d[\d\.\,\s]*\b", "an amount"),
+    (r"\b\d[\d\.\,\s]*\s*(?:€|EUR|USD|GBP|CHF)\b", "an amount"),
+    (r"\b€\s*\d[\d\.\,\s]*\b", "an amount"),
+]
+
+# =========================================================
+# HIGHLIGHT MODE SETTINGS (EDIT THESE)
+# =========================================================
+TXT_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\converted_text"
+OUT_SUBFOLDER = "highlighted_html"
+
+HIGHLIGHT_NAMES = True
+HIGHLIGHT_TITLES = True
+
+# =========================================================
+# Shared helpers
+# =========================================================
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def safe_firstname_from_email(email: str) -> str:
+    """
+    Rahul.singh@ -> Rahul
+    If no dot: rahul@ -> Rahul
+    """
+    email = (email or "").strip()
+    if "@" in email:
+        local = email.split("@", 1)[0]
+    else:
+        local = email
+    first = local.split(".", 1)[0].strip()
+    if not first:
+        return "Colleague"
+    return first[:1].upper() + first[1:]
+
+def strict_subject_is_bot(subject: str) -> bool:
+    """
+    Must be exactly 'bot' ignoring case and surrounding whitespace.
+    Rejects 'RE: bot', 'AW: bot', etc.
+    """
+    s = (subject or "").strip().lower()
+    return s == "bot"
+
+def format_outlook_html(text: str) -> str:
+    """
+    Convert LLM plain text into Outlook-friendly HTML:
+    - Blank-line separated blocks -> <p>
+    - Blocks made of '- ' lines -> <ul><li>...</li></ul>
+    Keeps single newlines inside a paragraph as <br>.
+    """
+    text = (text or "").replace("\r\n", "\n").strip()
+    if not text:
+        return "<p></p>"
+
+    blocks = re.split(r"\n\s*\n", text)
+    html_parts = []
+
+    for block in blocks:
+        lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
+
+        if all(ln.startswith("- ") for ln in lines):
+            html_parts.append("<ul>")
+            for ln in lines:
+                html_parts.append(f"<li>{escape(ln[2:].strip())}</li>")
+            html_parts.append("</ul>")
+        else:
+            para = "<br>".join(escape(ln) for ln in lines)
+            html_parts.append(f"<p>{para}</p>")
+
+    return "\n".join(html_parts)
+
+# =========================================================
+# BOT MODE: Redaction
+# =========================================================
+def redact_sensitive(text: str) -> str:
+    if not text:
+        return ""
+    t = text
+
+    for term in REDACT_COMPANY_TERMS:
+        if term:
+            t = re.sub(re.escape(term), "", t, flags=re.IGNORECASE)
+
+    for pat, repl in REDACT_PATTERNS:
+        t = re.sub(pat, repl, t)
+
+    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\s+([,.;:])", r"\1", t)
+    t = re.sub(r"([,.;:]){2,}", r"\1", t)
+    t = re.sub(r"\(\s*\)", "", t)
+    return t.strip()
+
+def strip_redaction_tokens(text: str) -> str:
+    if not text:
+        return ""
+    t = re.sub(r"\[REDACTED_[A-Z_]+\]", "", text)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+# =========================================================
+# BOT MODE: Azure client
+# =========================================================
+def build_azure_client() -> AzureOpenAI:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise SystemExit("OPENAI_API_KEY env var missing (corporate Azure key).")
+    return AzureOpenAI(
+        api_version=AZURE_API_VERSION,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_key=key,
+    )
+
+# =========================================================
+# BOT MODE: KB readers
+# =========================================================
+def read_txt(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="ignore")
+
+def extract_docx_tables_as_text(doc: DocxDocument) -> str:
+    out = []
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [clean_ws(c.text) for c in row.cells]
+            if any(cells):
+                out.append(" | ".join(cells))
+    return "\n".join(out)
+
+def find_col_index(headers: List[str], target: str) -> Optional[int]:
+    target_norm = re.sub(r"\s+", "", target).lower()
+    for i, h in enumerate(headers):
+        hn = re.sub(r"\s+", "", (h or "")).lower()
+        if hn == target_norm:
+            return i
+    return None
+
+def read_special_qa_docx(p: Path) -> str:
+    doc = DocxDocument(str(p))
+    qa_lines = []
+
+    for table in doc.tables:
+        if not table.rows:
+            continue
+
+        header_cells = [clean_ws(c.text) for c in table.rows[0].cells]
+        if not any(header_cells):
+            continue
+
+        q_idx = find_col_index(header_cells, "Fragen")
+        a_idx = (
+            find_col_index(header_cells, "Antwort/ Erklärung")
+            or find_col_index(header_cells, "Antwort/Erklärung")
+            or find_col_index(header_cells, "Antwort")
+            or find_col_index(header_cells, "Erklärung")
+        )
+
+        if q_idx is None or a_idx is None:
+            continue
+
+        for row in table.rows[1:]:
+            cells = [clean_ws(c.text) for c in row.cells]
+            if q_idx >= len(cells) or a_idx >= len(cells):
+                continue
+            q = clean_ws(cells[q_idx])
+            a = clean_ws(cells[a_idx])
+            if not q and not a:
+                continue
+            if q and a:
+                qa_lines.append(f"Q: {q}\nA: {a}")
+            elif q and not a:
+                qa_lines.append(f"Q: {q}\nA: (no answer provided)")
+            elif a and not q:
+                qa_lines.append(f"Q: (missing question)\nA: {a}")
+
+    if not qa_lines:
+        paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
+        tables = extract_docx_tables_as_text(doc)
+        return clean_ws(paras + "\n" + tables)
+
+    return "\n\n".join(qa_lines)
+
+def read_docx(p: Path) -> str:
+    if p.name.strip().lower() == SPECIAL_QA_DOC_NAME.strip().lower():
+        return read_special_qa_docx(p)
+
+    doc = DocxDocument(str(p))
+    paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
+    tables = extract_docx_tables_as_text(doc)
+    return clean_ws(paras + "\n" + tables)
+
+def read_pdf(p: Path) -> str:
+    out = []
+    r = PdfReader(str(p))
+    for pg in r.pages:
+        try:
+            out.append(pg.extract_text() or "")
+        except Exception:
+            pass
+    return "\n".join(out)
+
+def read_xlsx(p: Path) -> str:
+    try:
+        import openpyxl
+    except Exception:
+        return ""
+
+    wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+    out = []
+    for ws in wb.worksheets:
+        out.append(f"Sheet: {ws.title}")
+        max_rows = min(ws.max_row or 0, 200)
+        max_cols = min(ws.max_column or 0, 30)
+        for r in range(1, max_rows + 1):
+            row_vals = []
+            for c in range(1, max_cols + 1):
+                v = ws.cell(row=r, column=c).value
+                row_vals.append("" if v is None else str(v))
+            if any(cell.strip() for cell in row_vals):
+                out.append(" | ".join(clean_ws(x) for x in row_vals))
+    return "\n".join(out)
+
+def extract_text_from_file(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext == ".txt":
+        return clean_ws(read_txt(p))
+    if ext == ".docx":
+        return clean_ws(read_docx(p))
+    if ext == ".pdf":
+        return clean_ws(read_pdf(p))
+    if ext == ".xlsx":
+        return clean_ws(read_xlsx(p))
+    return ""
+
+def load_kb(dirpath: str) -> List[Tuple[str, str]]:
+    base = Path(dirpath)
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"KB_DIR not found or not a folder: {dirpath}")
+
+    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    if not files:
+        raise SystemExit(f"No supported KB files found in: {dirpath}")
+
+    out: List[Tuple[str, str]] = []
+    for p in sorted(files):
+        try:
+            txt = extract_text_from_file(p)
+            txt = clean_ws(txt)
+            if txt:
+                out.append((p.name, txt[:MAX_CHARS_PER_FILE]))
+        except Exception as e:
+            print("Skip KB file:", p.name, "-", e)
+
+    if not out:
+        raise SystemExit("KB files found, but no extractable text.")
+    return out
+
+# =========================================================
+# BOT MODE: Attachments extraction (incl. nested .msg)
+# =========================================================
+def _safe_save_attachment(att, dest_path: str) -> bool:
+    try:
+        att.SaveAsFile(dest_path)
+        return True
+    except Exception:
+        return False
+
+def _unique_temp_path(filename: str) -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    safe = re.sub(r"[^A-Za-z0-9._\- ]+", "_", filename or "attachment")
+    return os.path.join(ATTACH_TEMP_DIR, f"{ts}__{safe}")
+
+def extract_from_mail_attachments(ns, mail_item, depth: int = 0) -> List[Tuple[str, str]]:
+    results: List[Tuple[str, str]] = []
+    try:
+        atts = mail_item.Attachments
+    except Exception:
+        return results
+
+    for i in range(1, atts.Count + 1):
+        try:
+            att = atts.Item(i)
+            fname = getattr(att, "FileName", "") or f"attachment_{i}"
+            ext = Path(fname).suffix.lower()
+
+            if ext not in SUPPORTED_ATTACHMENT_EXTS:
+                continue
+
+            tmp_path = _unique_temp_path(fname)
+            if not _safe_save_attachment(att, tmp_path):
+                continue
+
+            p = Path(tmp_path)
+
+            if p.suffix.lower() == ".msg":
+                if depth >= ATTACH_MSG_DEPTH_LIMIT:
+                    continue
+                try:
+                    msg_item = ns.OpenSharedItem(str(p))
+                except Exception:
+                    try:
+                        msg_item = ns.Application.CreateItemFromTemplate(str(p))
+                    except Exception:
+                        continue
+
+                # body
+                try:
+                    msg_html = getattr(msg_item, "HTMLBody", "") or ""
+                    msg_body = clean_html_to_text(msg_html) or clean_ws(getattr(msg_item, "Body", "") or "")
+                    msg_body = msg_body[:ATTACH_MAX_CHARS_PER_FILE]
+                    if msg_body.strip():
+                        results.append((f"AttachedEmail:{fname}", msg_body))
+                except Exception:
+                    pass
+
+                # recurse into .msg attachments
+                results.extend(extract_from_mail_attachments(ns, msg_item, depth=depth + 1))
+                continue
+
+            # normal file
+            txt = extract_text_from_file(p)
+            if txt:
+                results.append((fname, txt[:ATTACH_MAX_CHARS_PER_FILE]))
+
+        except Exception:
+            continue
+
+    return results[:ATTACH_MAX_FILES]
+
+# =========================================================
+# BOT MODE: Retrieval
+# =========================================================
+def pick_relevant(files: List[Tuple[str, str]], subject: str, body_text: str, max_files: int) -> List[Tuple[str, str]]:
+    q = (subject + " " + body_text).lower()
+    scores = []
+    for name, text in files:
+        score = 0
+        for token in re.split(r"[^a-z0-9]+", Path(name).stem.lower()):
+            if token and token in q:
+                score += 6
+        for token in set(re.split(r"[^a-z0-9]+", q)):
+            if token and token in text.lower():
+                score += 1
+        scores.append((score, name, text))
+
+    scores.sort(reverse=True)
+    picked = [(n, t) for s, n, t in scores[:max_files]]
+
+    total = 0
+    cut: List[Tuple[str, str]] = []
+    for n, t in picked:
+        if total + len(t) > MAX_TOTAL_CHARS:
+            cut.append((n, t[: max(0, MAX_TOTAL_CHARS - total)]))
+            break
+        cut.append((n, t))
+        total += len(t)
+    return cut
+
+# =========================================================
+# BOT MODE: Attachment "placement" heuristic into the email text
+# =========================================================
+def inject_attachment_extracts_into_email_text(email_text: str, attach_docs: List[Tuple[str, str]]) -> str:
+    """
+    Best-effort placement:
+    - If filename or filename stem is mentioned in the email_text, inject a short extract after first mention.
+    - Otherwise append a section at the end.
+    """
+    if not email_text.strip() or not attach_docs:
+        return email_text
+
+    text = email_text
+    used = set()
+
+    def short_extract(s: str, limit: int = 600) -> str:
+        s = clean_ws(s)
+        return (s[:limit] + "…") if len(s) > limit else s
+
+    for fname, content in attach_docs:
+        if not content.strip():
+            continue
+
+        stem = Path(fname).stem
+
+        if fname:
+            m = re.search(re.escape(fname), text, flags=re.IGNORECASE)
+            if m:
+                block = f"\n\n[Attachment extract: {fname}]\n{short_extract(content)}\n"
+                insert_at = m.end()
+                text = text[:insert_at] + block + text[insert_at:]
+                used.add(fname)
+                continue
+
+        if stem and fname not in used:
+            m = re.search(re.escape(stem), text, flags=re.IGNORECASE)
+            if m:
+                block = f"\n\n[Attachment extract: {fname}]\n{short_extract(content)}\n"
+                insert_at = m.end()
+                text = text[:insert_at] + block + text[insert_at:]
+                used.add(fname)
+
+    remaining = [(f, c) for f, c in attach_docs if f not in used and c.strip()]
+    if remaining:
+        text += "\n\nAttachment extracts:\n"
+        for f, c in remaining:
+            text += f"- {f}: {short_extract(c)}\n"
+
+    return text
+
+# =========================================================
+# BOT MODE: Prompt + LLM call
+# =========================================================
+def make_prompt(snips: List[Tuple[str, str]], subject: str, email_text: str, sender_firstname: str, your_firstname: str) -> str:
+    redacted_subject = redact_sensitive(subject)
+    redacted_email_text = redact_sensitive(email_text)
+
+    redacted_snips = [(n, redact_sensitive(t)) for n, t in snips]
+    block = "\n\n---\n\n".join([f"[{n}]\n{t}" for n, t in redacted_snips]) if redacted_snips else "(no snippets)"
+
+    return f"""You MUST answer using ONLY the SNIPPETS below.
+If the answer is not explicitly supported by the snippets, reply exactly:
+"I don't have that information in the provided documents."
+
+Write a short email reply (max 160 words). Be factual and professional.
+Formatting requirements:
+- Use paragraphs (line breaks) when it improves readability.
+- If there are multiple steps or multiple items, use bullet points with "-" (dash).
+- Start with: "Hello {sender_firstname},"
+- End with:
+"Best regards,
+{your_firstname}"
+
+Do NOT include any personal data, email addresses, phone numbers, company names, IDs, or money amounts.
+Do NOT copy/paste from snippets; paraphrase.
+
+SNIPPETS:
+{block}
+
+EMAIL SUBJECT:
+{redacted_subject}
+
+EMAIL QUESTION (plain text):
+{redacted_email_text}
+"""
+
+def call_azure_openai(client: AzureOpenAI, prompt: str) -> str:
+    r = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+        temperature=0.1,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Strictly use only snippets. Never invent. "
+                    "Obey formatting requirements. Never output personal data, emails, phone numbers, "
+                    "company names, IDs, or monetary amounts."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return r.choices[0].message.content or ""
+
+# =========================================================
+# BOT MODE: Outlook helpers
+# =========================================================
+def clean_html_to_text(html: str) -> str:
+    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
+    return clean_ws(txt)
+
+def get_sender_smtp(mail) -> str:
+    try:
+        addr = (mail.SenderEmailAddress or "").lower()
+        if addr.startswith("/o="):
+            ex = mail.Sender.GetExchangeUser()
+            if ex:
+                return (ex.PrimarySmtpAddress or "").lower()
+        return addr
+    except Exception:
+        return (mail.SenderEmailAddress or "").lower()
+
+def add_processed_category(mail):
+    try:
+        cats = mail.Categories or ""
+        if PROCESSED_CATEGORY.lower() not in cats.lower():
+            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
+            mail.Save()
+    except Exception:
+        pass
+
+def get_target_folder():
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+    target_store = None
+    for st in ns.Stores:
+        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
+            target_store = st
+            break
+
+    if not target_store:
+        print("Available stores (use one of these in TARGET_MAILBOX):")
+        for st in ns.Stores:
+            print(" -", st.DisplayName)
+        raise SystemExit("Target mailbox not found.")
+
+    inbox = target_store.GetDefaultFolder(6)  # Inbox
+
+    if WATCH_FOLDER_NAME.lower() == "inbox":
+        return inbox, target_store.DisplayName, "Inbox"
+
+    for f in inbox.Folders:
+        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
+            return f, target_store.DisplayName, f.Name
+
+    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
+
+def get_account_for_mailbox(ns, mailbox_substring: str):
+    try:
+        for acc in ns.Session.Accounts:
+            smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
+            if mailbox_substring.lower() in smtp or smtp in mailbox_substring.lower():
+                return acc
+    except Exception:
+        pass
+    return None
+
+def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str, kb_files_used: List[str]):
+    requester_name = safe_firstname_from_email(requester_email)
+    kb_html = "<br>".join([f"- {re.sub(r'&', '&amp;', f)}" for f in kb_files_used]) if kb_files_used else "(none)"
+
+    msg = ns.Application.CreateItem(0)
+    msg.To = to_addr
+    msg.Subject = f"Draft created (review needed): {orig_subject}"
+    msg.HTMLBody = (
+        f"<p>A draft reply has been created in Outlook.</p>"
+        f"<ul>"
+        f"<li><b>Original subject:</b> {escape(orig_subject)}</li>"
+        f"<li><b>Requester:</b> {escape(requester_email)}</li>"
+        f"</ul>"
+        f"<p>Please verify the draft and then send it to <b>{escape(requester_name)}</b>.</p>"
+        f"<p><b>KB/Attachment sources used (internal trace):</b><br>{kb_html}</p>"
+    )
+
+    acc = get_account_for_mailbox(ns, from_mailbox)
+    if acc:
+        try:
+            msg.SendUsingAccount = acc
+        except Exception:
+            pass
+
+    msg.Send()
+
+# =========================================================
+# BOT MODE: Run once
+# =========================================================
+def run_bot_once():
+    time.sleep(STARTUP_DELAY_SEC)
+
+    print("Loading KB from:", KB_DIR)
+    kb_files = load_kb(KB_DIR)
+    print("KB loaded:", len(kb_files), "documents")
+
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    folder, store_name, folder_name = get_target_folder()
+    print(f"Mailbox={store_name} | Folder={folder_name}")
+
+    client = build_azure_client()
+    allowed = {a.lower() for a in ALLOWED_SENDERS}
+
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True)
+
+    drafted = 0
+    checked = 0
+
+    your_firstname = safe_firstname_from_email(TARGET_MAILBOX)
+
+    for mail in items:
+        checked += 1
+        if checked > SCAN_LIMIT:
+            break
+        if drafted >= PROCESS_PER_RUN:
+            break
+
+        try:
+            if getattr(mail, "Class", None) != 43:
+                continue
+
+            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
+                continue
+
+            if REQUIRE_UNREAD and not mail.UnRead:
+                continue
+
+            sender = get_sender_smtp(mail)
+            if allowed and sender not in allowed:
+                continue
+
+            subject = mail.Subject or ""
+            if not strict_subject_is_bot(subject):
+                continue
+
+            sender_firstname = safe_firstname_from_email(sender)
+
+            body_text = clean_html_to_text(mail.HTMLBody or "")
+
+            # attachments from THIS mail (and nested .msg)
+            attach_docs = extract_from_mail_attachments(ns, mail)
+
+            # attempt to place extracts into email text (heuristic)
+            body_with_attach_extracts = inject_attachment_extracts_into_email_text(body_text, attach_docs)
+
+            # Retrieval pool: KB + attachments
+            combined_docs = kb_files + attach_docs
+
+            # pick relevant from combined pool
+            snips = pick_relevant(combined_docs, subject, body_with_attach_extracts, max_files=MAX_FILES)
+
+            used_sources = [n for n, _ in snips]
+
+            prompt = make_prompt(snips, subject, body_with_attach_extracts, sender_firstname, your_firstname)
+            answer = call_azure_openai(client, prompt)
+
+            # Output sanitation
+            answer = redact_sensitive(answer)
+            answer = strip_redaction_tokens(answer)
+
+            # Outlook-friendly HTML (paragraphs + bullet lists)
+            html_answer = format_outlook_html(answer)
+
+            reply = mail.Reply()
+            reply.HTMLBody = f"<div>{html_answer}</div><hr>" + reply.HTMLBody
+
+            if AUTO_SEND:
+                reply.Send()
+                print("Sent:", subject)
+            else:
+                reply.Save()
+                print("Draft created:", subject)
+
+                if SELF_NOTIFY:
+                    try:
+                        send_self_notification(
+                            ns=ns,
+                            from_mailbox=TARGET_MAILBOX,
+                            to_addr=SELF_NOTIFY_TO,
+                            orig_subject=subject,
+                            requester_email=sender,
+                            kb_files_used=used_sources,
+                        )
+                        print("Self-notification sent for:", subject)
+                    except Exception as e:
+                        print("Self-notification error:", e)
+
+            add_processed_category(mail)
+            drafted += 1
+
+        except Exception as e:
+            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", e)
+
+    print(f"Done. Checked={checked}, Drafted={drafted}")
+
+# =========================================================
+# HIGHLIGHT MODE: patterns + exporter
+# =========================================================
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+
+PHONE_RE = re.compile(
+    r"(?<!\w)(?:\+?\d{1,3}[\s\-\/]?)?(?:\(?\d{2,5}\)?[\s\-\/]?)?\d{3,4}[\s\-\/]?\d{3,4}(?!\w)"
+)
+
+ADDRESS_RE = re.compile(
+    r"\b([A-ZÄÖÜ][a-zäöüß]+(?:\s[A-ZÄÖÜ][a-zäöüß]+){0,3})\s"
+    r"(Straße|Strasse|Str\.|Weg|Allee|Platz|Ring|Gasse|Damm|Ufer)\s"
+    r"\d{1,5}[a-zA-Z]?\b"
+)
+
+NUMBER_RE = re.compile(r"\b\d+(?:[.,]\d+)?\b")
+NAME_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{1,}\s[A-ZÄÖÜ][a-zäöüß]{1,}\b")
+
+TITLE_NAME_RE = re.compile(
+    r"\b(?:Mr|Mrs|Ms|Miss|Dr|Prof|Herr|Frau)\.?\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b"
+)
+
+def safe_output_name(source_txt_path: Path) -> str:
+    raw = source_txt_path.stem
+    cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    h = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    cleaned = cleaned[:60] if len(cleaned) > 60 else cleaned
+    if not cleaned:
+        cleaned = "file"
+    return f"{cleaned}__{h}.html"
+
+def apply_highlights(text: str) -> str:
+    original = text
+    hits = []
+
+    def mark(regex, label):
+        for m in regex.finditer(original):
+            hits.append((m.start(), m.end(), label))
+
+    mark(EMAIL_RE, "email")
+    mark(PHONE_RE, "phone")
+    mark(ADDRESS_RE, "address")
+    if HIGHLIGHT_TITLES:
+        mark(TITLE_NAME_RE, "title_name")
+    if HIGHLIGHT_NAMES:
+        mark(NAME_RE, "name")
+    mark(NUMBER_RE, "number")
+
+    hits.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+
+    merged = []
+    last_end = -1
+    for s, e, label in hits:
+        if s < last_end:
+            continue
+        merged.append((s, e, label))
+        last_end = e
+
+    color = {
+        "email": "#fff59d",
+        "phone": "#c8e6c9",
+        "address": "#bbdefb",
+        "title_name": "#ffccbc",
+        "name": "#f8bbd0",
+        "number": "#eeeeee",
+    }
+
+    parts = []
+    cur = 0
+    for s, e, label in merged:
+        parts.append(escape(original[cur:s]))
+        parts.append(
+            f'<span style="background:{color.get(label,"#ffffcc")}; padding:0 2px; border-radius:3px;">'
+            f'{escape(original[s:e])}</span>'
+        )
+        cur = e
+    parts.append(escape(original[cur:]))
+
+    body_html = "".join(parts).replace("\n", "<br>\n")
+
+    legend_bits = [
+        ('Email', color["email"]),
+        ('Phone', color["phone"]),
+        ('Address', color["address"]),
+        ('Title+Name', color["title_name"]) if HIGHLIGHT_TITLES else None,
+        ('Name', color["name"]) if HIGHLIGHT_NAMES else None,
+        ('Number', color["number"]),
+    ]
+    legend_bits = [b for b in legend_bits if b is not None]
+
+    legend = '<div style="font-family:Segoe UI,Arial; font-size:13px; margin-bottom:12px;"><b>Legend:</b> '
+    for label, c in legend_bits:
+        legend += f'<span style="background:{c};padding:2px 6px;border-radius:3px;margin-left:6px;">{label}</span>'
+    legend += "</div>"
+
+    return f"""<html>
+<head><meta charset="utf-8"><title>Highlighted Text</title></head>
+<body style="font-family:Segoe UI,Arial; font-size:13px; line-height:1.35; padding:16px;">
+{legend}
+<div>{body_html}</div>
+</body>
+</html>"""
+
+def run_highlight_txt_to_html():
+    base = Path(TXT_DIR)
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"TXT_DIR not found or not a folder: {TXT_DIR}")
+
+    out_dir = base / OUT_SUBFOLDER
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    txt_files = sorted(base.glob("*.txt"))
+    print("Found .txt files:", len(txt_files))
+    if not txt_files:
+        print("No .txt files in folder.")
+        return
+
+    written = 0
+    for f in txt_files:
+        try:
+            txt = f.read_text(encoding="utf-8", errors="ignore")
+            html = apply_highlights(txt)
+
+            out_name = safe_output_name(f)
+            out_path = out_dir / out_name
+            out_path.write_text(html, encoding="utf-8")
+            written += 1
+        except Exception as e:
+            print("FAIL:", f.name, "-", e)
+
+    print("Done. Written:", written, "HTML files")
+    print("Output folder:", out_dir.resolve())
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", nargs="?", default="bot", choices=["bot", "highlight"],
+                        help="Run mode: bot (default) or highlight")
+    args = parser.parse_args()
+
+    if args.mode == "highlight":
+        run_highlight_txt_to_html()
+    else:
+        run_bot_once()
+
+if __name__ == "__main__":
+    main()
