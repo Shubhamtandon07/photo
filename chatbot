@@ -8,4 +8,5 @@ SystemExit: 2
 C:\Users\SHTANDO\AppData\Roaming\Python\Python314\site-packages\IPython\core\interactiveshell.py:3707: UserWarning: To exit: use 'exit', 'quit', or Ctrl-D.
   warn("To exit: use 'exit', 'quit', or Ctrl-D.", stacklevel=1)
 
-! python -m pip install script
+python C:\path\to\script.py bot
+python C:\path\to\script.py highlight
