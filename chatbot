@@ -1,4 +1,92 @@
 # -*- coding: utf-8 -*-
+import re
+from pathlib import Path
+import win32com.client as win32
+
+# ===== EDIT =====
+MSG_FOLDER = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus"
+OUT_TEXT_SUBFOLDER = "converted_text"
+# ===============
+
+def clean_filename(name: str, max_len: int = 140) -> str:
+    name = name or "no_subject"
+    name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:max_len] if len(name) > max_len else name
+
+def main():
+    msg_folder = Path(MSG_FOLDER)
+    print("MSG_FOLDER =", MSG_FOLDER)
+    print("Resolved  =", msg_folder.resolve())
+    print("Exists    =", msg_folder.exists(), "Is dir =", msg_folder.is_dir())
+
+    msg_files = sorted(msg_folder.glob("*.msg"))
+    print("Found .msg:", len(msg_files))
+    if msg_files:
+        print("First 3:", [f.name for f in msg_files[:3]])
+
+    out_text_dir = msg_folder / OUT_TEXT_SUBFOLDER
+    out_text_dir.mkdir(parents=True, exist_ok=True)
+    print("Output dir:", out_text_dir.resolve())
+
+    # Start Outlook COM
+    print("Starting Outlook COM…")
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    print("Outlook COM OK.")
+
+    converted = 0
+    failed = 0
+
+    for i, f in enumerate(msg_files, start=1):
+        try:
+            print(f"[{i}/{len(msg_files)}] Opening:", f.name)
+            item = ns.OpenSharedItem(str(f))
+
+            # Basic inspection
+            cls = getattr(item, "Class", None)
+            msg_class = getattr(item, "MessageClass", "")
+            subj = getattr(item, "Subject", "") or f.stem
+
+            print("    Class =", cls, "| MessageClass =", msg_class, "| Subject =", subj[:60])
+
+            # Extract body
+            body = getattr(item, "Body", "") or ""
+            if not body.strip():
+                html = getattr(item, "HTMLBody", "") or ""
+                body = re.sub(r"<[^>]+>", " ", html)
+                body = re.sub(r"\s+", " ", body).strip()
+
+            base_name = clean_filename(f.stem)
+            out_txt = out_text_dir / f"{base_name}.txt"
+
+            content = (
+                f"FILE: {f.name}\n"
+                f"SUBJECT: {subj}\n"
+                f"MESSAGECLASS: {msg_class}\n"
+                f"\n--- BODY ---\n"
+                f"{body}\n"
+            )
+
+            out_txt.write_text(content, encoding="utf-8", errors="ignore")
+            print("    Wrote:", out_txt.name)
+
+            converted += 1
+
+        except Exception as e:
+            failed += 1
+            print("    FAIL:", f.name, "|", repr(e))
+
+    print("\nDone.")
+    print("Converted:", converted)
+    print("Failed   :", failed)
+    print("Check output folder:", out_text_dir.resolve())
+
+if __name__ == "__main__":
+    main()
+
+
+
+# -*- coding: utf-8 -*-
 """
 Highlight sensitive patterns in .txt files and export as colored HTML.
 
