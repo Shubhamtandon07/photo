@@ -1,6 +1,740 @@
-Hello Sustainable-procurement,
+# -*- coding: utf-8 -*-
+"""
+Outlook -> Azure OpenAI (genai-nexus) -> Draft reply (RUN ONCE) + Self notification
 
-To achieve responsible sourcing, suppliers must adhere to several key requirements: => Complete the latest version of the Sustainability Assessment Questionnaire (SAQ) on the SUPPLIERASSURANCE platform for the planned production site before awarding. This questionnaire is developed by the Drive Sustainability initiative. => Use electricity from renewable energies at tier 1 for production processes, as outlined in the "Green electricity Standard Group AG" document. => Ensure all products delivered are produced CO-neutral across all value creation stages by 1/1/2039, including both your own production sites and the upstream supply chain. These requirements apply to all production plants and subsidiaries involved in supplying volumes. If there are changes in the production site or if no result has been shared for the planned location, the responsible purchaser should be informed immediately.
+Enhancements in this version (minimal change to main flow):
+1) Better retrieval quality:
+   - Splits each KB document into smaller chunks and retrieves across ALL chunks
+   - Allows combining evidence from multiple files/sections
 
-Best regards,
-Shubham
+2) More presentable email body:
+   - Prompt instructs: answer only what is asked, do not dump everything
+   - Uses paragraphs and clean bullets (no "=>", uses "-" bullets)
+   - Light post-formatting for paragraphs and bullet lists
+
+3) Traceability:
+   - Adds "Documents used: <file1>; <file2> ..." at the end of the drafted reply
+   - Filenames are NOT sent to Azure OpenAI; added locally after generation
+
+4) Optional: run hourly automatically (without Task Scheduler):
+   - Set RUN_EVERY_HOUR = True to keep the script running and processing once per hour
+"""
+
+import os
+import re
+import time
+from pathlib import Path
+from typing import List, Tuple, Optional
+from collections import OrderedDict
+
+import win32com.client as win32
+from openai import AzureOpenAI
+from docx import Document as DocxDocument
+from pypdf import PdfReader
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# =========================
+# EDIT THESE
+# =========================
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"   # must match Outlook store DisplayName (substring match)
+WATCH_FOLDER_NAME = "Inbox"                           # "Inbox" or subfolder under Inbox
+
+KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
+
+# Subject must be exactly this (case-insensitive), no prefixes like RE:/AW:
+STRICT_SUBJECT = "bot"
+
+REQUIRE_UNREAD = True
+AUTO_SEND = False             # Draft only
+PROCESS_PER_RUN = 3
+SCAN_LIMIT = 200
+STARTUP_DELAY_SEC = 5
+
+ALLOWED_SENDERS = set()       # empty = allow anyone
+
+# Azure OpenAI (corporate) settings
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net/apikey/"
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-4o"   # DEPLOYMENT NAME in your org
+
+# Notify yourself after draft created
+SELF_NOTIFY = True
+SELF_NOTIFY_TO = TARGET_MAILBOX
+
+# Auto-run loop (no Task Scheduler needed)
+RUN_EVERY_HOUR = False         # True = keep running; processes once/hour
+RUN_INTERVAL_SECONDS = 3600    # 1 hour
+# =========================
+
+PROCESSED_CATEGORY = "AI-Drafted"
+
+# Retrieval controls
+MAX_SNIPPETS = 8              # how many chunks to send to LLM
+MAX_TOTAL_CHARS = 14000       # total chars of all snippets sent
+
+# KB parsing
+SUPPORTED_EXTS = {".txt", ".docx", ".pdf"}
+MAX_CHARS_PER_FILE_FOR_INDEX = 40000  # index more content per file (before chunking)
+
+# Chunking (improves “find perfect answer” across docs/sections)
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 200
+
+SPECIAL_QA_DOC_NAME = "2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx"
+
+# Traceability line in outgoing email
+INCLUDE_SOURCES_IN_EMAIL = True
+SOURCES_PREFIX = "Documents used:"
+MAX_SOURCES_LISTED = 8
+
+# -------------------------
+# Redaction configuration
+# -------------------------
+REDACT_COMPANY_TERMS = [
+    "Mercedes-Benz",
+    "Mercedes Benz",
+    "Mercedes",
+    "Daimler",
+    "corpinter",
+    "Catena-X",
+    "Catena X",
+]
+
+REDACT_PATTERNS = [
+    # Email addresses -> remove
+    (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", ""),
+
+    # URLs -> remove
+    (r"\bhttps?://[^\s<>()]+\b", ""),
+    (r"\bwww\.[^\s<>()]+\b", ""),
+
+    # Phone numbers -> remove (broad)
+    (r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d", ""),
+
+    # IDs / references -> neutral text (requires at least one digit)
+    (r"\b(?:PO|PR|NCR|Ticket|Case|Req|Request|Material|Part)\s*[:#]?\s*[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b",
+     "the relevant reference"),
+
+    # Money / amounts -> replace with neutral phrase
+    (r"(?i)\b(?:EUR|USD|GBP|CHF)\s*\d[\d\.\,\s]*\b", "an amount"),
+    (r"\b\d[\d\.\,\s]*\s*(?:€|EUR|USD|GBP|CHF)\b", "an amount"),
+    (r"\b€\s*\d[\d\.\,\s]*\b", "an amount"),
+]
+
+AGGRESSIVE_NAME_REDACTION = False
+NAME_LIKE_PATTERN = r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b"
+
+
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def is_strict_subject(subject: str) -> bool:
+    """
+    Only allow subject exactly == STRICT_SUBJECT (case-insensitive), after trimming.
+    Rejects 'RE: bot', 'AW: bot', etc.
+    """
+    s = (subject or "").strip()
+    return s.casefold() == STRICT_SUBJECT.casefold()
+
+
+def first_name_from_email(email: str) -> str:
+    """
+    Extract first name from email like 'rahul.singh@...' -> 'Rahul'
+    Fallback: 'there'
+    """
+    e = (email or "").strip().lower()
+    if "@" not in e:
+        return "there"
+    local = e.split("@", 1)[0]
+    first = local.split(".", 1)[0].strip()
+    if not first:
+        return "there"
+    return first[:1].upper() + first[1:]
+
+
+def redact_sensitive(text: str) -> str:
+    """Redact/neutralize sensitive content. Used for subject/body/snippets AND final answer."""
+    if not text:
+        return ""
+
+    t = text
+
+    for term in REDACT_COMPANY_TERMS:
+        if term:
+            t = re.sub(re.escape(term), "", t, flags=re.IGNORECASE)
+
+    for pat, repl in REDACT_PATTERNS:
+        t = re.sub(pat, repl, t)
+
+    if AGGRESSIVE_NAME_REDACTION:
+        t = re.sub(NAME_LIKE_PATTERN, "", t)
+
+    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\s+([,.;:])", r"\1", t)
+    t = re.sub(r"([,.;:]){2,}", r"\1", t)
+    t = re.sub(r"\(\s*\)", "", t)
+
+    return t.strip()
+
+
+def strip_redaction_tokens(text: str) -> str:
+    """Safety: remove any leftover [REDACTED_*] markers if they appear."""
+    if not text:
+        return ""
+    t = re.sub(r"\[REDACTED_[A-Z_]+\]", "", text)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def sanitize_source_name(name: str) -> str:
+    """
+    Make filename safe to show in email (best-effort).
+    Keeps basename, strips excessive whitespace.
+    """
+    n = clean_ws(name)
+    n = re.sub(r"\s{2,}", " ", n)
+    # remove email-like parts in filename, if any
+    n = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "", n)
+    return clean_ws(n)
+
+
+# ---------- Azure OpenAI client ----------
+def build_azure_client() -> AzureOpenAI:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise SystemExit("OPENAI_API_KEY env var missing (corporate Azure key).")
+    return AzureOpenAI(
+        api_version=AZURE_API_VERSION,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_key=key,
+    )
+
+
+# ---------- KB readers ----------
+def read_txt(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="ignore")
+
+
+def extract_docx_tables_as_text(doc: DocxDocument) -> str:
+    out = []
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [clean_ws(c.text) for c in row.cells]
+            if any(cells):
+                out.append(" | ".join(cells))
+    return "\n".join(out)
+
+
+def find_col_index(headers: List[str], target: str) -> Optional[int]:
+    target_norm = re.sub(r"\s+", "", target).lower()
+    for i, h in enumerate(headers):
+        hn = re.sub(r"\s+", "", (h or "")).lower()
+        if hn == target_norm:
+            return i
+    return None
+
+
+def read_special_qa_docx(p: Path) -> str:
+    doc = DocxDocument(str(p))
+    qa_lines = []
+
+    for table in doc.tables:
+        if not table.rows:
+            continue
+
+        header_cells = [clean_ws(c.text) for c in table.rows[0].cells]
+        if not any(header_cells):
+            continue
+
+        q_idx = find_col_index(header_cells, "Fragen")
+        a_idx = (
+            find_col_index(header_cells, "Antwort/ Erklärung")
+            or find_col_index(header_cells, "Antwort/Erklärung")
+            or find_col_index(header_cells, "Antwort")
+            or find_col_index(header_cells, "Erklärung")
+        )
+
+        if q_idx is None or a_idx is None:
+            continue
+
+        for row in table.rows[1:]:
+            cells = [clean_ws(c.text) for c in row.cells]
+            if q_idx >= len(cells) or a_idx >= len(cells):
+                continue
+            q = clean_ws(cells[q_idx])
+            a = clean_ws(cells[a_idx])
+            if not q and not a:
+                continue
+            if q and a:
+                qa_lines.append(f"Q: {q}\nA: {a}")
+            elif q and not a:
+                qa_lines.append(f"Q: {q}\nA: (no answer provided)")
+            elif a and not q:
+                qa_lines.append(f"Q: (missing question)\nA: {a}")
+
+    if not qa_lines:
+        paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
+        tables = extract_docx_tables_as_text(doc)
+        return clean_ws(paras + "\n" + tables)
+
+    return "\n\n".join(qa_lines)
+
+
+def read_docx(p: Path) -> str:
+    if p.name.strip().lower() == SPECIAL_QA_DOC_NAME.strip().lower():
+        return read_special_qa_docx(p)
+
+    doc = DocxDocument(str(p))
+    paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
+    tables = extract_docx_tables_as_text(doc)
+    return clean_ws(paras + "\n" + tables)
+
+
+def read_pdf(p: Path) -> str:
+    out = []
+    r = PdfReader(str(p))
+    for pg in r.pages:
+        try:
+            out.append(pg.extract_text() or "")
+        except Exception:
+            pass
+    return "\n".join(out)
+
+
+def chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
+    """
+    Split text into overlapping chunks. Helps retrieval pick specific parts across docs.
+    """
+    t = (text or "").strip()
+    if not t:
+        return []
+    if len(t) <= chunk_size:
+        return [t]
+
+    chunks = []
+    step = max(1, chunk_size - overlap)
+    i = 0
+    while i < len(t):
+        chunk = t[i:i + chunk_size]
+        chunk = chunk.strip()
+        if chunk:
+            chunks.append(chunk)
+        i += step
+    return chunks
+
+
+def load_kb(dirpath: str) -> List[Tuple[str, str]]:
+    """
+    Returns list of (source_filename, chunk_text).
+    Chunking is applied to allow mixing evidence across docs/sections.
+    """
+    base = Path(dirpath)
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"KB_DIR not found or not a folder: {dirpath}")
+
+    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    if not files:
+        raise SystemExit(f"No .txt/.docx/.pdf found in: {dirpath}")
+
+    out: List[Tuple[str, str]] = []
+    for p in sorted(files):
+        try:
+            ext = p.suffix.lower()
+            raw = read_txt(p) if ext == ".txt" else (read_docx(p) if ext == ".docx" else read_pdf(p))
+            raw = clean_ws(raw)
+            raw = raw[:MAX_CHARS_PER_FILE_FOR_INDEX]  # index more than before
+            if not raw:
+                continue
+
+            chunks = chunk_text(raw, CHUNK_SIZE, CHUNK_OVERLAP)
+            for ch in chunks:
+                out.append((p.name, ch))
+        except Exception as e:
+            print("Skip KB file:", p.name, "-", e)
+
+    if not out:
+        raise SystemExit("Docs found, but no extractable text. Use text PDFs or .txt/.docx.")
+    return out
+
+
+# ---------- improved retrieval across chunks ----------
+def pick_relevant(chunks: List[Tuple[str, str]], subject: str, body_text: str) -> List[Tuple[str, str]]:
+    """
+    Returns best-matching chunks (source_name, chunk_text).
+    Uses token overlap heuristic; chunking greatly improves precision/coverage.
+    """
+    q = (subject + " " + body_text).lower()
+    q_tokens = [t for t in re.split(r"[^a-z0-9]+", q) if t and len(t) >= 3]
+    q_token_set = set(q_tokens)
+
+    scores = []
+    for src, text in chunks:
+        tl = text.lower()
+        score = 0
+
+        # mild boost for filename tokens
+        for token in re.split(r"[^a-z0-9]+", Path(src).stem.lower()):
+            if token and token in q:
+                score += 5
+
+        # overlap scoring (dedup)
+        for token in q_token_set:
+            if token in tl:
+                score += 1
+
+        # extra boost if any "question-like" markers overlap
+        if "q:" in tl or "frage" in tl:
+            if any(tok in tl for tok in ("scope", "co2", "emission", "sustain", "nachhalt", "saq", "supplier", "audit")):
+                score += 2
+
+        scores.append((score, src, text))
+
+    scores.sort(reverse=True)
+
+    # pick top, then cap total chars
+    picked = [(src, txt) for score, src, txt in scores[: max(30, MAX_SNIPPETS * 6)] if score > 0]
+    if not picked:
+        picked = [(src, txt) for score, src, txt in scores[:MAX_SNIPPETS]]
+
+    total = 0
+    cut: List[Tuple[str, str]] = []
+    for src, txt in picked:
+        if len(cut) >= MAX_SNIPPETS:
+            break
+        if total + len(txt) > MAX_TOTAL_CHARS:
+            remain = max(0, MAX_TOTAL_CHARS - total)
+            if remain > 200:
+                cut.append((src, txt[:remain]))
+            break
+        cut.append((src, txt))
+        total += len(txt)
+    return cut
+
+
+def dedupe_preserve_order(items: List[str]) -> List[str]:
+    return list(OrderedDict.fromkeys(items))
+
+
+# ---------- formatting controls ----------
+def normalize_llm_body(text: str) -> str:
+    """
+    Post-format the model output to be more email-friendly:
+    - normalize bullets: "=> " or "*" or "•" -> "- "
+    - ensure blank line before bullet blocks
+    - avoid one giant paragraph when multiple sentences/topics exist
+    """
+    if not text:
+        return ""
+
+    t = text.replace("\r\n", "\n").strip()
+
+    # Normalize bullets
+    t = re.sub(r"(?m)^\s*(=>|•|\*)\s+", "- ", t)
+
+    # If the model produced "A: ... B: ..." as one paragraph, gently add breaks after sentences
+    # but do NOT overdo it.
+    if "\n" not in t and len(t) > 260:
+        t = re.sub(r"(?<=\.)\s+(?=[A-ZÄÖÜ])", "\n\n", t)
+
+    # Ensure blank line before the first bullet list
+    t = re.sub(r"(?m)([^\n])\n(- )", r"\1\n\n\2", t)
+
+    # Ensure each bullet is on its own line (guard)
+    t = re.sub(r"(- [^\n]+)\s+(- )", r"\1\n\2", t)
+
+    # Clean excessive blank lines
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t
+
+
+# ---------- prompt: answer only asked + good structure ----------
+def make_prompt(snips: List[Tuple[str, str]], subject: str, email_text: str) -> str:
+    redacted_subject = redact_sensitive(subject)
+    redacted_email_text = redact_sensitive(email_text)
+
+    # IMPORTANT: Do NOT send filenames; label as DOC1..DOCn
+    snippet_blocks = []
+    for i, (src, txt) in enumerate(snips, start=1):
+        snippet_blocks.append(f"[DOC{i}]\n{redact_sensitive(txt)}")
+    block = "\n\n---\n\n".join(snippet_blocks) if snippet_blocks else "(no snippets)"
+
+    return f"""You MUST answer using ONLY the SNIPPETS below.
+
+GOAL:
+Draft a professional email reply that answers ONLY what the sender asked.
+
+RULES:
+- Use ONLY snippet facts. Do NOT invent.
+- Do NOT dump all snippet content. Include only information needed to answer the question.
+- If the question has multiple parts, answer each part clearly.
+- If snippets do not fully cover the question, answer what is supported, then ask 1–2 precise clarifying questions.
+- Keep the reply presentable:
+  - Use short paragraphs (line breaks when topic changes).
+  - Use bullet points with "- " when listing requirements/steps/items.
+- Max ~170 words for the body you produce (excluding greeting/signature which are added separately).
+- Do NOT include personal data, email addresses, phone numbers, company/supplier names, IDs, or money amounts.
+- Paraphrase; do not copy long phrases.
+
+Return ONLY the email body (no greeting, no signature).
+
+SNIPPETS:
+{block}
+
+EMAIL SUBJECT:
+{redacted_subject}
+
+EMAIL QUESTION (plain text):
+{redacted_email_text}
+"""
+
+
+def call_azure_openai(client: AzureOpenAI, prompt: str) -> str:
+    r = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+        temperature=0.1,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Use only snippets. Do not invent facts. "
+                    "Answer only what is asked. Keep it email-ready with paragraphs and '-' bullets when needed. "
+                    "Never include personal data, emails, phone numbers, company/supplier names, IDs, or money amounts."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return r.choices[0].message.content or ""
+
+
+# ---------- Outlook helpers ----------
+def clean_html_to_text(html: str) -> str:
+    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
+    return clean_ws(txt)
+
+
+def get_sender_smtp(mail) -> str:
+    try:
+        addr = (mail.SenderEmailAddress or "").lower()
+        if addr.startswith("/o="):
+            ex = mail.Sender.GetExchangeUser()
+            if ex:
+                return (ex.PrimarySmtpAddress or "").lower()
+        return addr
+    except Exception:
+        return (mail.SenderEmailAddress or "").lower()
+
+
+def add_processed_category(mail):
+    try:
+        cats = mail.Categories or ""
+        if PROCESSED_CATEGORY.lower() not in cats.lower():
+            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
+            mail.Save()
+    except Exception:
+        pass
+
+
+def get_target_folder():
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+    target_store = None
+    for st in ns.Stores:
+        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
+            target_store = st
+            break
+
+    if not target_store:
+        print("Available stores (use one of these in TARGET_MAILBOX):")
+        for st in ns.Stores:
+            print(" -", st.DisplayName)
+        raise SystemExit("Target mailbox not found.")
+
+    inbox = target_store.GetDefaultFolder(6)  # Inbox
+
+    if WATCH_FOLDER_NAME.lower() == "inbox":
+        return inbox, target_store.DisplayName, "Inbox"
+
+    for f in inbox.Folders:
+        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
+            return f, target_store.DisplayName, f.Name
+
+    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
+
+
+# ---------- Self notification ----------
+def get_account_for_mailbox(ns, mailbox_substring: str):
+    try:
+        for acc in ns.Session.Accounts:
+            smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
+            if mailbox_substring.lower() in smtp or smtp in mailbox_substring.lower():
+                return acc
+    except Exception:
+        pass
+    return None
+
+
+def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
+    requester_name = first_name_from_email(requester_email)
+
+    msg = ns.Application.CreateItem(0)  # MailItem
+    msg.To = to_addr
+    msg.Subject = f"Draft created (review needed): {orig_subject}"
+    msg.HTMLBody = (
+        f"<p>A draft reply has been created.</p>"
+        f"<ul>"
+        f"<li><b>Original subject:</b> {orig_subject}</li>"
+        f"<li><b>Requester:</b> {requester_email}</li>"
+        f"</ul>"
+        f"<p>Please review the draft before sending it to <b>{requester_name}</b>.</p>"
+    )
+
+    acc = get_account_for_mailbox(ns, from_mailbox)
+    if acc:
+        try:
+            msg.SendUsingAccount = acc
+        except Exception:
+            pass
+
+    msg.Send()
+
+
+def html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# =========================
+# MAIN (RUN ONCE)
+# =========================
+def run_once():
+    time.sleep(STARTUP_DELAY_SEC)
+
+    print("Loading KB from:", KB_DIR)
+    kb_chunks = load_kb(KB_DIR)
+    print("KB loaded (chunks):", len(kb_chunks))
+
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    folder, store_name, folder_name = get_target_folder()
+    print(f"Mailbox={store_name} | Folder={folder_name}")
+
+    client = build_azure_client()
+    allowed = {a.lower() for a in ALLOWED_SENDERS}
+
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True)
+
+    drafted = 0
+    checked = 0
+
+    your_first_name = first_name_from_email(TARGET_MAILBOX)
+
+    for mail in items:
+        checked += 1
+        if checked > SCAN_LIMIT:
+            break
+        if drafted >= PROCESS_PER_RUN:
+            break
+
+        try:
+            if getattr(mail, "Class", None) != 43:
+                continue
+
+            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
+                continue
+
+            if REQUIRE_UNREAD and not mail.UnRead:
+                continue
+
+            sender = get_sender_smtp(mail)
+            if allowed and sender not in allowed:
+                continue
+
+            subject = mail.Subject or ""
+            if not is_strict_subject(subject):
+                continue
+
+            body_text = clean_html_to_text(mail.HTMLBody or "")
+
+            # Retrieval across ALL KB chunks
+            snips = pick_relevant(kb_chunks, subject, body_text)
+
+            # sources used (dedup, preserve order)
+            used_sources = dedupe_preserve_order([src for src, _ in snips])
+            used_sources = [sanitize_source_name(x) for x in used_sources if x]
+            used_sources = used_sources[:MAX_SOURCES_LISTED]
+
+            prompt = make_prompt(snips, subject, body_text)
+            answer = call_azure_openai(client, prompt)
+
+            # Sanitize + format
+            answer = redact_sensitive(answer)
+            answer = strip_redaction_tokens(answer)
+            answer = normalize_llm_body(answer)
+
+            # Add greeting + signature
+            sender_first = first_name_from_email(sender)
+
+            sources_line = ""
+            if INCLUDE_SOURCES_IN_EMAIL and used_sources:
+                sources_line = f"\n\n{SOURCES_PREFIX} " + "; ".join(used_sources)
+
+            final_body = (
+                f"Hello {sender_first},\n\n"
+                f"{answer}"
+                f"{sources_line}\n\n"
+                f"Best regards,\n"
+                f"{your_first_name}"
+            )
+
+            # Draft reply with line breaks preserved
+            reply = mail.Reply()
+            html_body = "<br>".join(html_escape(line) for line in final_body.split("\n"))
+            reply.HTMLBody = f"<p>{html_body}</p><hr>" + reply.HTMLBody
+
+            if AUTO_SEND:
+                reply.Send()
+                print("Sent:", subject)
+            else:
+                reply.Save()
+                print("Draft created:", subject)
+
+                if SELF_NOTIFY:
+                    try:
+                        send_self_notification(
+                            ns=ns,
+                            from_mailbox=TARGET_MAILBOX,
+                            to_addr=SELF_NOTIFY_TO,
+                            orig_subject=subject,
+                            requester_email=sender,
+                        )
+                        print("Self-notification sent for:", subject)
+                    except Exception as e:
+                        print("Self-notification error:", e)
+
+            add_processed_category(mail)
+            drafted += 1
+
+        except Exception as e:
+            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", e)
+
+    print(f"Done. Checked={checked}, Drafted={drafted}")
+
+
+def main():
+    if RUN_EVERY_HOUR:
+        print("RUN_EVERY_HOUR=True -> keeping process alive. Interval (sec):", RUN_INTERVAL_SECONDS)
+        while True:
+            try:
+                run_once()
+            except Exception as e:
+                print("Top-level run error:", e)
+            time.sleep(RUN_INTERVAL_SECONDS)
+    else:
+        run_once()
+
+
+if __name__ == "__main__":
+    main()
