@@ -18,6 +18,11 @@ Small changes added (no change to the main flow):
 1) Process ONLY if subject is exactly "bot" (case-insensitive). NOT "RE: bot", "AW: bot", etc.
 2) Adds "Hello <SenderFirstName>," + "Best regards, <YourFirstName>"
 3) Encourages paragraphs and => bullets for multi-step answers
+
+Key quality fixes added (still same main flow: load_kb -> pick_relevant -> make_prompt -> call -> draft):
+A) KB is chunked into paragraph-like pieces so the bot can retrieve the right paragraph (incl. later parts of same doc).
+B) Retrieval ignores common stopwords and weights body_text higher to reduce "dump everything" behavior.
+C) Prompt explicitly says: answer ONLY what is asked; ignore unrelated snippet info.
 """
 
 import os
@@ -64,10 +69,15 @@ SELF_NOTIFY_TO = TARGET_MAILBOX
 # =========================
 
 PROCESSED_CATEGORY = "AI-Drafted"
-MAX_FILES = 6
+
+# Retrieval limits
+MAX_FILES = 8                 # was 6; slightly higher recall without changing flow
 MAX_CHARS_PER_FILE = 4000
-MAX_TOTAL_CHARS = 12000
+MAX_TOTAL_CHARS = 14000       # was 12000; slightly higher recall
 SUPPORTED_EXTS = {".txt", ".docx", ".pdf"}
+
+# Chunking (KB only)
+KB_CHUNK_MAX_CHARS = 900      # paragraph-ish chunks; improves precision/recall
 
 SPECIAL_QA_DOC_NAME = "2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx"
 
@@ -274,6 +284,30 @@ def read_pdf(p: Path) -> str:
     return "\n".join(out)
 
 
+def chunk_text(text: str, max_chars: int = 900) -> List[str]:
+    """
+    Split into paragraph-like chunks and cap chunk size.
+    This improves retrieval: the bot can pick the exact paragraph that answers the question.
+    """
+    t = (text or "").replace("\r\n", "\n")
+    # split on blank lines first
+    parts = [p.strip() for p in re.split(r"\n\s*\n+", t) if p.strip()]
+
+    chunks: List[str] = []
+    for p in parts:
+        p = clean_ws(p)
+        if not p:
+            continue
+        if len(p) <= max_chars:
+            chunks.append(p)
+        else:
+            for i in range(0, len(p), max_chars):
+                seg = p[i:i + max_chars].strip()
+                if seg:
+                    chunks.append(seg)
+    return chunks
+
+
 def load_kb(dirpath: str) -> List[Tuple[str, str]]:
     base = Path(dirpath)
     if not base.exists() or not base.is_dir():
@@ -288,9 +322,22 @@ def load_kb(dirpath: str) -> List[Tuple[str, str]]:
         try:
             ext = p.suffix.lower()
             txt = read_txt(p) if ext == ".txt" else (read_docx(p) if ext == ".docx" else read_pdf(p))
-            txt = clean_ws(txt)
-            if txt:
-                out.append((p.name, txt[:MAX_CHARS_PER_FILE]))
+
+            # IMPORTANT: do NOT destroy paragraph boundaries before chunking.
+            txt = (txt or "").strip()
+            if not txt:
+                continue
+
+            # Keep your per-file cap, but then chunk within that range.
+            txt = txt[:MAX_CHARS_PER_FILE]
+
+            chunks = chunk_text(txt, max_chars=KB_CHUNK_MAX_CHARS)
+            if not chunks:
+                continue
+
+            for idx, ch in enumerate(chunks, start=1):
+                out.append((f"{p.name}::P{idx}", ch))
+
         except Exception as e:
             print("Skip KB file:", p.name, "-", e)
 
@@ -299,18 +346,42 @@ def load_kb(dirpath: str) -> List[Tuple[str, str]]:
     return out
 
 
-# ---------- simple retrieval ----------
+# ---------- simple retrieval (improved, same signature) ----------
 def pick_relevant(files: List[Tuple[str, str]], subject: str, body_text: str) -> List[Tuple[str, str]]:
-    q = (subject + " " + body_text).lower()
+    # Weight body higher to match the actual question intent
+    q = ((subject or "") + " " + (body_text or "") + " " + (body_text or "")).lower()
+
+    stop = {
+        "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "is", "are", "was", "were",
+        "be", "as", "i", "we", "you", "they", "it", "this", "that", "these", "those", "from", "by", "at",
+        "not", "can", "could", "should", "would", "please", "thanks", "regards",
+        "bitte", "und", "oder", "der", "die", "das", "ein", "eine", "mit", "für", "nicht", "ist", "sind",
+        "war", "waren", "danke", "gruß", "grüsse", "gruesse"
+    }
+
+    q_tokens = [t for t in re.split(r"[^a-z0-9]+", q) if t and t not in stop and len(t) > 2]
+    q_set = set(q_tokens)
+
     scores = []
     for name, text in files:
+        text_l = (text or "").lower()
         score = 0
+
+        # filename tokens (helps)
         for token in re.split(r"[^a-z0-9]+", Path(name).stem.lower()):
-            if token and token in q:
-                score += 6
-        for token in set(re.split(r"[^a-z0-9]+", q)):
-            if token and token in text.lower():
-                score += 1
+            if token and token in q_set:
+                score += 8
+
+        # token overlap
+        hits = 0
+        for token in q_set:
+            if token in text_l:
+                hits += 1
+                score += 2
+
+        # bonus for multiple matches
+        score += min(hits, 10)
+
         scores.append((score, name, text))
 
     scores.sort(reverse=True)
@@ -335,11 +406,11 @@ def make_prompt(snips: List[Tuple[str, str]], subject: str, email_text: str) -> 
     redacted_snips = [(n, redact_sensitive(t)) for n, t in snips]
     block = "\n\n---\n\n".join([f"[{n}]\n{t}" for n, t in redacted_snips]) if redacted_snips else "(no snippets)"
 
-    # NOTE: This prompt is intentionally less "self-sabotaging" than the earlier strict version.
-    # It still forces snippet-only grounding, but it allows answering + asking 1-2 clarifying questions.
     return f"""You MUST answer using ONLY the SNIPPETS below.
 
 Rules:
+- Answer ONLY the question(s) asked in EMAIL QUESTION. Do not add extra background unless explicitly requested.
+- Ignore snippet content that is not relevant to the question.
 - Use only the snippets as grounding. Do not invent facts.
 - If snippets are insufficient for a complete answer, write what you can supported by snippets,
   then ask 1–2 short clarifying questions.
@@ -371,6 +442,7 @@ def call_azure_openai(client: AzureOpenAI, prompt: str) -> str:
                 "role": "system",
                 "content": (
                     "Use only snippets. Do not invent facts. "
+                    "Answer only what is asked. "
                     "Format as a ready-to-send email body with paragraphs and => bullets if needed. "
                     "Never include personal data, emails, phone numbers, company/supplier names, IDs, or money amounts."
                 ),
@@ -485,7 +557,7 @@ def main():
 
     print("Loading KB from:", KB_DIR)
     kb_files = load_kb(KB_DIR)
-    print("KB loaded:", len(kb_files), "documents")
+    print("KB loaded:", len(kb_files), "chunks")
 
     ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
     folder, store_name, folder_name = get_target_folder()
@@ -531,17 +603,17 @@ def main():
 
             body_text = clean_html_to_text(mail.HTMLBody or "")
 
-            # Retrieve locally using original text (unchanged)
+            # Retrieve locally using original text (same flow)
             snips = pick_relevant(kb_files, subject, body_text)
 
             prompt = make_prompt(snips, subject, body_text)
             answer = call_azure_openai(client, prompt)
 
-            # Ensure output contains no sensitive remnants (unchanged)
+            # Ensure output contains no sensitive remnants
             answer = redact_sensitive(answer)
             answer = strip_redaction_tokens(answer)
 
-            # Add greeting + signature (small change)
+            # Add greeting + signature
             sender_first = first_name_from_email(sender)
             final_body = (
                 f"Hello {sender_first},\n\n"
@@ -550,7 +622,7 @@ def main():
                 f"{your_first_name}"
             )
 
-            # Draft reply with line breaks preserved (small change)
+            # Draft reply with line breaks preserved
             reply = mail.Reply()
             html_body = "<br>".join(html_escape(line) for line in final_body.split("\n"))
             reply.HTMLBody = f"<p>{html_body}</p><hr>" + reply.HTMLBody
