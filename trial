@@ -1,36 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-MERGED SCRIPT (Windows / Outlook COM)
+MSG -> ONE HTML output per .msg (highlighted sensitive info)
 
-What it does:
-A) MSG MODE:
-   - Reads .msg files from MSG_DIR
-   - Extracts headers + body
-   - Saves attachments to an output subfolder per message
-   - Rewrites inline CID images in HTML body to real files (best-effort)
-   - Extracts text from attachments: .pdf, .xlsx, .docx, .txt (+ optional .doc via Word COM)
-   - Produces HTML outputs:
-        1) message_raw.html         (body with inline images fixed)
-        2) message_highlight.html   (ONE combined highlighted view: headers + plain body + attachment text)
+Outputs per msg:
+- <msg_folder>/message_redact_me.html   (ONLY ONE HTML FILE)
+- <msg_folder>/attachments/            (saved attachments)
 
-B) TXT MODE:
-   - Reads standalone .txt files from TXT_DIR
-   - Exports highlighted HTML into OUT_SUBFOLDER
+The HTML highlights:
+- emails, urls, domains
+- phones
+- addresses (basic DE pattern)
+- IDs/refs
+- money
+- names (heuristics incl. greeting/signoff)
+- numbers
+- company/supplier names (heuristics)
 
-Notes:
-- Inline placement "wherever it belongs" is only possible for inline images referenced via CID.
-  For PDFs/Excels/Docs, we add extracted text in an Attachments section.
-- Screenshots/images: this script embeds the image in HTML; it does NOT OCR images by default.
+Note: Highlights are applied to a *plain-text rendering* of the email body to avoid breaking HTML markup.
 """
 
 import re
 import os
 import hashlib
-import shutil
 from pathlib import Path
 from html import escape
-from datetime import datetime
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 import win32com.client as win32
 
@@ -50,22 +44,14 @@ try:
 except Exception:
     DocxDocument = None
 
-
 # =========================================================
 # EDIT THESE PATHS
 # =========================================================
 MSG_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus"
-# If you want TXT mode from a different folder, set separately:
-TXT_DIR = MSG_DIR
-
 OUT_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports"
-OUT_SUBFOLDER_TXT = "highlighted_html_txt"   # inside OUT_DIR for standalone .txt highlighting
-
-RUN_MSG_MODE = True
-RUN_TXT_MODE = True
 
 # If you have legacy .doc attachments and MS Word installed, enable:
-ENABLE_WORD_COM_FOR_DOC = True
+ENABLE_WORD_COM_FOR_DOC = False
 
 # =========================================================
 # HIGHLIGHT CONFIG
@@ -82,10 +68,8 @@ HIGHLIGHT_IBAN = True
 # Regex patterns (sensitive info)
 # ---------------------------------------------------------
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
-
 URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
 WWW_RE = re.compile(r"\bwww\.[^\s<>()]+\b", re.I)
-
 DOMAIN_RE = re.compile(
     r"\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,24})\b",
     re.I
@@ -101,7 +85,6 @@ ADDRESS_RE = re.compile(
     r"\d{1,5}[a-zA-Z]?\b"
 )
 
-# IDs / references (broad)
 ID_RE = re.compile(
     r"\b(?:PO|PR|NCR|Ticket|Case|Req|Request|Material|Part|Supplier|Portal|Round|ID|Ref|Reference|Order)\s*[:#]?\s*"
     r"[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b",
@@ -114,30 +97,23 @@ MONEY_RE = re.compile(
 
 IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[ ]?(?:[A-Z0-9][ ]?){11,30}\b", re.I)
 
-# Names (heuristic)
+# Name heuristics
 NAME_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{1,}\s+[A-ZÄÖÜ][a-zäöüß]{1,}(?:\s+[A-ZÄÖÜ][a-zäöüß]{1,})?\b")
-
 TITLE_NAME_RE = re.compile(
     r"\b(?:Mr|Mrs|Ms|Miss|Dr|Prof|Herr|Frau)\.?\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b"
 )
-
-# Greeting based names: "Hello Rahul," / "Hallo Max,"
 GREETING_NAME_RE = re.compile(
     r"(?im)^(?:hello|hi|hallo|dear|guten\s+tag|good\s+morning|good\s+afternoon)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2})\s*[,\!]\s*$"
 )
-
-# Signature based names: "Best regards,\nRahul"
 SIGNOFF_NAME_RE = re.compile(
     r"(?is)\b(?:best\s+regards|kind\s+regards|regards|mit\s+freundlichen\s+gr[üu]ßen|freundliche\s+gr[üu]ße)\b[\s,:-]*\n\s*([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2})\b"
 )
 
-# Company / supplier heuristic: capitalized sequences + suffixes
+# Company / supplier heuristic
 COMPANY_RE = re.compile(
     r"\b(?:[A-ZÄÖÜ][A-Za-zÄÖÜäöüß&\.\-]+(?:\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß&\.\-]+){0,6})\s+"
     r"(?:GmbH|AG|SE|KG|UG|Ltd|Limited|Inc|LLC|S\.A\.|S\.p\.A\.|BV|NV|Oy|AB|Co\.|Company)\b"
 )
-
-# Also highlight "Supplier: X" / "Supplier Name: X"
 SUPPLIER_LINE_RE = re.compile(
     r"(?im)^(?:supplier|lieferant|supplier\s+name|lieferantenname)\s*[:\-]\s*(.+?)\s*$"
 )
@@ -151,13 +127,13 @@ NUMBER_RE = re.compile(r"\b\d+(?:[.,]\d+)?\b")
 def clean_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
-def safe_output_name(stem: str, ext: str = ".html") -> str:
+def safe_folder_name(stem: str) -> str:
     raw = stem or "file"
     cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", raw)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     h = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:8]
     cleaned = cleaned[:80] if len(cleaned) > 80 else cleaned
-    return f"{cleaned}__{h}{ext}"
+    return f"{cleaned}__{h}"
 
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
@@ -174,13 +150,12 @@ def html_page(title: str, body_html: str) -> str:
 </html>"""
 
 def strip_html_to_text(html: str) -> str:
-    # basic, intentionally simple
     txt = re.sub(r"<br\s*/?>", "\n", html or "", flags=re.I)
     txt = re.sub(r"</p\s*>", "\n\n", txt, flags=re.I)
     txt = re.sub(r"<[^>]+>", " ", txt, flags=re.S)
-    return clean_ws(txt).replace("  ", " ")
+    return (txt or "").replace("\r\n", "\n")
 
-def short_dt(dt) -> str:
+def dt_str(dt) -> str:
     try:
         return dt.strftime("%Y-%m-%d %H:%M")
     except Exception:
@@ -217,31 +192,22 @@ def apply_highlights(text: str) -> str:
     if HIGHLIGHT_MONEY:
         mark(MONEY_RE, "money")
 
-    # Supplier line: highlight the value portion
+    # Supplier line value
     if HIGHLIGHT_COMPANIES:
         for m in SUPPLIER_LINE_RE.finditer(original):
-            # highlight only the group (supplier name)
             g1 = m.group(1)
             if g1:
-                start = m.start(1)
-                end = m.end(1)
-                hits.append((start, end, "supplier"))
-
+                hits.append((m.start(1), m.end(1), "supplier"))
         mark(COMPANY_RE, "company")
 
     if HIGHLIGHT_TITLES:
         mark(TITLE_NAME_RE, "title_name")
 
     if HIGHLIGHT_NAMES:
-        # greeting/signature based names are often more reliable than naive "First Last"
         for m in GREETING_NAME_RE.finditer(original):
-            start, end = m.start(1), m.end(1)
-            hits.append((start, end, "name_strong"))
-
+            hits.append((m.start(1), m.end(1), "name_strong"))
         for m in SIGNOFF_NAME_RE.finditer(original):
-            start, end = m.start(1), m.end(1)
-            hits.append((start, end, "name_strong"))
-
+            hits.append((m.start(1), m.end(1), "name_strong"))
         mark(NAME_RE, "name")
 
     # Numbers (least specific)
@@ -310,17 +276,14 @@ def apply_highlights(text: str) -> str:
             continue
         if key == "company" and not HIGHLIGHT_COMPANIES:
             continue
-        if key in ("title_name",) and not HIGHLIGHT_TITLES:
+        if key == "title_name" and not HIGHLIGHT_TITLES:
             continue
         if key in ("name", "name_strong") and not HIGHLIGHT_NAMES:
             continue
-        if key in ("id",) and not HIGHLIGHT_IDS:
+        if key == "id" and not HIGHLIGHT_IDS:
             continue
-        if key in ("money",) and not HIGHLIGHT_MONEY:
+        if key == "money" and not HIGHLIGHT_MONEY:
             continue
-        if key in ("url", "domain") and not HIGHLIGHT_DOMAINS:
-            # still show URL (URL highlight always on), but you can adjust if you want
-            pass
         legend += f'<span style="background:{color.get(key)}; padding:2px 6px; border-radius:3px; margin-left:6px;">{escape(label)}</span>'
     legend += "</div>"
 
@@ -328,7 +291,7 @@ def apply_highlights(text: str) -> str:
 
 
 # =========================================================
-# Attachment extraction helpers
+# Attachment extraction
 # =========================================================
 def extract_text_from_pdf(p: Path) -> str:
     if PdfReader is None:
@@ -351,7 +314,6 @@ def extract_text_from_docx(p: Path) -> str:
     try:
         doc = DocxDocument(str(p))
         paras = [clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text)]
-        # tables
         tbl = []
         for table in doc.tables:
             for row in table.rows:
@@ -389,23 +351,6 @@ def extract_text_from_txt(p: Path) -> str:
     except Exception:
         return ""
 
-def extract_text_from_doc_via_word(p: Path) -> str:
-    """
-    Optional for legacy .doc using Word COM (requires MS Word installed).
-    """
-    if not ENABLE_WORD_COM_FOR_DOC:
-        return ""
-    try:
-        word = win32.Dispatch("Word.Application")
-        word.Visible = False
-        doc = word.Documents.Open(str(p), ReadOnly=True)
-        txt = doc.Content.Text or ""
-        doc.Close(False)
-        word.Quit()
-        return clean_ws(txt)
-    except Exception:
-        return ""
-
 def extract_text_from_file(p: Path) -> str:
     ext = p.suffix.lower()
     if ext == ".pdf":
@@ -416,8 +361,6 @@ def extract_text_from_file(p: Path) -> str:
         return extract_text_from_xlsx(p)
     if ext == ".txt":
         return extract_text_from_txt(p)
-    if ext == ".doc":
-        return extract_text_from_doc_via_word(p)
     return ""
 
 
@@ -425,98 +368,39 @@ def extract_text_from_file(p: Path) -> str:
 # MSG processing via Outlook COM
 # =========================================================
 def open_msg_item(app, ns, msg_path: Path):
-    # Try CreateItemFromTemplate first
     try:
         return app.CreateItemFromTemplate(str(msg_path))
     except Exception:
         pass
-    # Then OpenSharedItem
     try:
         return ns.OpenSharedItem(str(msg_path))
     except Exception:
         return None
 
-def get_attach_content_id(att) -> str:
-    """
-    Read PR_ATTACH_CONTENT_ID if present (for inline images).
-    """
-    # https://learn.microsoft.com/en-us/office/client-developer/outlook/mapi/pidtagattachcontentid-canonical-property
-    PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
-    try:
-        pa = att.PropertyAccessor
-        cid = pa.GetProperty(PR_ATTACH_CONTENT_ID)
-        return (cid or "").strip()
-    except Exception:
-        return ""
-
-def save_attachments(item, out_folder: Path) -> List[dict]:
-    """
-    Saves all attachments to out_folder.
-    Returns list of dict: {name, path, ext, cid, is_inline_image}
-    """
-    attachments_info = []
+def save_attachments(item, attach_folder: Path) -> List[dict]:
+    out = []
     try:
         atts = item.Attachments
         count = atts.Count
     except Exception:
-        return attachments_info
+        return out
 
     for i in range(1, count + 1):
         try:
             att = atts.Item(i)
             fname = getattr(att, "FileName", None) or f"attachment_{i}"
-            ext = Path(fname).suffix.lower()
-
-            # Ensure unique filename in folder
-            base_name = Path(fname).name
-            save_path = out_folder / base_name
+            base = Path(fname).name
+            save_path = attach_folder / base
             if save_path.exists():
-                save_path = out_folder / f"{save_path.stem}__{i}{save_path.suffix}"
-
+                save_path = attach_folder / f"{save_path.stem}__{i}{save_path.suffix}"
             att.SaveAsFile(str(save_path))
-
-            cid = get_attach_content_id(att)
-            is_img = ext in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
-            attachments_info.append({
-                "name": save_path.name,
-                "path": save_path,
-                "ext": ext,
-                "cid": cid,
-                "is_inline_image": bool(cid) and is_img,
-            })
+            out.append({"name": save_path.name, "path": save_path, "ext": save_path.suffix.lower()})
         except Exception:
             continue
 
-    return attachments_info
-
-def rewrite_inline_cid_images(html_body: str, attachments: List[dict]) -> str:
-    """
-    Replaces src="cid:xxx" with src="attachments/filename.png" (relative).
-    """
-    if not html_body:
-        return html_body or ""
-
-    cid_map = {}
-    for a in attachments:
-        if a.get("cid") and a.get("is_inline_image"):
-            cid_map[a["cid"].strip().strip("<>")] = a["name"]
-
-    if not cid_map:
-        return html_body
-
-    def repl(m):
-        cid = (m.group(1) or "").strip().strip("<>")
-        fn = cid_map.get(cid)
-        if not fn:
-            return m.group(0)
-        return f'src="attachments/{escape(fn)}"'
-
-    # common patterns: src="cid:..."
-    out = re.sub(r'src\s*=\s*"(?:cid:)([^"]+)"', repl, html_body, flags=re.I)
-    out = re.sub(r"src\s*=\s*'(?:cid:)([^']+)'", lambda m: f"src='attachments/{cid_map.get((m.group(1) or '').strip().strip('<>'), m.group(1))}'", out, flags=re.I)
     return out
 
-def msg_to_outputs(msg_path: Path, out_base: Path) -> None:
+def msg_to_single_html(msg_path: Path, out_base: Path) -> None:
     app = win32.Dispatch("Outlook.Application")
     ns = app.GetNamespace("MAPI")
 
@@ -525,159 +409,80 @@ def msg_to_outputs(msg_path: Path, out_base: Path) -> None:
         print("FAIL open msg:", msg_path.name)
         return
 
-    # output folder per msg
-    msg_stem = msg_path.stem
-    folder_name = safe_output_name(msg_stem, ext="").rstrip(".")
-    out_folder = out_base / folder_name
+    out_folder = out_base / safe_folder_name(msg_path.stem)
     attach_folder = out_folder / "attachments"
     ensure_dir(out_folder)
     ensure_dir(attach_folder)
 
-    # headers
     subject = getattr(item, "Subject", "") or ""
     sender_name = getattr(item, "SenderName", "") or ""
     sender_email = getattr(item, "SenderEmailAddress", "") or ""
     to_line = getattr(item, "To", "") or ""
     cc_line = getattr(item, "CC", "") or ""
-    sent_on = getattr(item, "SentOn", None)
     received = getattr(item, "ReceivedTime", None)
+    sent = getattr(item, "SentOn", None)
+    date_str = dt_str(received) or dt_str(sent)
 
-    dt = short_dt(received) or short_dt(sent_on)
-
-    # body
     html_body = getattr(item, "HTMLBody", "") or ""
     plain_body = strip_html_to_text(html_body) if html_body else (getattr(item, "Body", "") or "")
     plain_body = plain_body.replace("\r\n", "\n")
 
-    # attachments
     attachments = save_attachments(item, attach_folder)
 
-    # rewrite inline images
-    html_body_fixed = rewrite_inline_cid_images(html_body, attachments)
-
-    # extract text from attachments
+    # Extract text from attachments and append as section
     extracted_blocks = []
-    extracted_files = []
     for a in attachments:
-        p = a["path"]
-        ext = a["ext"]
-        txt = extract_text_from_file(p)
+        txt = extract_text_from_file(a["path"])
         if txt:
-            extracted_files.append(a["name"])
             extracted_blocks.append(f"--- Attachment: {a['name']} ---\n{txt}\n")
 
-    # RAW HTML output (body + inline images)
-    header_html = f"""
-    <h2>Message</h2>
-    <table style="border-collapse:collapse;">
-      <tr><td style="padding:4px 10px; color:#555;">Subject</td><td style="padding:4px 10px;">{escape(subject)}</td></tr>
-      <tr><td style="padding:4px 10px; color:#555;">From</td><td style="padding:4px 10px;">{escape(sender_name)} {escape(sender_email)}</td></tr>
-      <tr><td style="padding:4px 10px; color:#555;">To</td><td style="padding:4px 10px;">{escape(to_line)}</td></tr>
-      <tr><td style="padding:4px 10px; color:#555;">CC</td><td style="padding:4px 10px;">{escape(cc_line)}</td></tr>
-      <tr><td style="padding:4px 10px; color:#555;">Date</td><td style="padding:4px 10px;">{escape(dt)}</td></tr>
-    </table>
-    <hr>
-    <h3>Body (original HTML)</h3>
-    <div style="border:1px solid #ddd; padding:10px; border-radius:6px;">
-      {html_body_fixed if html_body_fixed else "<i>(no HTML body)</i>"}
-    </div>
-    <hr>
-    <h3>Attachments</h3>
-    <ul>
-    {''.join([f"<li>{escape(a['name'])}</li>" for a in attachments]) or "<li>(none)</li>"}
-    </ul>
-    """
+    combined = []
+    combined.append(f"Subject: {subject}")
+    combined.append(f"From: {sender_name} {sender_email}")
+    combined.append(f"To: {to_line}")
+    combined.append(f"CC: {cc_line}")
+    combined.append(f"Date: {date_str}")
+    combined.append("\n--- BODY ---\n")
+    combined.append(plain_body or "")
+    combined.append("\n--- ATTACHMENTS (extracted text) ---\n")
+    combined.append("\n".join(extracted_blocks) if extracted_blocks else "(none extracted)")
 
-    raw_html = html_page(f"RAW - {subject}", header_html)
-    (out_folder / "message_raw.html").write_text(raw_html, encoding="utf-8")
+    combined_text = "\n".join(combined)
 
-    # HIGHLIGHTED COMBINED view (headers + plain body + extracted attachment text)
-    combined_text = []
-    combined_text.append(f"Subject: {subject}")
-    combined_text.append(f"From: {sender_name} {sender_email}")
-    combined_text.append(f"To: {to_line}")
-    combined_text.append(f"CC: {cc_line}")
-    combined_text.append(f"Date: {dt}")
-    combined_text.append("\n--- BODY (plain text) ---\n")
-    combined_text.append(plain_body or "")
-    if extracted_blocks:
-        combined_text.append("\n--- ATTACHMENTS (extracted text) ---\n")
-        combined_text.append("\n".join(extracted_blocks))
-    else:
-        combined_text.append("\n--- ATTACHMENTS (extracted text) ---\n(none extracted)\n")
-
-    combined_text_str = "\n".join(combined_text)
-
-    highlighted_html_body = f"""
-    <h2>Highlighted view (headers + body + attachment text)</h2>
+    page = f"""
+    <h2>Message (highlight to delete sensitive info)</h2>
     <p style="color:#555;">Source: {escape(msg_path.name)}</p>
-    {apply_highlights(combined_text_str)}
+    {apply_highlights(combined_text)}
     <hr>
-    <h3>Trace</h3>
+    <h3>Attachments saved</h3>
     <ul>
-      <li>Saved inline/regular attachments to: <code>attachments/</code></li>
-      <li>Extracted text from: {escape(", ".join(extracted_files) if extracted_files else "(none)")}</li>
+      {''.join([f"<li><code>attachments/{escape(a['name'])}</code></li>" for a in attachments]) or "<li>(none)</li>"}
     </ul>
     """
 
-    highlight_html = html_page(f"HIGHLIGHT - {subject}", highlighted_html_body)
-    (out_folder / "message_highlight.html").write_text(highlight_html, encoding="utf-8")
+    out_html = html_page(f"REDACT - {subject}", page)
+    (out_folder / "message_redact_me.html").write_text(out_html, encoding="utf-8")
 
-    # Also write a plain text dump (useful for later processing)
-    (out_folder / "message_all_text.txt").write_text(combined_text_str, encoding="utf-8")
+    print("OK:", msg_path.name, "->", str(out_folder))
 
-    print("OK MSG:", msg_path.name, "->", str(out_folder))
-
-
-# =========================================================
-# Standalone TXT highlighting (your original 2nd script functionality)
-# =========================================================
-def highlight_txt_folder(txt_dir: Path, out_dir: Path) -> None:
-    ensure_dir(out_dir)
-    txt_files = sorted(txt_dir.glob("*.txt"))
-    print("TXT files found:", len(txt_files))
-
-    for f in txt_files:
-        try:
-            txt = f.read_text(encoding="utf-8", errors="ignore")
-            body = apply_highlights(txt)
-            out_name = safe_output_name(f.stem, ext=".html")
-            (out_dir / out_name).write_text(html_page(f"Highlighted - {f.name}", body), encoding="utf-8")
-        except Exception as e:
-            print("FAIL TXT:", f.name, "-", e)
-
-    print("OK TXT ->", str(out_dir))
-
-
-# =========================================================
-# MAIN
-# =========================================================
 def main():
     msg_dir = Path(MSG_DIR)
-    txt_dir = Path(TXT_DIR)
     out_base = Path(OUT_DIR)
-
     ensure_dir(out_base)
 
-    if RUN_MSG_MODE:
-        if not msg_dir.exists():
-            raise SystemExit(f"MSG_DIR not found: {MSG_DIR}")
-        msg_files = sorted(msg_dir.rglob("*.msg"))
-        print("MSG files found:", len(msg_files))
-        for m in msg_files:
-            try:
-                msg_to_outputs(m, out_base)
-            except Exception as e:
-                print("FAIL MSG:", m.name, "-", e)
+    if not msg_dir.exists():
+        raise SystemExit(f"MSG_DIR not found: {MSG_DIR}")
 
-    if RUN_TXT_MODE:
-        if not txt_dir.exists():
-            raise SystemExit(f"TXT_DIR not found: {TXT_DIR}")
-        out_txt = out_base / OUT_SUBFOLDER_TXT
-        highlight_txt_folder(txt_dir, out_txt)
+    msg_files = sorted(msg_dir.rglob("*.msg"))
+    print("MSG files found:", len(msg_files))
+
+    for m in msg_files:
+        try:
+            msg_to_single_html(m, out_base)
+        except Exception as e:
+            print("FAIL:", m.name, "-", e)
 
     print("DONE.")
-
 
 if __name__ == "__main__":
     main()
