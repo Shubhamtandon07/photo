@@ -1,35 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-MSG -> SANITIZED DATASET (with attachment extraction + OCR)
+INPUTS:
+  - .msg/.MSG (Outlook emails)
+  - .html/.htm (already-exported emails)
 
-Input:
-  MSG_DIR = folder containing .msg files (recursive)
+OUTPUTS (per input file):
+  OUT_DIR/sanitized_text/<name>.txt
+  OUT_DIR/sanitized_html/<name>.html
 
-Output:
-  OUT_DIR/
-    sanitized_text/         (1 .txt per .msg)
-    sanitized_jsonl/dataset.jsonl
-    entity_map.json         (stable pseudonyms across runs)
-    errors.log
-    ocr_missing.log         (only if images encountered but OCR not available)
-
-Attachments supported:
-  - .pdf   (pypdf)
-  - .docx  (python-docx)
-  - .xlsx/.xlsm (openpyxl)
-  - .txt
-  - .png/.jpg/.jpeg (OCR via pytesseract + Pillow if installed)
-  - .msg (nested email, depth-limited)
-
-Install (recommended):
-  python -m pip install extract_msg pypdf python-docx openpyxl pillow pytesseract
-
-OCR note:
-  pytesseract also requires the Tesseract binary installed and on PATH.
+ALSO:
+  OUT_DIR/sanitized_jsonl/dataset.jsonl   (one record per input)
+  OUT_DIR/entity_map.json                 (stable pseudonyms)
+  OUT_DIR/errors.log
+  OUT_DIR/ocr_missing.log                 (only if images exist but OCR libs missing)
 """
 
-import os
 import re
+import os
 import json
 import hashlib
 import tempfile
@@ -43,36 +30,21 @@ MSG_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\
 OUT_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports"
 
 # =========================================================
-# Behavior / safety knobs
+# Behavior knobs
 # =========================================================
-# Safer: do not keep To/CC/From in the dataset (prevents identity leaks)
 DROP_HEADER_FIELDS = True
-
-# Nested .msg attachments recursion depth
 MSG_ATTACHMENT_DEPTH_LIMIT = 2
 
-# Attachment size limits (text)
 ATTACH_MAX_FILES = 12
 ATTACH_MAX_CHARS_PER_FILE = 8000
 ATTACH_MAX_TOTAL_CHARS = 20000
+BODY_MAX_CHARS = 50000
 
-# Body/subject limits
-BODY_MAX_CHARS = 40000
-
-# Optional: enforce stable replacement for known supplier/company names
-SUPPLIER_COMPANY_DENYLIST = [
-    # "Kirchhoff",
-    # "Some Supplier GmbH",
-]
-
-# Optional: allowlist terms you never want touched (program names etc.)
-ALLOWLIST_TERMS = [
-    # "V530",
-    # "PLS",
-]
+# Which input file types to consider
+INPUT_EXTS = {".msg", ".html", ".htm"}
 
 # =========================================================
-# Regex patterns (tunable)
+# Patterns
 # =========================================================
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
@@ -109,19 +81,11 @@ COMPANY_SUFFIX_RE = re.compile(
 )
 SUPPLIER_LABEL_RE = re.compile(r"(?i)\b(?:Supplier|Lieferant|Vendor|Company|Firma)\s*[:\-]\s*([A-Z0-9ÄÖÜ][^\n\r]{2,80})")
 
-QUOTE_MARKERS = [
-    r"^Von:\s.*$",
-    r"^From:\s.*$",
-    r"^Gesendet:\s.*$",
-    r"^Sent:\s.*$",
-    r"^An:\s.*$",
-    r"^To:\s.*$",
-    r"^Cc:\s.*$",
-    r"^Betreff:\s.*$",
-    r"^Subject:\s.*$",
-    r"^-----Original Message-----.*$",
-]
-QUOTE_BLOCK_RE = re.compile("|".join(QUOTE_MARKERS), re.I | re.M)
+QUOTE_BLOCK_RE = re.compile(
+    r"^Von:\s.*$|^From:\s.*$|^Gesendet:\s.*$|^Sent:\s.*$|^An:\s.*$|^To:\s.*$|^Cc:\s.*$|"
+    r"^Betreff:\s.*$|^Subject:\s.*$|^-----Original Message-----.*$",
+    re.I | re.M
+)
 
 SIGNATURE_CUTOFF_RE = re.compile(
     r"(?im)^\s*(Mit\s+freundlichen\s+Gr[üu]ßen|Best\s+regards|Kind\s+regards|"
@@ -130,9 +94,9 @@ SIGNATURE_CUTOFF_RE = re.compile(
 )
 
 # =========================================================
-# Utilities
+# Helpers
 # =========================================================
-def _clean_ws(text: str) -> str:
+def clean_ws(text: str) -> str:
     if not text:
         return ""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -140,55 +104,129 @@ def _clean_ws(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-def _stable_token(prefix: str, value: str, salt: str = "v1") -> str:
-    h = hashlib.sha256((salt + "||" + value).encode("utf-8", errors="ignore")).hexdigest()[:10]
-    return f"[{prefix}_{h}]"
+def strip_quoted_history(text: str) -> str:
+    m = QUOTE_BLOCK_RE.search(text)
+    return text[:m.start()].strip() if m else text
 
-def _safe_stem(name: str, max_len: int = 80) -> str:
-    stem = re.sub(r"[^A-Za-z0-9_\-]+", "_", name)[:max_len]
-    return stem or "file"
-
-def _load_json(path: Path) -> dict:
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return {}
-
-def _save_json(path: Path, obj: dict) -> None:
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
-
-def _strip_signature(text: str) -> str:
+def strip_signature(text: str) -> str:
     lines = text.split("\n")
     if len(lines) < 6:
         return text
-    for i in range(len(lines) - 1, max(-1, len(lines) - 60), -1):
+    for i in range(len(lines) - 1, max(-1, len(lines) - 120), -1):
         if SIGNATURE_CUTOFF_RE.match(lines[i] or ""):
             return "\n".join(lines[:i]).strip()
     return text
 
-def _strip_quoted_history(text: str) -> str:
-    m = QUOTE_BLOCK_RE.search(text)
-    if m:
-        return text[: m.start()].strip()
-    return text
+def safe_stem(name: str, max_len: int = 80) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_\-]+", "_", name)[:max_len]
+    return stem or "file"
+
+def stable_token(prefix: str, value: str, salt: str = "v1") -> str:
+    h = hashlib.sha256((salt + "||" + value).encode("utf-8", errors="ignore")).hexdigest()[:10]
+    return f"[{prefix}_{h}]"
+
+def html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def text_to_simple_html(title: str, meta: Dict[str, str], body: str, stats: Dict[str, int]) -> str:
+    meta_rows = []
+    for k, v in meta.items():
+        if v:
+            meta_rows.append(f"<tr><td><b>{html_escape(k)}</b></td><td>{html_escape(v)}</td></tr>")
+    meta_tbl = "<table>" + "".join(meta_rows) + "</table>" if meta_rows else ""
+    stats_str = html_escape(json.dumps(stats, ensure_ascii=False))
+
+    lines = body.split("\n")
+    html_parts = []
+    buf = []
+    for ln in lines:
+        if ln.strip() == "":
+            if buf:
+                html_parts.append("<p>" + "<br>".join(html_escape(x) for x in buf) + "</p>")
+                buf = []
+            continue
+        buf.append(ln)
+    if buf:
+        html_parts.append("<p>" + "<br>".join(html_escape(x) for x in buf) + "</p>")
+
+    return f"""<html>
+<head><meta charset="utf-8"><title>{html_escape(title)}</title></head>
+<body style="font-family:Segoe UI, Arial; font-size:13px; line-height:1.4; padding:16px;">
+<h3>{html_escape(title)}</h3>
+{meta_tbl}
+<hr>
+{''.join(html_parts)}
+<hr>
+<p><b>RedactionStats:</b> {stats_str}</p>
+</body>
+</html>
+"""
 
 # =========================================================
-# Entity mapping
+# HTML -> text (robust)
+# =========================================================
+def html_to_text(html: str) -> str:
+    if not html:
+        return ""
+    # Prefer BeautifulSoup if available
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+
+        # remove script/style
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+
+        txt = soup.get_text("\n")
+        return clean_ws(txt)
+    except Exception:
+        # fallback: remove tags
+        txt = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
+        txt = re.sub(r"(?s)<[^>]+>", " ", txt)
+        txt = re.sub(r"&nbsp;", " ", txt)
+        txt = re.sub(r"&amp;", "&", txt)
+        txt = re.sub(r"&lt;", "<", txt)
+        txt = re.sub(r"&gt;", ">", txt)
+        return clean_ws(txt)
+
+def read_html_file(path: Path, errors_log: Path) -> str:
+    try:
+        raw = path.read_text(encoding="utf-8", errors="ignore")
+        return html_to_text(raw)
+    except Exception as e:
+        with errors_log.open("a", encoding="utf-8") as ef:
+            ef.write(f"{path}\nHTML read failed: {e}\n\n")
+        return ""
+
+# =========================================================
+# Entity mapping (stable pseudonyms across runs)
 # =========================================================
 class EntityMapper:
     def __init__(self, map_path: Path):
         self.map_path = map_path
-        self.map = _load_json(map_path)  # {"type|raw": "[TOKEN]"}
+        self.map = {}
+        if map_path.exists():
+            try:
+                self.map = json.loads(map_path.read_text(encoding="utf-8"))
+            except Exception:
+                self.map = {}
 
     def get(self, etype: str, raw: str) -> str:
         key = f"{etype}|{raw}"
         if key in self.map:
             return self.map[key]
-        token = _stable_token(etype.upper(), raw)
-        self.map[key] = token
-        return token
+        tok = stable_token(etype.upper(), raw)
+        self.map[key] = tok
+        return tok
 
     def save(self):
-        _save_json(self.map_path, self.map)
+        self.map_path.write_text(json.dumps(self.map, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def merge_stats(a: Dict[str, int], b: Dict[str, int]) -> Dict[str, int]:
+    out = dict(a)
+    for k, v in b.items():
+        out[k] = int(out.get(k, 0)) + int(v)
+    return out
 
 # =========================================================
 # Sanitization
@@ -203,146 +241,100 @@ def sanitize_text(text: str, mapper: EntityMapper) -> Tuple[str, Dict[str, int]]
 
     t = text
 
-    # Allowlist masking
-    allow_masks = {}
-    for term in ALLOWLIST_TERMS:
-        if term and term in t:
-            key = _stable_token("ALLOW", term)
-            allow_masks[key] = term
-            t = t.replace(term, key)
-
-    # Forced company denylist
-    for c in SUPPLIER_COMPANY_DENYLIST:
-        if c and re.search(re.escape(c), t, flags=re.I):
-            tok = mapper.get("company", c)
-            t = re.sub(re.escape(c), tok, t, flags=re.I)
-            stats["companies"] += 1
-
-    # Company suffix
-    def _rep_company(m):
-        raw = m.group(0).strip()
+    def rep_company(m):
         stats["companies"] += 1
-        return mapper.get("company", raw)
-    t = COMPANY_SUFFIX_RE.sub(_rep_company, t)
+        return mapper.get("company", m.group(0).strip())
+    t = COMPANY_SUFFIX_RE.sub(rep_company, t)
 
-    # Supplier label
-    def _rep_supplier_label(m):
+    def rep_supplier_label(m):
         raw = (m.group(1) or "").strip()
         raw2 = re.split(r"[;,/|]", raw)[0].strip()
         if not raw2:
             return m.group(0)
         stats["companies"] += 1
         return re.sub(re.escape(raw), mapper.get("company", raw2), m.group(0), flags=re.I)
-    t = SUPPLIER_LABEL_RE.sub(_rep_supplier_label, t)
+    t = SUPPLIER_LABEL_RE.sub(rep_supplier_label, t)
 
-    # Title+Name
-    def _rep_title_name(m):
-        raw = m.group(0).strip()
+    def rep_title_name(m):
         stats["names"] += 1
-        return mapper.get("name", raw)
-    t = TITLE_NAME_RE.sub(_rep_title_name, t)
+        return mapper.get("name", m.group(0).strip())
+    t = TITLE_NAME_RE.sub(rep_title_name, t)
 
-    # Greeting name
-    def _rep_greet(m):
+    def rep_greet(m):
         raw = (m.group(1) or "").strip()
         stats["names"] += 1
         return m.group(0).replace(raw, mapper.get("name", raw))
-    t = GREET_NAME_RE.sub(_rep_greet, t)
+    t = GREET_NAME_RE.sub(rep_greet, t)
 
-    # Heuristic names (noisy)
-    def _rep_name_heur(m):
-        raw = m.group(0).strip()
+    def rep_name_heur(m):
         stats["names"] += 1
-        return mapper.get("name", raw)
-    t = NAME_HEURISTIC_RE.sub(_rep_name_heur, t)
+        return mapper.get("name", m.group(0).strip())
+    t = NAME_HEURISTIC_RE.sub(rep_name_heur, t)
 
-    # Emails
-    def _rep_email(m):
+    def rep_email(m):
         stats["emails"] += 1
         return mapper.get("email", m.group(0).lower())
-    t = EMAIL_RE.sub(_rep_email, t)
+    t = EMAIL_RE.sub(rep_email, t)
 
-    # URLs
-    def _rep_url(_m):
+    def rep_url(_m):
         stats["urls"] += 1
         return "[URL]"
-    t = URL_RE.sub(_rep_url, t)
-    t = WWW_RE.sub(_rep_url, t)
+    t = URL_RE.sub(rep_url, t)
+    t = WWW_RE.sub(rep_url, t)
 
-    # Domains
-    def _rep_domain(m):
-        d = m.group(0)
-        if d.startswith("[") and d.endswith("]"):
-            return d
+    def rep_domain(_m):
         stats["domains"] += 1
         return "[DOMAIN]"
-    t = DOMAIN_RE.sub(_rep_domain, t)
+    t = DOMAIN_RE.sub(rep_domain, t)
 
-    # Phones
-    def _rep_phone(_m):
+    def rep_phone(_m):
         stats["phones"] += 1
         return "[PHONE]"
-    t = PHONE_RE.sub(_rep_phone, t)
+    t = PHONE_RE.sub(rep_phone, t)
 
-    # IBAN
-    def _rep_iban(_m):
+    def rep_iban(_m):
         stats["iban"] += 1
         return "[IBAN]"
-    t = IBAN_RE.sub(_rep_iban, t)
+    t = IBAN_RE.sub(rep_iban, t)
 
-    # Money
-    def _rep_money(_m):
+    def rep_money(_m):
         stats["money"] += 1
         return "[AMOUNT]"
-    t = MONEY_RE.sub(_rep_money, t)
+    t = MONEY_RE.sub(rep_money, t)
 
-    # Refs/IDs
-    def _rep_ref(m):
+    def rep_ref(m):
         stats["refs"] += 1
-        raw = m.group(0).strip()
-        return mapper.get("ref", raw)
-    t = REF_RE.sub(_rep_ref, t)
+        return mapper.get("ref", m.group(0).strip())
+    t = REF_RE.sub(rep_ref, t)
 
-    # Addresses
-    def _rep_addr(_m):
+    def rep_addr(_m):
         stats["addresses"] += 1
         return "[ADDRESS]"
-    t = ADDRESS_RE.sub(_rep_addr, t)
+    t = ADDRESS_RE.sub(rep_addr, t)
 
-    # Restore allowlist terms
-    for key, term in allow_masks.items():
-        t = t.replace(key, term)
-
-    t = _clean_ws(t)
-    return t, stats
-
-def merge_stats(a: Dict[str, int], b: Dict[str, int]) -> Dict[str, int]:
-    out = dict(a)
-    for k, v in b.items():
-        out[k] = int(out.get(k, 0)) + int(v)
-    return out
+    return clean_ws(t), stats
 
 # =========================================================
-# Attachment text extraction
+# Attachment extractors (skip if libs missing)
 # =========================================================
-def extract_text_pdf(path: Path) -> str:
+def extract_pdf(path: Path) -> str:
     try:
         from pypdf import PdfReader
     except Exception:
         return ""
-    out = []
     try:
+        out = []
         r = PdfReader(str(path))
         for pg in r.pages:
             try:
                 out.append(pg.extract_text() or "")
             except Exception:
                 continue
+        return clean_ws("\n".join(out))
     except Exception:
         return ""
-    return _clean_ws("\n".join(out))
 
-def extract_text_docx(path: Path) -> str:
+def extract_docx(path: Path) -> str:
     try:
         from docx import Document
     except Exception:
@@ -353,17 +345,16 @@ def extract_text_docx(path: Path) -> str:
         for p in doc.paragraphs:
             if p.text and p.text.strip():
                 parts.append(p.text.strip())
-        # tables
         for table in doc.tables:
             for row in table.rows:
                 cells = [c.text.strip() for c in row.cells]
                 if any(cells):
                     parts.append(" | ".join(cells))
-        return _clean_ws("\n".join(parts))
+        return clean_ws("\n".join(parts))
     except Exception:
         return ""
 
-def extract_text_xlsx(path: Path) -> str:
+def extract_xlsx(path: Path) -> str:
     try:
         import openpyxl
     except Exception:
@@ -380,140 +371,105 @@ def extract_text_xlsx(path: Path) -> str:
                 for c in range(1, max_cols + 1):
                     v = ws.cell(row=r, column=c).value
                     row_vals.append("" if v is None else str(v))
-                if any(x.strip() for x in row_vals if isinstance(x, str)):
-                    out.append(" | ".join(_clean_ws(x) for x in row_vals))
-        return _clean_ws("\n".join(out))
+                if any(str(x).strip() for x in row_vals):
+                    out.append(" | ".join(clean_ws(str(x)) for x in row_vals))
+        return clean_ws("\n".join(out))
     except Exception:
         return ""
 
-def extract_text_txt(path: Path) -> str:
+def extract_txt(path: Path) -> str:
     try:
-        return _clean_ws(path.read_text(encoding="utf-8", errors="ignore"))
+        return clean_ws(path.read_text(encoding="utf-8", errors="ignore"))
     except Exception:
         return ""
 
-def extract_text_image_ocr(path: Path, ocr_missing_log: Path) -> str:
-    """
-    OCR using pytesseract + Pillow. If missing, logs once per run.
-    """
+def extract_image_ocr(path: Path, ocr_missing_log: Path) -> str:
     try:
         from PIL import Image
         import pytesseract
     except Exception:
-        # log and skip
         with ocr_missing_log.open("a", encoding="utf-8") as f:
-            f.write(f"OCR unavailable for image: {path}\n")
+            f.write(f"OCR unavailable (missing libs) for: {path}\n")
         return ""
-
     try:
         img = Image.open(str(path))
-        # If you have German content, you can try lang="deu" if installed in Tesseract:
-        # text = pytesseract.image_to_string(img, lang="deu")
-        text = pytesseract.image_to_string(img)
-        return _clean_ws(text)
+        txt = pytesseract.image_to_string(img)
+        return clean_ws(txt)
     except Exception:
         return ""
 
-def extract_text_from_attachment_file(path: Path, ocr_missing_log: Path) -> str:
+def extract_attachment_text(path: Path, ocr_missing_log: Path) -> str:
     ext = path.suffix.lower()
     if ext == ".pdf":
-        return extract_text_pdf(path)
+        return extract_pdf(path)
     if ext == ".docx":
-        return extract_text_docx(path)
+        return extract_docx(path)
     if ext in (".xlsx", ".xlsm"):
-        return extract_text_xlsx(path)
+        return extract_xlsx(path)
     if ext == ".txt":
-        return extract_text_txt(path)
+        return extract_txt(path)
     if ext in (".png", ".jpg", ".jpeg"):
-        return extract_text_image_ocr(path, ocr_missing_log)
+        return extract_image_ocr(path, ocr_missing_log)
+    if ext in (".html", ".htm"):
+        # sometimes attachments are html too
+        return read_html_file(path, Path(OUT_DIR) / "errors.log")
     return ""
 
 # =========================================================
-# MSG parsing (extract_msg) with attachment saving
+# MSG parsing via extract_msg (skip if missing)
 # =========================================================
-def parse_msg_with_extract_msg(path: Path, tmp_dir: Path) -> Tuple[Dict[str, str], List[Path]]:
-    """
-    Returns:
-      - fields dict: subject/date/from/to/cc/body
-      - list of attachment file paths saved to tmp_dir
-    """
-    import extract_msg  # pip install extract_msg
-
-    msg = extract_msg.Message(str(path))
-    msg.process()
-
-    subject = (msg.subject or "").strip()
-    date = (msg.date or "").strip()
-    sender = (msg.sender or "").strip()
-    to = (msg.to or "").strip()
-    cc = (msg.cc or "").strip()
-    body = (msg.body or "").strip()
-
-    # Save attachments to disk
-    saved = []
-    try:
-        atts = msg.attachments or []
-        for a in atts:
-            try:
-                a.save(customPath=str(tmp_dir))
-                # extract_msg usually saves to filename under tmp_dir
-                # The object often has .longFilename or .shortFilename
-                name = None
-                for attr in ("longFilename", "shortFilename", "filename"):
-                    v = getattr(a, attr, None)
-                    if v:
-                        name = str(v)
-                        break
-                if name:
-                    cand = tmp_dir / name
-                    if cand.exists():
-                        saved.append(cand)
-                else:
-                    # fallback: list newest file
-                    pass
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # If name detection failed, just take all files in tmp_dir
-    if not saved:
-        for p in tmp_dir.glob("*"):
-            if p.is_file():
-                saved.append(p)
-
-    return {
-        "subject": subject,
-        "date": date,
-        "from": sender,
-        "to": to,
-        "cc": cc,
-        "body": body,
-    }, saved
-
-def parse_msg(path: Path, tmp_root: Path) -> Tuple[Dict[str, str], List[Path]]:
-    """
-    Currently uses extract_msg.
-    If you must fallback to Outlook COM later, tell me and I’ll add it in this exact pipeline.
-    """
+def parse_msg(path: Path, tmp_root: Path, errors_log: Path) -> Tuple[Dict[str, str], List[Path]]:
     tmp_dir = tmp_root / f"msg_{hashlib.sha1(str(path).encode('utf-8', errors='ignore')).hexdigest()[:10]}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    fields, attachments = parse_msg_with_extract_msg(path, tmp_dir)
-    return fields, attachments
 
-# =========================================================
-# Nested .msg attachments support
-# =========================================================
+    try:
+        import extract_msg
+    except Exception as e:
+        with errors_log.open("a", encoding="utf-8") as ef:
+            ef.write(f"{path}\nextract_msg missing: {e}\n\n")
+        return {}, []
+
+    try:
+        msg = extract_msg.Message(str(path))
+        msg.process()
+
+        fields = {
+            "subject": (msg.subject or "").strip(),
+            "date": (msg.date or "").strip(),
+            "from": (msg.sender or "").strip(),
+            "to": (msg.to or "").strip(),
+            "cc": (msg.cc or "").strip(),
+            "body": (msg.body or "").strip(),
+        }
+
+        saved = []
+        try:
+            atts = msg.attachments or []
+            for a in atts:
+                try:
+                    a.save(customPath=str(tmp_dir))
+                except Exception:
+                    continue
+            for p in tmp_dir.glob("*"):
+                if p.is_file():
+                    saved.append(p)
+        except Exception:
+            pass
+
+        return fields, saved
+
+    except Exception as e:
+        with errors_log.open("a", encoding="utf-8") as ef:
+            ef.write(f"{path}\nextract_msg failed: {e}\n\n")
+        return {}, []
+
 def extract_attachment_texts(
     att_paths: List[Path],
     tmp_root: Path,
     ocr_missing_log: Path,
+    errors_log: Path,
     depth: int = 0,
 ) -> List[Tuple[str, str]]:
-    """
-    Returns list of (attachment_name, extracted_text).
-    Handles nested .msg attachments by parsing and extracting their body + attachments recursively.
-    """
     out: List[Tuple[str, str]] = []
     if not att_paths:
         return out
@@ -522,41 +478,33 @@ def extract_attachment_texts(
     file_count = 0
 
     for ap in att_paths:
-        if file_count >= ATTACH_MAX_FILES:
+        if file_count >= ATTACH_MAX_FILES or total_chars >= ATTACH_MAX_TOTAL_CHARS:
             break
-        if not ap.exists() or not ap.is_file():
+        if not ap.exists():
             continue
 
         ext = ap.suffix.lower()
         name = ap.name
 
-        # Nested msg
         if ext == ".msg" and depth < MSG_ATTACHMENT_DEPTH_LIMIT:
-            try:
-                nested_fields, nested_atts = parse_msg(ap, tmp_root)
-                nested_body = _clean_ws(nested_fields.get("body", ""))[:ATTACH_MAX_CHARS_PER_FILE]
-                if nested_body:
-                    out.append((f"AttachedEmail:{name}", nested_body))
-                    total_chars += len(nested_body)
+            nested_fields, nested_atts = parse_msg(ap, tmp_root, errors_log)
+            nested_body = clean_ws(nested_fields.get("body", ""))[:ATTACH_MAX_CHARS_PER_FILE]
+            if nested_body:
+                out.append((f"AttachedEmail:{name}", nested_body))
+                total_chars += len(nested_body)
+                file_count += 1
+            nested_more = extract_attachment_texts(nested_atts, tmp_root, ocr_missing_log, errors_log, depth + 1)
+            for n, t in nested_more:
+                if file_count >= ATTACH_MAX_FILES or total_chars >= ATTACH_MAX_TOTAL_CHARS:
+                    break
+                if t:
+                    t2 = t[:ATTACH_MAX_CHARS_PER_FILE]
+                    out.append((n, t2))
+                    total_chars += len(t2)
                     file_count += 1
-                    if total_chars >= ATTACH_MAX_TOTAL_CHARS:
-                        break
-                # recurse into nested attachments
-                nested_texts = extract_attachment_texts(nested_atts, tmp_root, ocr_missing_log, depth=depth + 1)
-                for n, t in nested_texts:
-                    if file_count >= ATTACH_MAX_FILES or total_chars >= ATTACH_MAX_TOTAL_CHARS:
-                        break
-                    if t:
-                        t2 = t[:ATTACH_MAX_CHARS_PER_FILE]
-                        out.append((n, t2))
-                        total_chars += len(t2)
-                        file_count += 1
-            except Exception:
-                continue
             continue
 
-        # Normal files (pdf/docx/xlsx/txt/images)
-        txt = extract_text_from_attachment_file(ap, ocr_missing_log)
+        txt = extract_attachment_text(ap, ocr_missing_log)
         if not txt:
             continue
 
@@ -568,70 +516,140 @@ def extract_attachment_texts(
             total_chars += len(txt)
             file_count += 1
 
-        if total_chars >= ATTACH_MAX_TOTAL_CHARS:
-            break
-
     return out
 
 # =========================================================
-# Per-message pipeline
+# Per-input processor (MSG or HTML)
 # =========================================================
-def sanitize_one_msg(msg_path: Path, mapper: EntityMapper, tmp_root: Path, ocr_missing_log: Path) -> Dict:
-    fields, att_paths = parse_msg(msg_path, tmp_root)
+def sanitize_one_input(
+    input_path: Path,
+    mapper: EntityMapper,
+    tmp_root: Path,
+    errors_log: Path,
+    ocr_missing_log: Path,
+) -> Dict:
+    ext = input_path.suffix.lower()
 
-    subject = _clean_ws(fields.get("subject", ""))
-    date = _clean_ws(fields.get("date", ""))
-    frm = _clean_ws(fields.get("from", ""))
-    to = _clean_ws(fields.get("to", ""))
-    cc = _clean_ws(fields.get("cc", ""))
+    # Common record fields
+    subject = ""
+    date = ""
+    frm = ""
+    to = ""
+    cc = ""
+    body = ""
+    attachments_extracted: List[str] = []
 
-    body = _clean_ws(fields.get("body", ""))[:BODY_MAX_CHARS]
-    body = _strip_quoted_history(body)
-    body = _strip_signature(body)
+    if ext == ".msg":
+        fields, att_paths = parse_msg(input_path, tmp_root, errors_log)
+        if not fields:
+            return {
+                "source_file": input_path.name,
+                "source_type": "msg",
+                "subject": "",
+                "date": "",
+                "from": "",
+                "to": "",
+                "cc": "",
+                "text": "",
+                "stats": {},
+                "attachments_extracted": [],
+                "status": "parse_failed",
+            }
 
-    # Extract attachment texts (including OCR + nested msg)
-    att_texts = extract_attachment_texts(att_paths, tmp_root, ocr_missing_log, depth=0)
+        subject = clean_ws(fields.get("subject", ""))
+        date = clean_ws(fields.get("date", ""))
+        frm = clean_ws(fields.get("from", ""))
+        to = clean_ws(fields.get("to", ""))
+        cc = clean_ws(fields.get("cc", ""))
 
-    # Build combined text (work-safe structure)
-    combined_parts = []
-    combined_parts.append("=== MAIN MESSAGE ===")
-    combined_parts.append(body)
+        body = clean_ws(fields.get("body", ""))[:BODY_MAX_CHARS]
+        body = strip_quoted_history(body)
+        body = strip_signature(body)
 
-    if att_texts:
-        combined_parts.append("")
-        combined_parts.append("=== ATTACHMENTS (EXTRACTED TEXT) ===")
-        for name, txt in att_texts:
-            combined_parts.append(f"[Attachment: {name}]")
-            combined_parts.append(txt)
-            combined_parts.append("")
+        att_texts = extract_attachment_texts(att_paths, tmp_root, ocr_missing_log, errors_log, depth=0)
+        attachments_extracted = [n for n, _ in att_texts]
 
-    combined = _clean_ws("\n".join(combined_parts))
+        combined = ["=== MAIN MESSAGE ===", body]
+        if att_texts:
+            combined += ["", "=== ATTACHMENTS (EXTRACTED TEXT) ==="]
+            for n, t in att_texts:
+                combined += [f"[Attachment: {n}]", t, ""]
 
-    # Sanitize text
-    sanitized_subject, st_sub = sanitize_text(subject, mapper)
-    sanitized_body, st_body = sanitize_text(combined, mapper)
-    stats = merge_stats(st_sub, st_body)
+        combined_text = clean_ws("\n".join(combined))
+
+    elif ext in (".html", ".htm"):
+        # Treat HTML as email-like content
+        raw_text = read_html_file(input_path, errors_log)
+        if not raw_text.strip():
+            return {
+                "source_file": input_path.name,
+                "source_type": "html",
+                "subject": "",
+                "date": "",
+                "from": "",
+                "to": "",
+                "cc": "",
+                "text": "",
+                "stats": {},
+                "attachments_extracted": [],
+                "status": "empty_or_unreadable",
+            }
+
+        # crude header extraction if present
+        # (optional: many exports have "Subject:" lines)
+        subj_match = re.search(r"(?im)^\s*Subject:\s*(.+)$", raw_text)
+        if subj_match:
+            subject = clean_ws(subj_match.group(1))
+
+        date_match = re.search(r"(?im)^\s*Date:\s*(.+)$", raw_text)
+        if date_match:
+            date = clean_ws(date_match.group(1))
+
+        body = raw_text[:BODY_MAX_CHARS]
+        body = strip_quoted_history(body)
+        body = strip_signature(body)
+        combined_text = clean_ws(body)
+
+    else:
+        return {
+            "source_file": input_path.name,
+            "source_type": ext.lstrip("."),
+            "subject": "",
+            "date": "",
+            "from": "",
+            "to": "",
+            "cc": "",
+            "text": "",
+            "stats": {},
+            "attachments_extracted": [],
+            "status": "unsupported_input_ext",
+        }
+
+    # sanitize
+    s_subj, st1 = sanitize_text(subject, mapper)
+    s_text, st2 = sanitize_text(combined_text, mapper)
+    stats = merge_stats(st1, st2)
 
     if DROP_HEADER_FIELDS:
-        sanitized_from = ""
-        sanitized_to = ""
-        sanitized_cc = ""
+        s_from = s_to = s_cc = ""
     else:
-        sanitized_from, st_f = sanitize_text(frm, mapper)
-        sanitized_to, st_t = sanitize_text(to, mapper)
-        sanitized_cc, st_c = sanitize_text(cc, mapper)
-        stats = merge_stats(stats, merge_stats(st_f, merge_stats(st_t, st_c)))
+        s_from, stf = sanitize_text(frm, mapper)
+        s_to, stt = sanitize_text(to, mapper)
+        s_cc, stc = sanitize_text(cc, mapper)
+        stats = merge_stats(stats, merge_stats(stf, merge_stats(stt, stc)))
 
     return {
-        "source_file": msg_path.name,
-        "subject": sanitized_subject,
+        "source_file": input_path.name,
+        "source_type": "msg" if ext == ".msg" else "html",
+        "subject": s_subj,
         "date": date,
-        "from": sanitized_from,
-        "to": sanitized_to,
-        "cc": sanitized_cc,
-        "text": sanitized_body,
+        "from": s_from,
+        "to": s_to,
+        "cc": s_cc,
+        "text": s_text,
         "stats": stats,
-        "attachments_extracted": [n for n, _ in att_texts],
+        "attachments_extracted": attachments_extracted,
+        "status": "ok",
     }
 
 # =========================================================
@@ -641,73 +659,108 @@ def run():
     in_path = Path(MSG_DIR)
     out_path = Path(OUT_DIR)
     out_text_dir = out_path / "sanitized_text"
+    out_html_dir = out_path / "sanitized_html"
     out_jsonl_dir = out_path / "sanitized_jsonl"
     out_text_dir.mkdir(parents=True, exist_ok=True)
+    out_html_dir.mkdir(parents=True, exist_ok=True)
     out_jsonl_dir.mkdir(parents=True, exist_ok=True)
 
     errors_log = out_path / "errors.log"
     ocr_missing_log = out_path / "ocr_missing.log"
-
     map_path = out_path / "entity_map.json"
     mapper = EntityMapper(map_path)
-
-    msg_files = sorted(in_path.rglob("*.msg"))
-    if not msg_files:
-        raise SystemExit(f"No .msg files found under: {MSG_DIR}")
 
     tmp_root = Path(tempfile.gettempdir()) / "msg_sanitize_tmp"
     tmp_root.mkdir(parents=True, exist_ok=True)
 
+    # Scan inputs: .msg/.MSG + .html/.htm
+    candidates: List[Path] = []
+    for p in in_path.rglob("*"):
+        if not p.is_file():
+            continue
+        ext = p.suffix.lower()
+        if ext in INPUT_EXTS:
+            candidates.append(p)
+        elif p.suffix == ".MSG":
+            candidates.append(p)
+
+    candidates = sorted(set(candidates))
+
+    if not candidates:
+        raise SystemExit(f"No input files found under: {MSG_DIR} (expected .msg/.MSG/.html/.htm)")
+
     jsonl_path = out_jsonl_dir / "dataset.jsonl"
 
-    written = 0
+    written_ok = 0
+    written_failed = 0
+
     with jsonl_path.open("w", encoding="utf-8") as jf:
-        for p in msg_files:
+        for p in candidates:
             try:
-                rec = sanitize_one_msg(p, mapper, tmp_root, ocr_missing_log)
+                rec = sanitize_one_input(p, mapper, tmp_root, errors_log, ocr_missing_log)
 
-                # One output .txt per .msg
-                stem = _safe_stem(p.stem, 80)
+                stem = safe_stem(p.stem, 80)
                 h = hashlib.sha1(str(p).encode("utf-8", errors="ignore")).hexdigest()[:8]
-                out_txt = out_text_dir / f"{stem}__{h}.txt"
+                base_name = f"{stem}__{h}"
 
-                # Layout
-                parts = []
-                parts.append(f"Source: {rec['source_file']}")
-                parts.append(f"Subject: {rec['subject']}")
-                if rec["date"]:
-                    parts.append(f"Date: {rec['date']}")
-                if not DROP_HEADER_FIELDS:
-                    if rec["from"]:
-                        parts.append(f"From: {rec['from']}")
-                    if rec["to"]:
-                        parts.append(f"To: {rec['to']}")
-                    if rec["cc"]:
-                        parts.append(f"CC: {rec['cc']}")
-                if rec["attachments_extracted"]:
-                    parts.append(f"AttachmentsExtracted: {', '.join(rec['attachments_extracted'])}")
-                parts.append("")
-                parts.append(rec["text"])
-                parts.append("")
-                parts.append(f"RedactionStats: {json.dumps(rec['stats'], ensure_ascii=False)}")
+                if rec.get("status") == "ok" and rec.get("text", "").strip():
+                    meta = {
+                        "Source": rec["source_file"],
+                        "SourceType": rec["source_type"],
+                        "Subject": rec["subject"],
+                        "Date": rec["date"],
+                        "AttachmentsExtracted": ", ".join(rec["attachments_extracted"]) if rec["attachments_extracted"] else "",
+                    }
+                    if not DROP_HEADER_FIELDS:
+                        meta["From"] = rec.get("from", "")
+                        meta["To"] = rec.get("to", "")
+                        meta["CC"] = rec.get("cc", "")
 
-                out_txt.write_text("\n".join(parts).strip() + "\n", encoding="utf-8")
+                    txt_out = out_text_dir / f"{base_name}.txt"
+                    html_out = out_html_dir / f"{base_name}.html"
 
-                # JSONL
+                    txt_out.write_text(
+                        f"Source: {rec['source_file']}\n"
+                        f"SourceType: {rec['source_type']}\n"
+                        f"Subject: {rec['subject']}\n"
+                        f"Date: {rec['date']}\n"
+                        f"AttachmentsExtracted: {', '.join(rec['attachments_extracted']) if rec['attachments_extracted'] else ''}\n\n"
+                        f"{rec['text']}\n\n"
+                        f"RedactionStats: {json.dumps(rec['stats'], ensure_ascii=False)}\n",
+                        encoding="utf-8",
+                    )
+
+                    html_out.write_text(
+                        text_to_simple_html(
+                            title=rec["subject"] or rec["source_file"],
+                            meta=meta,
+                            body=rec["text"],
+                            stats=rec["stats"],
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    written_ok += 1
+                else:
+                    written_failed += 1
+
                 jf.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                written += 1
 
             except Exception as e:
+                written_failed += 1
                 with errors_log.open("a", encoding="utf-8") as ef:
-                    ef.write(f"{p}\n{e}\n\n")
+                    ef.write(f"{p}\nUNHANDLED ERROR: {e}\n\n")
 
     mapper.save()
-    print(f"Done. Sanitized={written}")
-    print(f"Output: {out_path.resolve()}")
-    print(f"Dataset: {jsonl_path.resolve()}")
-    print(f"Entity map: {map_path.resolve()}")
+    print(f"Done. OK={written_ok}, Failed={written_failed}")
+    print(f"Outputs in: {out_path.resolve()}")
+    print(f"- TXT:  {out_text_dir.resolve()}")
+    print(f"- HTML: {out_html_dir.resolve()}")
+    print(f"- JSONL:{jsonl_path.resolve()}")
+    print(f"- Map:  {map_path.resolve()}")
     if ocr_missing_log.exists():
-        print(f"OCR warnings: {ocr_missing_log.resolve()}")
+        print(f"- OCR log: {ocr_missing_log.resolve()}")
+    print(f"- Errors: {errors_log.resolve()}")
 
 if __name__ == "__main__":
     run()
