@@ -1,8 +1,13 @@
-Label: answer
-Subject: AW_ EB-L Schütze
-________________________________________
-Body:
-(no usable body text extracted)
+import extract_msg
+from pathlib import Path
 
+p = Path(r"PASTE_FULL_PATH_OF_ONE_FAILING_MSG_HERE")
+m = extract_msg.Message(str(p))
+m.process()
 
-this is the result, you tell me what to do, originally there is chain of mails, most files contain this info of 1-2 kb whichich is bullshit
+print("subject:", m.subject)
+print("len(body):", len(getattr(m,"body","") or ""))
+print("has htmlBody:", bool(getattr(m,"htmlBody", None)))
+print("len(htmlBody):", len(getattr(m,"htmlBody","") or ""))
+print("has rtfBody:", bool(getattr(m,"rtfBody", None)))
+print("len(rtfBody):", len(getattr(m,"rtfBody","") or ""))
