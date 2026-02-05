@@ -1,35 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-OPTION B (Python 3.14 compatible): HTML-first sanitizer + labeler
+MSG Sanitizer (Outlook COM) - ONE OUTPUT PER .MSG
 
-Goal
-- Input: a folder that contains .html/.htm/.mhtml files (exported mails) and optionally
-         .txt/.pdf/.docx/.xlsx files.
-- Output: EXACTLY ONE sanitized HTML per input file (no 3–4 extra files per email).
-- Removes/neutralizes sensitive info:
-  - names, emails, phone numbers, URLs/domains, addresses, IBAN, money, IDs/references
-  - removes common header blocks: Von/From/An/To/Cc/Gesendet/Sent/Betreff/Subject, mailto, etc.
-- Extracts the "useful body": keeps the conversational content between greeting and signature.
-- Labels each mail file as: question / answer (heuristic)
-- Adds a short "Sources" header (the source filename only) and a JSON stats line.
+Reads .msg files using Outlook COM (no extract_msg, Python 3.14 OK)
+- Extracts Subject + Body (prefers HTMLBody, fallback Body)
+- Extracts attachments and appends their text (best-effort)
+  - .pdf via pypdf (if installed)
+  - .docx via python-docx (if installed)
+  - .xlsx via openpyxl (if installed)
+  - .txt via plain read
+  - .png/.jpg OCR via pytesseract + pillow (if installed + tesseract present)
+- Sanitizes:
+  - removes header blocks (From/Von, To/An, CC, Sent/Gesendet etc.)
+  - removes emails, URLs, domains, phones, IBAN, references/IDs, money, addresses
+  - removes names (heuristics: greeting name, title+name, Firstname Lastname, Exchange /O=EXCH…)
+  - removes signatures (VG/LG/BR/MfG/Kind regards etc.)
+- Outputs exactly 1 file per input msg (HTML or TXT).
+- Labels: question / answer (heuristic)
 
-Important notes
-- No .msg parsing (skip, because Python 3.14 + extract_msg is unreliable for you).
-- OCR for images is OPTIONAL and will be skipped automatically if libs aren't installed.
-- Attachments referenced inside HTML are NOT reliably extractable without .msg parsing.
-  This script focuses on HTML exports you already have.
-
-How to run
-- Put this script in a .py file, e.g. sanitize_html_mails.py
-- Edit MSG_DIR and OUT_DIR below
-- Run:
-    python sanitize_html_mails.py
-
+Run:
+  python sanitize_msg_outlook.py
 """
 
+import os
 import re
 import json
+import shutil
 import hashlib
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from html import escape
@@ -40,46 +38,47 @@ from html import escape
 MSG_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus"
 OUT_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports"
 
-# If True: process files recursively in subfolders.
 RECURSIVE = True
+OUTPUT_FORMAT = "html"   # "html" or "txt"
+SKIP_TEMP = True         # skip "~$" files etc.
 
-# Skip temp Office files (~$...)
-SKIP_TEMP = True
-
-# Output format: "html" (recommended) or "txt"
-OUTPUT_FORMAT = "html"
+MAX_BODY_CHARS = 25000
+ATTACH_MAX_CHARS_EACH = 8000
+ATTACH_MAX_FILES = 10
 
 # =========================
-# Heuristic knobs
+# Optional: treat supplier words as sensitive
+# If you want to KEEP supplier names, set this to False.
 # =========================
-MAX_BODY_CHARS = 20000          # cap long bodies
-MIN_USEFUL_CHARS = 30           # if less -> "(no usable body text extracted)"
-
-# Company/supplier cue words (for highlighting/removal logic)
+REMOVE_SUPPLIER_WORDS = True
 SUPPLIER_CUE_WORDS = [
-    "supplier", "lieferant", "lieferanten", "lieferfirma", "lieferung",
-    "kirchhoff", "bosch", "continental", "zf", "magna", "forvia", "faurecia",
+    "lieferant", "lieferanten", "supplier",
+    "kirchhoff", "bosch", "continental", "zf", "magna", "forvia", "faurecia"
 ]
 
-# Common signature closings (DE/EN/HU, etc.)
+# =========================
+# Signature / greeting cues
+# =========================
 SIGNATURE_CLOSINGS = [
-    "best regards", "kind regards", "regards", "mit freundlichen grüßen",
-    "freundliche grüße", "viele grüße", "vg", "lg", "br", "mfg", "danke und grüße",
-    "thanks and regards", "with best regards", "üdvözlettel",
+    "best regards", "kind regards", "regards",
+    "mit freundlichen grüßen", "freundliche grüße", "viele grüße",
+    "vg", "lg", "br", "mfg", "thanks and regards",
+    "with best regards", "üdvözlettel"
 ]
 
-# Common greeting openers
 GREETING_CUES = [
     "hallo", "hi", "hello", "guten morgen", "guten tag", "good morning",
-    "dear", "liebe", "lieber",
+    "dear", "liebe", "lieber"
 ]
 
-# Reply/forward indicators (German + English)
 REPLY_PREFIXES = ("re:", "aw:", "wg:", "fw:", "fwd:")
 
 # =========================
-# Patterns (PII + headers)
+# Regex patterns
 # =========================
+WS_RE = re.compile(r"\s+")
+TAG_RE = re.compile(r"<[^>]+>", re.S)
+
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
 WWW_RE = re.compile(r"\bwww\.[^\s<>()]+\b", re.I)
@@ -88,9 +87,7 @@ DOMAIN_RE = re.compile(r"\b(?:[a-z0-9-]+\.)+(?:[a-z]{2,})(?:/[^\s<>()]+)?\b", re
 PHONE_RE = re.compile(
     r"(?<!\w)(?:\+?\d{1,3}[\s\-\/]?)?(?:\(?\d{2,5}\)?[\s\-\/]?)?\d[\d\s\-\/]{6,}\d(?!\w)"
 )
-
 IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b", re.I)
-
 MONEY_RE = re.compile(
     r"(?ix)"
     r"(?:\b(?:eur|usd|gbp|chf)\s*\d[\d\.,\s]*\b)|"
@@ -98,51 +95,30 @@ MONEY_RE = re.compile(
     r"(?:\b€\s*\d[\d\.,\s]*\b)"
 )
 
-# IDs / references: includes digits to avoid over-matching
 REF_RE = re.compile(
-    r"(?i)\b(?:po|pr|ncr|ticket|case|req|request|material|part|sp\d+|sp\d+-\d+|id|ref)\s*[:#]?\s*"
+    r"(?i)\b(?:po|pr|ncr|ticket|case|req|request|material|part|supplier|portal|round|id|ref|sp\d+)\s*[:#]?\s*"
     r"[a-z0-9\-_\/]*\d[a-z0-9\-_\/]*\b"
 )
 
-# Address-ish: German street patterns
 ADDRESS_RE = re.compile(
     r"(?i)\b([A-ZÄÖÜ][a-zäöüß]+(?:\s[A-ZÄÖÜ][a-zäöüß]+){0,3})\s"
     r"(straße|strasse|str\.|weg|allee|platz|ring|gasse|damm|ufer)\s"
     r"\d{1,5}[a-z]?\b"
 )
 
-# Strong name patterns: Title + Name, plus greeting-based names
 TITLE_NAME_RE = re.compile(
     r"(?i)\b(?:mr|mrs|ms|miss|dr|prof|herr|frau)\.?\s+"
     r"[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b"
 )
 
-# Heuristic names (can false positive): First Last
 NAME_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b")
 
-# Greeting name: Hallo/Hi/Hello + token(s)
 GREETING_NAME_RE = re.compile(
     r"(?im)^\s*(?:hallo|hi|hello|guten\s+morgen|guten\s+tag|good\s+morning|dear)\s+([^\n,]{2,40})"
 )
 
-# Signature block separators
 THREAD_SEP_RE = re.compile(r"(?im)^\s*(?:von:|from:|sent:|gesendet:|an:|to:|cc:|betreff:|subject:)\s+.*$")
-
-# "Original Message" / quoted thread markers
-QUOTE_MARKERS_RE = re.compile(
-    r"(?im)^\s*(?:-----original message-----|_{5,}|begin forwarded message:)\s*$"
-)
-
-# Removes weird spaced-out HTML like "h t m l x m l n s ..."
-SPACED_HTML_NOISE_RE = re.compile(
-    r"(?i)\b(h\s*t\s*m\s*l|x\s*m\s*l\s*n\s*s|v\s*:\s*|o\s*:\s*|w\s*:\s*|u\s*r\s*n\s*:|s\s*c\s*h\s*e\s*m\s*a\s*s)\b"
-)
-
-# Simple HTML tag stripper
-TAG_RE = re.compile(r"<[^>]+>", re.S)
-
-# Whitespace normalize
-WS_RE = re.compile(r"\s+")
+QUOTE_MARKERS_RE = re.compile(r"(?im)^\s*(?:-----original message-----|_{5,}|begin forwarded message:)\s*$")
 
 
 def clean_ws(s: str) -> str:
@@ -154,266 +130,111 @@ def safe_output_name(source_path: Path) -> str:
     cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", raw)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     h = hashlib.sha1(str(source_path).encode("utf-8", errors="ignore")).hexdigest()[:8]
-    if len(cleaned) > 80:
-        cleaned = cleaned[:80]
+    if len(cleaned) > 90:
+        cleaned = cleaned[:90]
     if not cleaned:
-        cleaned = "file"
-    return f"{cleaned}__{h}.html" if OUTPUT_FORMAT == "html" else f"{cleaned}__{h}.txt"
+        cleaned = "mail"
+    ext = ".html" if OUTPUT_FORMAT.lower() == "html" else ".txt"
+    return f"{cleaned}__{h}{ext}"
 
 
 def html_to_text(raw: str) -> str:
-    """
-    Convert HTML to text, but keep line structure.
-    Also removes VML/Office junk and spaced-out html attribute artifacts.
-    """
+    """Basic HTML->text while keeping line breaks."""
     if not raw:
         return ""
-
-    s = raw
-
-    # quick fix for spaced-out HTML artifacts: collapse single-letter spacing in tags
-    # (This doesn't reconstruct HTML; it just removes the most harmful noise lines later.)
-    s = s.replace("\r\n", "\n")
-
-    # Replace <br> and </p> with newlines before stripping tags
+    s = raw.replace("\r\n", "\n")
     s = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", s)
     s = re.sub(r"(?i)</\s*p\s*>", "\n\n", s)
     s = re.sub(r"(?i)</\s*div\s*>", "\n", s)
-
-    # Strip tags
     s = TAG_RE.sub(" ", s)
 
-    # Remove typical Office/VML noise
-    lines = [ln.strip() for ln in s.split("\n")]
-    cleaned_lines = []
-    for ln in lines:
-        if not ln:
-            cleaned_lines.append("")
-            continue
-        # drop lines that are just CSS/VML junk or spaced-html noise
-        if SPACED_HTML_NOISE_RE.search(ln) and len(ln) > 30:
-            continue
-        if ln.startswith(("v\\:*", "o\\:*", "w\\:*", ".shape", "/*")):
-            continue
-        cleaned_lines.append(ln)
-
-    # Normalize: collapse huge whitespace but keep paragraph breaks
-    out_lines = []
-    for ln in cleaned_lines:
-        if ln == "":
-            out_lines.append("")
-        else:
-            out_lines.append(WS_RE.sub(" ", ln).strip())
-
-    # Remove excessive blank lines
-    text = "\n".join(out_lines)
+    lines = [WS_RE.sub(" ", ln).strip() for ln in s.split("\n")]
+    text = "\n".join(lines)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
 
-def read_file_as_text(p: Path) -> str:
-    """
-    Read a supported file as text. For Office/PDF, attempts best-effort.
-    Missing libs are handled by returning "" without raising.
-    """
-    ext = p.suffix.lower().strip()
-
-    try:
-        if ext in (".html", ".htm", ".mhtml"):
-            raw = p.read_text(encoding="utf-8", errors="ignore")
-            # Some exports are already text-like, some are HTML
-            return html_to_text(raw)
-
-        if ext == ".txt":
-            return p.read_text(encoding="utf-8", errors="ignore")
-
-        if ext == ".pdf":
-            try:
-                from pypdf import PdfReader
-            except Exception:
-                return ""
-            out = []
-            r = PdfReader(str(p))
-            for pg in r.pages:
-                try:
-                    out.append(pg.extract_text() or "")
-                except Exception:
-                    pass
-            return "\n".join(out)
-
-        if ext == ".docx":
-            try:
-                from docx import Document as DocxDocument
-            except Exception:
-                return ""
-            doc = DocxDocument(str(p))
-            paras = []
-            for par in doc.paragraphs:
-                t = clean_ws(par.text)
-                if t:
-                    paras.append(t)
-            return "\n".join(paras)
-
-        if ext == ".xlsx":
-            try:
-                import openpyxl
-            except Exception:
-                return ""
-            wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
-            out = []
-            for ws in wb.worksheets:
-                out.append(f"Sheet: {ws.title}")
-                max_rows = min(ws.max_row or 0, 200)
-                max_cols = min(ws.max_column or 0, 30)
-                for r in range(1, max_rows + 1):
-                    row_vals = []
-                    for c in range(1, max_cols + 1):
-                        v = ws.cell(row=r, column=c).value
-                        row_vals.append("" if v is None else str(v))
-                    if any(cell.strip() for cell in row_vals):
-                        out.append(" | ".join(clean_ws(x) for x in row_vals))
-            return "\n".join(out)
-
-        # images: OCR optional
-        if ext in (".png", ".jpg", ".jpeg"):
-            return ocr_image_best_effort(p)
-
-    except Exception:
-        return ""
-
-    return ""
-
-
-def ocr_image_best_effort(p: Path) -> str:
-    """
-    OCR image file if possible.
-    - If pytesseract/PIL not installed or Tesseract missing: returns "" (silently).
-    """
-    try:
-        from PIL import Image
-    except Exception:
-        return ""
-    try:
-        import pytesseract
-    except Exception:
-        return ""
-
-    # If tesseract is not available in PATH, this can raise; we catch and skip.
-    try:
-        img = Image.open(str(p))
-        txt = pytesseract.image_to_string(img)
-        return txt or ""
-    except Exception:
-        return ""
-
-
 def strip_thread_headers(text: str) -> str:
-    """
-    Remove "Von/From/To/Cc/Sent/Subject" header lines and quoted thread blocks.
-    """
     if not text:
         return ""
-
     lines = text.split("\n")
     out = []
     for ln in lines:
-        # remove mailto remnants and angle-bracket artifacts
         if "mailto:" in ln.lower():
             continue
-        # remove explicit header lines
         if THREAD_SEP_RE.match(ln):
             continue
-        # remove line that is just "Priorität: Hoch" etc.
         if re.match(r"(?im)^\s*(priorität|priority)\s*:\s*.*$", ln):
             continue
         out.append(ln)
 
     t = "\n".join(out)
-    # cut off after "Original message" markers if present
     m = QUOTE_MARKERS_RE.search(t)
     if m:
         t = t[:m.start()].strip()
-
     return re.sub(r"\n{3,}", "\n\n", t).strip()
 
 
 def extract_useful_body(text: str) -> str:
     """
-    Try to keep only the useful conversational body:
-    - remove header blocks
-    - keep content from first greeting (if any) until signature closing (if any)
+    Keep conversational content. Prefer from first greeting until signature.
+    Fallback: stripped thread.
     """
     t = strip_thread_headers(text)
 
-    # cap extreme size
     if len(t) > MAX_BODY_CHARS:
         t = t[:MAX_BODY_CHARS]
 
-    # If there's a greeting line, start from it (or next line)
-    start_idx = 0
     lines = t.split("\n")
+    start_idx = 0
     for i, ln in enumerate(lines):
-        lnl = ln.strip().lower()
-        if any(lnl.startswith(gc) for gc in GREETING_CUES):
+        l = ln.strip().lower()
+        if any(l.startswith(gc) for gc in GREETING_CUES):
             start_idx = i
             break
 
-    # If there's a signature closing, cut at it (take content before)
     end_idx = len(lines)
     for i in range(len(lines)):
-        lnl = lines[i].strip().lower()
-        # match "VG", "LG", etc. as standalone or prefix
-        if any(lnl == sc or lnl.startswith(sc + " ") for sc in SIGNATURE_CLOSINGS):
+        l = lines[i].strip().lower()
+        if any(l == sc or l.startswith(sc + " ") for sc in SIGNATURE_CLOSINGS):
             end_idx = i
             break
-        # also consider "mit freundlichen grüßen" etc within line
-        if any(sc in lnl for sc in SIGNATURE_CLOSINGS):
+        if any(sc in l for sc in SIGNATURE_CLOSINGS):
             end_idx = i
             break
 
-    body_lines = lines[start_idx:end_idx]
-    body = "\n".join(body_lines).strip()
+    body = "\n".join(lines[start_idx:end_idx]).strip()
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
 
-    # If empty, fallback to stripped thread (first 2k chars)
-    if len(clean_ws(body)) < MIN_USEFUL_CHARS:
-        fallback = strip_thread_headers(text)
-        fallback = fallback.strip()
-        if len(clean_ws(fallback)) >= MIN_USEFUL_CHARS:
-            return fallback[:MAX_BODY_CHARS].strip()
-        return ""
-
+    if len(clean_ws(body)) < 30:
+        fallback = strip_thread_headers(text).strip()
+        return fallback[:MAX_BODY_CHARS] if len(clean_ws(fallback)) >= 30 else ""
     return body
 
 
-def redact_text(text: str) -> (str, dict):
+def redact_text(text: str):
     """
-    Replace sensitive patterns with nothing (delete).
-    Also removes obvious signature blocks (names, teams) by heuristics.
+    Delete sensitive info completely (no [PERSON] token).
     Returns (redacted_text, stats)
     """
-    if not text:
-        return "", {"emails": 0, "phones": 0, "urls": 0, "domains": 0, "iban": 0,
-                    "money": 0, "refs": 0, "addresses": 0, "names": 0, "companies": 0}
-
     stats = {
         "emails": 0, "phones": 0, "urls": 0, "domains": 0, "iban": 0,
         "money": 0, "refs": 0, "addresses": 0, "names": 0, "companies": 0
     }
+    if not text:
+        return "", stats
 
     t = text
 
-    # Supplier/company cues (delete explicit supplier mentions if matched as standalone word)
-    # NOTE: This is heuristic. If you want to keep supplier references but anonymize, change to "[SUPPLIER]".
-    for w in SUPPLIER_CUE_WORDS:
-        if not w:
-            continue
-        t2, n = re.subn(rf"(?i)\b{re.escape(w)}\b", "", t)
-        if n:
-            stats["companies"] += n
-            t = t2
+    if REMOVE_SUPPLIER_WORDS:
+        for w in SUPPLIER_CUE_WORDS:
+            if not w:
+                continue
+            t2, n = re.subn(rf"(?i)\b{re.escape(w)}\b", "", t)
+            if n:
+                stats["companies"] += n
+                t = t2
 
-    # Apply pattern deletions
     def sub_count(pattern, key):
         nonlocal t
         t2, n = pattern.subn("", t)
@@ -430,41 +251,36 @@ def redact_text(text: str) -> (str, dict):
     sub_count(ADDRESS_RE, "addresses")
     sub_count(PHONE_RE, "phones")
 
-    # Domains AFTER URLs, but be careful: don't delete normal words with dots in abbreviations.
-    # This can over-delete; if too aggressive, disable it.
+    # Domains (optional aggressive) – keep after URLs
     sub_count(DOMAIN_RE, "domains")
 
-    # Names: remove title+name and "Firstname Lastname"
+    # Title+Name
     t2, n = TITLE_NAME_RE.subn("", t)
     if n:
         stats["names"] += n
         t = t2
 
-    # Greeting names: remove the captured name part (not the greeting itself)
+    # Greeting name (remove captured part only)
     def _strip_greeting_name(m):
-        nonlocal stats
         stats["names"] += 1
         return m.group(0).replace(m.group(1), "").strip()
 
     t = GREETING_NAME_RE.sub(_strip_greeting_name, t)
 
-    # Remove obvious "Firstname Lastname" patterns (heuristic)
+    # Firstname Lastname
     t2, n = NAME_RE.subn("", t)
     if n:
         stats["names"] += n
         t = t2
 
-    # Remove Exchange-style "/O=EXCH..." chunks
+    # Exchange DN fragments
     t2, n = re.subn(r"(?i)/o=exch[^ \n]+", "", t)
     if n:
         stats["names"] += n
         t = t2
 
-    # Remove email header remnants like "Von:" blocks that survived
+    # Final cleanup
     t = strip_thread_headers(t)
-
-    # Cleanup
-    # Remove multiple punctuation leftovers
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n[ \t]+", "\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
@@ -476,53 +292,110 @@ def redact_text(text: str) -> (str, dict):
 
 
 def label_question_answer(subject: str, body: str) -> str:
-    """
-    Heuristic labels:
-    - "question": contains question marks, or imperative ask lines, or "kannst du", "please", etc.
-    - "answer": contains "danke", "unten meine anmerkungen", "hier die infos", "as discussed", etc.
-    Default: question if uncertain.
-    """
     s = (subject or "").strip().lower()
     b = (body or "").strip().lower()
 
-    # If subject is a reply but body is mostly guidance => answer
-    if s.startswith(REPLY_PREFIXES):
-        # still can be a question, but often answer
-        if any(x in b for x in ["unten", "anmerkungen", "hier", "as discussed", "as agreed", "danke", "thanks", "wir plädieren", "unsere meinung"]):
-            return "answer"
-
-    if "?" in body:
+    if "?" in (body or ""):
         return "question"
 
-    ask_cues = ["kannst du", "könnt ihr", "kann einer", "please", "bitte", "could you", "can you", "dringend", "please check", "draufschauen"]
+    ask_cues = ["kannst du", "könnt ihr", "kann einer", "please", "bitte", "could you", "can you", "draufschauen", "check", "prüfen"]
     if any(x in b for x in ask_cues):
         return "question"
 
-    answer_cues = ["danke", "unten", "anmerkungen", "hier die", "in der vergangenheit", "wir haben", "wir plädieren", "folgende informationen", "note that"]
+    answer_cues = ["danke", "unten", "anmerkungen", "hier", "wir plädieren", "folgende informationen", "as discussed", "as agreed"]
     if any(x in b for x in answer_cues):
         return "answer"
 
-    # fallback: if reply-like subject => answer
     if s.startswith(REPLY_PREFIXES):
         return "answer"
 
     return "question"
 
 
+def try_extract_attachment_text(file_path: Path) -> str:
+    """
+    Best effort text extraction from attachment file.
+    Missing libs => return "" (skip silently).
+    """
+    ext = file_path.suffix.lower()
+
+    try:
+        if ext == ".txt":
+            return file_path.read_text(encoding="utf-8", errors="ignore")
+
+        if ext == ".pdf":
+            try:
+                from pypdf import PdfReader
+            except Exception:
+                return ""
+            out = []
+            r = PdfReader(str(file_path))
+            for pg in r.pages:
+                try:
+                    out.append(pg.extract_text() or "")
+                except Exception:
+                    pass
+            return "\n".join(out)
+
+        if ext == ".docx":
+            try:
+                from docx import Document
+            except Exception:
+                return ""
+            doc = Document(str(file_path))
+            paras = []
+            for p in doc.paragraphs:
+                t = clean_ws(p.text)
+                if t:
+                    paras.append(t)
+            return "\n".join(paras)
+
+        if ext == ".xlsx":
+            try:
+                import openpyxl
+            except Exception:
+                return ""
+            wb = openpyxl.load_workbook(str(file_path), data_only=True, read_only=True)
+            out = []
+            for ws in wb.worksheets:
+                out.append(f"Sheet: {ws.title}")
+                max_rows = min(ws.max_row or 0, 200)
+                max_cols = min(ws.max_column or 0, 30)
+                for r in range(1, max_rows + 1):
+                    row = []
+                    for c in range(1, max_cols + 1):
+                        v = ws.cell(row=r, column=c).value
+                        row.append("" if v is None else str(v))
+                    if any(x.strip() for x in row):
+                        out.append(" | ".join(clean_ws(x) for x in row))
+            return "\n".join(out)
+
+        if ext in (".png", ".jpg", ".jpeg"):
+            # OCR optional
+            try:
+                from PIL import Image
+            except Exception:
+                return ""
+            try:
+                import pytesseract
+            except Exception:
+                return ""
+            try:
+                img = Image.open(str(file_path))
+                return pytesseract.image_to_string(img) or ""
+            except Exception:
+                return ""
+
+    except Exception:
+        return ""
+
+    return ""
+
+
 def format_output_html(source_name: str, label: str, subject: str, body: str, stats: dict) -> str:
     gen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    legend = "Email/URL/Domain/Phone/Address/IBAN/Reference/Money/Company/Name/Number"
-    meta = {
-        "Source": source_name,
-        "Label": label,
-        "Generated": gen,
-        "Subject": subject,
-        "RedactionStats": stats,
-    }
 
-    # Keep subject but do not leak names: sanitize subject too
     subj_red, _ = redact_text(subject)
-
     body_display = body if body else "(no usable body text extracted)"
     body_display = escape(body_display).replace("\n\n", "<br><br>").replace("\n", "<br>")
 
@@ -533,7 +406,6 @@ def format_output_html(source_name: str, label: str, subject: str, body: str, st
   <div><b>Source:</b> {escape(source_name)}</div>
   <div><b>Label:</b> {escape(label)}</div>
   <div><b>Generated:</b> {escape(gen)}</div>
-  <div><b>Legend:</b> {escape(legend)}</div>
   <div><b>Subject:</b> {escape(subj_red) if subj_red else "(empty subject)"}</div>
 </div>
 <hr>
@@ -560,25 +432,98 @@ def format_output_txt(source_name: str, label: str, subject: str, body: str, sta
     )
 
 
-def collect_input_files(base_dir: str):
+def collect_msg_files(base_dir: str):
     base = Path(base_dir)
     if not base.exists():
         raise SystemExit(f"Input folder not found: {base}")
 
-    exts = (".html", ".htm", ".mhtml", ".txt", ".pdf", ".docx", ".xlsx", ".png", ".jpg", ".jpeg")
-
     files = []
-    it = base.rglob("*") if RECURSIVE else base.glob("*")
+    it = base.rglob("*.msg") if RECURSIVE else base.glob("*.msg")
     for p in it:
         if not p.is_file():
             continue
         name = (p.name or "").lower().strip()
         if SKIP_TEMP and name.startswith("~$"):
             continue
-        if name.endswith(exts):
-            files.append(p)
-
+        files.append(p)
     return sorted(files)
+
+
+def outlook_open_msg(path: str):
+    """
+    Outlook COM open .msg:
+      ns.OpenSharedItem(path)
+    Returns MailItem or None.
+    """
+    try:
+        import win32com.client as win32
+    except Exception as e:
+        raise SystemExit("pywin32 is required for Outlook COM. Install: pip install pywin32") from e
+
+    app = win32.Dispatch("Outlook.Application")
+    ns = app.GetNamespace("MAPI")
+    try:
+        item = ns.OpenSharedItem(path)
+        return item
+    except Exception:
+        return None
+
+
+def get_msg_body_text(mail_item) -> str:
+    """
+    Prefer HTMLBody -> text conversion, fallback Body.
+    Some mails might have empty body if exported weirdly.
+    """
+    html = ""
+    body = ""
+    try:
+        html = getattr(mail_item, "HTMLBody", "") or ""
+    except Exception:
+        html = ""
+    try:
+        body = getattr(mail_item, "Body", "") or ""
+    except Exception:
+        body = ""
+
+    if html.strip():
+        return html_to_text(html)
+    return body or ""
+
+
+def extract_attachments_to_temp(mail_item, temp_dir: Path):
+    """
+    Save attachments to temp dir.
+    Returns list of saved paths.
+    Skips if access fails.
+    """
+    saved = []
+    try:
+        atts = mail_item.Attachments
+    except Exception:
+        return saved
+
+    count = 0
+    for i in range(1, getattr(atts, "Count", 0) + 1):
+        if count >= ATTACH_MAX_FILES:
+            break
+        try:
+            att = atts.Item(i)
+            fname = getattr(att, "FileName", "") or f"attachment_{i}"
+            # sanitize filename
+            safe = re.sub(r"[\\/:*?\"<>|]+", "_", fname).strip()
+            if not safe:
+                safe = f"attachment_{i}"
+            out_path = temp_dir / safe
+            # ensure uniqueness
+            if out_path.exists():
+                out_path = temp_dir / f"{out_path.stem}_{i}{out_path.suffix}"
+            att.SaveAsFile(str(out_path))
+            saved.append(out_path)
+            count += 1
+        except Exception:
+            continue
+
+    return saved
 
 
 def main():
@@ -586,63 +531,85 @@ def main():
     out_dir = Path(OUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    inputs = collect_input_files(MSG_DIR)
+    msg_files = collect_msg_files(MSG_DIR)
     print("Input folder:", in_dir)
-    print("Inputs found:", len(inputs))
+    print(".msg found:", len(msg_files))
 
-    if not inputs:
-        print("No supported files found. Check path and file extensions (.html/.htm/.mhtml).")
+    if not msg_files:
+        print("No .msg files found. Verify MSG_DIR path and RECURSIVE setting.")
         return
 
     written = 0
     skipped = 0
 
-    for p in inputs:
-        try:
-            raw_text = read_file_as_text(p)
-            if not raw_text.strip():
-                # still write output with empty body, but this helps you see which files are problematic
-                subj = p.stem
-                label = "question"
-                body = ""
-                stats = {"emails":0,"phones":0,"urls":0,"domains":0,"iban":0,"money":0,"refs":0,"addresses":0,"names":0,"companies":0}
-            else:
-                # Heuristic: detect subject lines if present in export, else use filename stem
-                subj = ""
-                # Try to find a "Subject:" line in the text
-                m = re.search(r"(?im)^\s*(?:subject|betreff)\s*:\s*(.+)$", raw_text)
-                if m:
-                    subj = clean_ws(m.group(1))
-                if not subj:
-                    subj = p.stem
+    # temp for attachments extraction
+    temp_root = Path(tempfile.mkdtemp(prefix="msg_sanitize_"))
+
+    try:
+        for p in msg_files:
+            try:
+                item = outlook_open_msg(str(p))
+                if item is None:
+                    skipped += 1
+                    continue
+
+                subject = ""
+                try:
+                    subject = getattr(item, "Subject", "") or ""
+                except Exception:
+                    subject = ""
+
+                raw_text = get_msg_body_text(item)
+                raw_text = raw_text.replace("\r\n", "\n")
+
+                # Extract attachments -> append their extracted text (best effort)
+                temp_dir = temp_root / (p.stem[:60] + "__" + hashlib.sha1(str(p).encode("utf-8", errors="ignore")).hexdigest()[:8])
+                temp_dir.mkdir(parents=True, exist_ok=True)
+
+                attach_paths = extract_attachments_to_temp(item, temp_dir)
+                attach_blocks = []
+                for ap in attach_paths:
+                    txt = try_extract_attachment_text(ap)
+                    txt = txt.strip()
+                    if txt:
+                        if len(txt) > ATTACH_MAX_CHARS_EACH:
+                            txt = txt[:ATTACH_MAX_CHARS_EACH] + "…"
+                        attach_blocks.append(f"[Attachment: {ap.name}]\n{txt}")
+
+                if attach_blocks:
+                    raw_text = (raw_text.strip() + "\n\n" + "\n\n".join(attach_blocks)).strip()
 
                 useful = extract_useful_body(raw_text)
                 red_body, stats = redact_text(useful)
 
-                # Normalize again after redaction
                 red_body = red_body.strip()
-                if len(clean_ws(red_body)) < MIN_USEFUL_CHARS:
+                if len(clean_ws(red_body)) < 30:
                     red_body = ""
 
-                label = label_question_answer(subj, red_body)
-                body = red_body
+                label = label_question_answer(subject, red_body)
 
-            out_name = safe_output_name(p)
-            out_path = out_dir / out_name
+                out_name = safe_output_name(p)
+                out_path = out_dir / out_name
 
-            if OUTPUT_FORMAT == "txt":
-                out_text = format_output_txt(p.name, label, subj, body, stats)
-                out_path.write_text(out_text, encoding="utf-8", errors="ignore")
-            else:
-                out_html = format_output_html(p.name, label, subj, body, stats)
-                out_path.write_text(out_html, encoding="utf-8", errors="ignore")
+                if OUTPUT_FORMAT.lower() == "txt":
+                    out_text = format_output_txt(p.name, label, subject, red_body, stats)
+                    out_path.write_text(out_text, encoding="utf-8", errors="ignore")
+                else:
+                    out_html = format_output_html(p.name, label, subject, red_body, stats)
+                    out_path.write_text(out_html, encoding="utf-8", errors="ignore")
 
-            written += 1
+                written += 1
 
-        except Exception as e:
-            skipped += 1
-            # Never crash the whole run
-            print("SKIP:", p.name, "-", e)
+            except Exception as e:
+                skipped += 1
+                print("SKIP:", p.name, "-", e)
+
+    finally:
+        # keep temp root? Usually we delete. If you want to inspect attachments, comment out next line.
+        try:
+            shutil.rmtree(temp_root, ignore_errors=True)
+        except Exception:
+            pass
 
     print("Done.")
     print("Written:", written)
