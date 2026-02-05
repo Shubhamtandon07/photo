@@ -1,32 +1,695 @@
-QUESTION
-Hallo ,
-der nominierte hat folgende Einschränkungen zum Prämissenblatt formuliert, siehe Anhang.
+# -*- coding: utf-8 -*-
+"""
+ONE FILE PER INPUT MAIL (NO MULTIPLE OUTPUTS PER MAIL)
 
+Goal
+- Read .msg (and optionally .html/.htm mail exports) from MSG_DIR (recursive)
+- Extract *full* email chain as best as possible (prefer HTML body)
+- Remove sensitive info (names, emails, phones, addresses, org blocks, IDs/refs, money, etc.)
+- Keep only work-relevant content (discussion text), not headers (Von/An/CC, signatures, etc.)
+- Split the chain into turns (oldest -> newest) and label each turn as QUESTION / ANSWER / OTHER
+  - Optional: use Azure OpenAI for better labeling/classification (redacted text only)
+- Export exactly 1 HTML per input mail into OUT_DIR/sanitized_one_per_mail
 
+Notes
+- This script is defensive: if a library isn't available, it skips that step (no crash).
+- Attachments: intentionally ignored for now (per your latest request).
+- If extract_msg fails on your Python 3.14 for some files, you may still need Python 3.11/3.12.
+  The script will log failures and continue.
 
-ist Rasmus bereits im Austausch mit Hirschvogel im Zusammenhang mit -M Projekten.
+EDIT THESE TWO PATHS
+"""
+from __future__ import annotations
 
-betrifft folgende VUs:
+import os
+import re
+import json
+import time
+import hashlib
+from pathlib import Path
+from datetime import datetime
+from html import escape
+from typing import List, Dict, Tuple, Optional
 
+# =========================
+# EDIT THESE
+# =========================
+MSG_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus"
+OUT_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports"
 
+# Optional: better labels using Azure OpenAI (redacted content only)
+USE_LLM_LABELING = True
 
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net/apikey/"
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-4o"  # your deployment name in Azure
+# The API key is read from environment variable OPENAI_API_KEY
+# =========================
 
+# Output folder
+OUT_SUBFOLDER = "sanitized_one_per_mail"
 
+# Logging
+LOG_SUBFOLDER = "_logs"
+ERRORS_LOG = "errors.log"
+STATS_JSON = "stats.json"
 
+# Input types considered
+INPUT_EXTS = {".msg", ".html", ".htm"}
 
-,
-die VUs & Arm haben ihr VZT-Datum bereits überfahren oder sind im proPlan als abgeschlossen markiert. Für die Berechnung der Nachhaltigkeits KPI „Anteil erfolgreiche Fokusvergaben“ und zum Start der Nachhaltigkeits-Industrialisierungsgespräche benötigen wir die von den nominierten Lieferanten unterschriebenen Nachhaltigkeitsprämissenblätter. uns bitte das Dokument bzw. die Dokumente zeitnah zusenden?
+# -------------------------------------------------------------------
+# Optional imports (skip if missing)
+# -------------------------------------------------------------------
+extract_msg = None
+BeautifulSoup = None
+AzureOpenAI = None
 
-im Voraus.
+try:
+    import extract_msg as _extract_msg
+    extract_msg = _extract_msg
+except Exception:
+    extract_msg = None
 
+try:
+    from bs4 import BeautifulSoup as _BS
+    BeautifulSoup = _BS
+except Exception:
+    BeautifulSoup = None
 
+try:
+    from openai import AzureOpenAI as _AzureOpenAI
+    AzureOpenAI = _AzureOpenAI
+except Exception:
+    AzureOpenAI = None
 
-Mercedes- and (MP/RM1)
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-Mercedes-Benz AG 
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
 
+def log_error(log_path: Path, msg: str) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8", errors="ignore") as f:
+        f.write(f"[{now_str()}] ERROR: {msg}\n")
 
+def clean_ws(s: str) -> str:
+    s = s or ""
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # remove zero-width
+    s = re.sub(r"[\u200B-\u200D\uFEFF]", "", s)
+    # normalize spaces per line
+    s = "\n".join(re.sub(r"[ \t]+", " ", ln).rstrip() for ln in s.split("\n"))
+    # collapse excessive blank lines
+    s = re.sub(r"\n{4,}", "\n\n\n", s)
+    return s.strip()
 
-050/HPC: L393
+def safe_stem(p: Path) -> str:
+    raw = p.stem
+    raw = re.sub(r"[\\/:*?\"<>|]+", "_", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    if not raw:
+        raw = "mail"
+    h = hashlib.sha1(str(p).encode("utf-8", errors="ignore")).hexdigest()[:8]
+    raw = raw[:80]
+    return f"{raw}__{h}"
 
-Schickardstraße
+def html_to_text(html: str) -> str:
+    html = html or ""
+    if not html.strip():
+        return ""
+    if BeautifulSoup:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            # remove scripts/styles
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            txt = soup.get_text("\n")
+            return clean_ws(txt)
+        except Exception:
+            pass
+    # fallback: crude strip tags
+    txt = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
+    txt = re.sub(r"(?is)<br\s*/?>", "\n", txt)
+    txt = re.sub(r"(?is)</p\s*>", "\n\n", txt)
+    txt = re.sub(r"(?is)<[^>]+>", " ", txt)
+    return clean_ws(txt)
+
+def de_spaced_garbage(text: str) -> str:
+    """
+    Fix the classic 'h t m l  x m l n s : v = ...' spaced-letter artifact.
+    We only apply if it looks like spaced letters are dominating.
+    """
+    t = text or ""
+    if not t.strip():
+        return t
+
+    # heuristic: many single-letter tokens separated by spaces
+    tokens = re.findall(r"\b\w\b", t)
+    if len(tokens) < 30:
+        return t
+
+    # ratio of single-letter tokens to total words
+    words = re.findall(r"\b\w+\b", t)
+    if not words:
+        return t
+    ratio = len(tokens) / max(1, len(words))
+    if ratio < 0.55:
+        return t
+
+    # collapse sequences like "h t m l" -> "html"
+    t = re.sub(r"(?:(?<=\b)\w\s+){3,}\w(?=\b)", lambda m: m.group(0).replace(" ", ""), t)
+    # also collapse "x m l n s" patterns
+    t = re.sub(r"(?:(?<=\b)\w\s+){4,}\w(?=\b)", lambda m: m.group(0).replace(" ", ""), t)
+    return t
+
+# -------------------------------------------------------------------
+# Sensitive patterns (delete, not placeholders)
+# -------------------------------------------------------------------
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
+WWW_RE = re.compile(r"\bwww\.[^\s<>()]+\b", re.I)
+
+PHONE_RE = re.compile(
+    r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d"
+)
+
+# German street + optional number (also catches "Schickardstraße" without number by STREET_ONLY_RE below)
+ADDRESS_RE = re.compile(
+    r"(?im)\b[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,3}\s+"
+    r"(straße|strasse|str\.|weg|allee|platz|ring|gasse|damm|ufer)\s*\d{0,5}[a-zA-Z]?\b"
+)
+
+STREET_ONLY_RE = re.compile(
+    r"(?im)\b[A-ZÄÖÜ][a-zäöüß]+(?:straße|strasse|str\.|weg|allee|platz|ring|gasse|damm|ufer)\b"
+)
+
+MONEY_RE_1 = re.compile(r"(?i)\b(?:EUR|USD|GBP|CHF)\s*\d[\d\.\,\s]*\b")
+MONEY_RE_2 = re.compile(r"\b\d[\d\.\,\s]*\s*(?:€|EUR|USD|GBP|CHF)\b", re.I)
+MONEY_RE_3 = re.compile(r"\b€\s*\d[\d\.\,\s]*\b", re.I)
+
+# Reference-like patterns (keep generic work text; remove actual tokens)
+REF_RE = re.compile(
+    r"(?i)\b(?:PO|PR|NCR|Ticket|Case|Req|Request|Material|Part|Supplier|Portal|Round|ID|Ref|VU)\s*[:#]?\s*"
+    r"[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b"
+)
+
+# Person name patterns
+TITLE_NAME_RE = re.compile(
+    r"\b(?:Mr|Mrs|Ms|Miss|Dr|Prof|Herr|Frau)\.?\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b"
+)
+NAME_STRONG_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b")
+
+# Greeting/signoff names (single name only, constrained contexts)
+GREET_INLINE_RE = re.compile(r"(?im)^\s*(hallo|hi|hello|guten\s+morgen|guten\s+tag)\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b.*$")
+SIGNOFF_SHORT_RE = re.compile(r"(?im)^\s*(vg|lg|br|mfg|grüße|mit\s+freundlichen\s+grüßen)\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b.*$")
+
+AUSTAUSCH_MIT_NAME_RE = re.compile(r"(?i)\b(im\s+austausch\s+mit)\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b")
+
+# Big header blocks we want to drop from chains
+HEADER_LINE_RE = re.compile(
+    r"(?im)^\s*(von|from|an|to|cc|bcc|betreff|subject|gesendet|sent|datum|date)\s*:\s*.*$"
+)
+
+# Common chain separators
+CHAIN_SEP_RE = re.compile(
+    r"(?im)^\s*(von|from)\s*:\s+.*$|^\s*-----\s*original message\s*-----\s*$|^\s*_{5,}\s*$"
+)
+
+# Signature tail stripper (very aggressive; remove org/address blocks at end)
+SIG_TAIL_RE = re.compile(
+    r"(?is)\n\s*(mercedes[- ]?benz.*|mercedes[- ]?benz\s+ag.*|mp/rm\d+.*|"
+    r"telefon\s*:.*|mobil\s*:.*|e-?mail\s*:.*|mail\s*:.*|"
+    r"schickardstra[ßs]e.*|stuttgart.*|sindelfingen.*|germany.*)\n.*$"
+)
+
+def redact_text(text: str, stats: Dict[str, int]) -> str:
+    t = text or ""
+
+    # Remove obvious headers everywhere
+    t = HEADER_LINE_RE.sub("", t)
+
+    # Remove greeting lines containing a name
+    t = GREET_INLINE_RE.sub(lambda m: m.group(1).capitalize() + ",", t)
+    t = SIGNOFF_SHORT_RE.sub("", t)
+
+    # Remove email/urls/phones/money/refs/addresses
+    t, n = EMAIL_RE.subn("", t); stats["emails"] += n
+    t, n = URL_RE.subn("", t); stats["urls"] += n
+    t, n = WWW_RE.subn("", t); stats["urls"] += n
+    t, n = PHONE_RE.subn("", t); stats["phones"] += n
+    t, n = MONEY_RE_1.subn("", t); stats["money"] += n
+    t, n = MONEY_RE_2.subn("", t); stats["money"] += n
+    t, n = MONEY_RE_3.subn("", t); stats["money"] += n
+    t, n = REF_RE.subn("", t); stats["refs"] += n
+    t, n = ADDRESS_RE.subn("", t); stats["addresses"] += n
+    t, n = STREET_ONLY_RE.subn("", t); stats["addresses"] += n
+
+    # Remove "im Austausch mit <Name>" name only
+    t2, n = AUSTAUSCH_MIT_NAME_RE.subn(r"\1", t)
+    if n:
+        stats["names"] += n
+        t = t2
+
+    # Remove title+name and strong full names
+    t, n = TITLE_NAME_RE.subn("", t); stats["names"] += n
+    t, n = NAME_STRONG_RE.subn("", t); stats["names"] += n
+
+    # Strip signature tails
+    t = SIG_TAIL_RE.sub("", t)
+
+    # Clean leftovers
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n[ \t]+", "\n", t)
+    t = re.sub(r"\n{4,}", "\n\n\n", t)
+    t = re.sub(r"\(\s*\)", "", t)
+    return clean_ws(t)
+
+# -------------------------------------------------------------------
+# Highlighting (for anything that still remains after redaction)
+# -------------------------------------------------------------------
+H_EMAIL = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+H_URL = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
+H_PHONE = re.compile(r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d")
+H_ADDRESS = ADDRESS_RE
+H_NUMBER = re.compile(r"\b\d+(?:[.,]\d+)?\b")
+
+def highlight_html(text: str) -> str:
+    original = text or ""
+    hits: List[Tuple[int, int, str]] = []
+
+    def mark(regex, label):
+        for m in regex.finditer(original):
+            hits.append((m.start(), m.end(), label))
+
+    mark(H_EMAIL, "email")
+    mark(H_URL, "url")
+    mark(H_PHONE, "phone")
+    mark(H_ADDRESS, "address")
+    mark(H_NUMBER, "number")
+
+    hits.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+
+    merged = []
+    last_end = -1
+    for s, e, label in hits:
+        if s < last_end:
+            continue
+        merged.append((s, e, label))
+        last_end = e
+
+    color = {
+        "email": "#fff59d",
+        "url": "#d1c4e9",
+        "phone": "#c8e6c9",
+        "address": "#bbdefb",
+        "number": "#eeeeee",
+    }
+
+    parts = []
+    cur = 0
+    for s, e, label in merged:
+        parts.append(escape(original[cur:s]))
+        parts.append(
+            f'<span style="background:{color.get(label,"#ffffcc")}; padding:0 2px; border-radius:3px;">'
+            f'{escape(original[s:e])}</span>'
+        )
+        cur = e
+    parts.append(escape(original[cur:]))
+
+    body_html = "".join(parts).replace("\n", "<br>\n")
+
+    legend = (
+        '<div style="font-family:Segoe UI,Arial; font-size:13px; margin-bottom:12px;">'
+        '<b>Legend:</b> '
+        f'<span style="background:{color["email"]};padding:2px 6px;border-radius:3px;margin-left:6px;">Email</span>'
+        f'<span style="background:{color["url"]};padding:2px 6px;border-radius:3px;margin-left:6px;">URL</span>'
+        f'<span style="background:{color["phone"]};padding:2px 6px;border-radius:3px;margin-left:6px;">Phone</span>'
+        f'<span style="background:{color["address"]};padding:2px 6px;border-radius:3px;margin-left:6px;">Address</span>'
+        f'<span style="background:{color["number"]};padding:2px 6px;border-radius:3px;margin-left:6px;">Number</span>'
+        "</div>"
+    )
+
+    return f"""<html>
+<head><meta charset="utf-8"><title>Sanitized Mail</title></head>
+<body style="font-family:Segoe UI,Arial; font-size:13px; line-height:1.35; padding:16px;">
+{legend}
+<div>{body_html}</div>
+</body>
+</html>"""
+
+# -------------------------------------------------------------------
+# Parsing .msg and .html/.htm mail exports
+# -------------------------------------------------------------------
+def parse_msg_file(path: Path) -> Tuple[str, str]:
+    """
+    Returns (subject, body_text_fullchain_best_effort)
+    """
+    if extract_msg is None:
+        raise RuntimeError("extract-msg not installed or failed to import.")
+
+    m = extract_msg.Message(str(path))
+
+    # Newer/older API compatibility
+    try:
+        # old versions
+        if hasattr(m, "process") and callable(getattr(m, "process")):
+            m.process()
+        else:
+            # many versions populate on init; calling save() often forces parsing
+            if hasattr(m, "save") and callable(getattr(m, "save")):
+                # save to temp is optional; but can trigger parsing
+                try:
+                    m.save(customPath=str(path.parent))
+                except Exception:
+                    pass
+    except Exception:
+        # proceed; maybe still has fields
+        pass
+
+    subject = getattr(m, "subject", "") or ""
+    body = getattr(m, "body", "") or ""
+    html_body = getattr(m, "htmlBody", "") or ""
+
+    # Prefer htmlBody when meaningful
+    body_txt = ""
+    if html_body and len(str(html_body)) > 50:
+        body_txt = html_to_text(str(html_body))
+    if not body_txt or len(body_txt) < 50:
+        body_txt = clean_ws(str(body))
+
+    # cleanup
+    body_txt = de_spaced_garbage(body_txt)
+
+    # close if available
+    try:
+        if hasattr(m, "close") and callable(getattr(m, "close")):
+            m.close()
+    except Exception:
+        pass
+
+    return clean_ws(subject), clean_ws(body_txt)
+
+def parse_html_file(path: Path) -> Tuple[str, str]:
+    raw = path.read_text(encoding="utf-8", errors="ignore")
+    # Try to detect subject inside HTML (optional)
+    subject = path.stem
+    txt = html_to_text(raw)
+    txt = de_spaced_garbage(txt)
+    return clean_ws(subject), clean_ws(txt)
+
+# -------------------------------------------------------------------
+# Chain splitting into turns
+# -------------------------------------------------------------------
+def split_into_turns(full_text: str) -> List[str]:
+    """
+    Split a thread into "turns" using common separators.
+    Then return turns oldest->newest (bottom->top in many Outlook exports).
+    """
+    t = full_text or ""
+    t = clean_ws(t)
+    if not t:
+        return []
+
+    # Remove some very noisy VML/css blocks early
+    t = re.sub(r"(?is)v\\:\*\s*\{.*?\}\s*o\\:\*\s*\{.*?\}\s*w\\:\*\s*\{.*?\}", " ", t)
+    t = re.sub(r"(?is)\.shape\s*\{.*?\}", " ", t)
+
+    # Split by separators
+    parts = re.split(r"(?im)^\s*(?:Von|From)\s*:\s+.*$|^\s*-----\s*Original Message\s*-----\s*$|^\s*_{5,}\s*$", t)
+    parts = [clean_ws(p) for p in parts if clean_ws(p)]
+
+    # Many exports: newest is first. You explicitly want questions to start from bottom.
+    # We'll treat the last chunk as oldest and reverse to get oldest->newest.
+    if len(parts) >= 2:
+        parts = list(reversed(parts))
+
+    return parts
+
+# -------------------------------------------------------------------
+# Labeling: QUESTION / ANSWER / OTHER per turn
+# -------------------------------------------------------------------
+QUESTION_CUES = re.compile(
+    r"(?is)\b("
+    r"can you|could you|please|bitte|kannst du|könnt ihr|können sie|"
+    r"frage|fragen|question|request|ich hätte gern|wir benötigen|"
+    r"uns bitte|bitte.*zusenden|bitte.*schicken|könnt.*zusenden|"
+    r"\?\s*$|\?\s*\n"
+    r")\b"
+)
+
+ANSWER_CUES = re.compile(
+    r"(?is)\b("
+    r"danke|here is|hier|unten|as discussed|wir plädieren|wir empfehlen|"
+    r"unsere meinung|anmerkungen|rückmeldung|antwort|"
+    r"vg|lg|br|mfg|mit freundlichen grüßen"
+    r")\b"
+)
+
+def heuristic_label(turn_text: str) -> str:
+    t = (turn_text or "").strip()
+    if not t:
+        return "other"
+
+    q = bool(QUESTION_CUES.search(t))
+    a = bool(ANSWER_CUES.search(t))
+
+    # If both: decide by density of question marks and request cues
+    qm = t.count("?")
+    if q and not a:
+        return "question"
+    if a and not q:
+        return "answer"
+    if q and a:
+        # if there are multiple question marks or "bitte ... zusenden", treat as question
+        if qm >= 1 and re.search(r"(?i)\b(bittt?e|please).*(zusenden|schicken|send)\b", t):
+            return "question"
+        # otherwise likely answer with a small follow-up question
+        return "answer"
+
+    # fallback: question marks
+    if qm >= 1:
+        return "question"
+    return "other"
+
+def build_azure_client() -> Optional[object]:
+    if not USE_LLM_LABELING:
+        return None
+    if AzureOpenAI is None:
+        return None
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        return None
+    try:
+        return AzureOpenAI(
+            api_version=AZURE_API_VERSION,
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            api_key=key,
+        )
+    except Exception:
+        return None
+
+def llm_label_turn(client, turn_text: str) -> str:
+    """
+    Returns: question / answer / other
+    Uses already-redacted content only.
+    """
+    if client is None:
+        return heuristic_label(turn_text)
+
+    prompt = f"""Classify this email turn into exactly one label:
+- question
+- answer
+- other
+
+Rules:
+- If it primarily requests info, documents, confirmation, or asks questions => question
+- If it primarily provides info, decisions, feedback, instructions, or answers earlier questions => answer
+- If it's mostly greetings, forwarding metadata, or unclear => other
+
+Return ONLY the label word.
+
+TURN:
+{turn_text[:2500]}
+"""
+    try:
+        r = client.chat.completions.create(
+            model=AZURE_DEPLOYMENT_NAME,
+            temperature=0.0,
+            messages=[
+                {"role": "system", "content": "Return only one label: question, answer, or other."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        out = (r.choices[0].message.content or "").strip().lower()
+        out = re.sub(r"[^a-z]", "", out)
+        if out in {"question", "answer", "other"}:
+            return out
+    except Exception:
+        pass
+
+    return heuristic_label(turn_text)
+
+# -------------------------------------------------------------------
+# Final "keep only useful content" cleanup per turn
+# -------------------------------------------------------------------
+def strip_remaining_headers_and_noise(t: str) -> str:
+    t = t or ""
+    # remove header-like lines again
+    t = HEADER_LINE_RE.sub("", t)
+    # remove obvious mailto artifacts
+    t = re.sub(r"(?im)\bmailto\s*:\s*\S+", "", t)
+    # remove repeated "Source" tokens etc.
+    t = re.sub(r"(?im)^\s*source\s*:.*$", "", t)
+    # remove "Priorität: Hoch" etc.
+    t = re.sub(r"(?im)^\s*(priorität|priority)\s*:\s*.*$", "", t)
+    return clean_ws(t)
+
+# -------------------------------------------------------------------
+# Export one HTML per mail
+# -------------------------------------------------------------------
+def render_one_mail_html(source_name: str, subject: str, turns: List[Tuple[str, str]]) -> str:
+    """
+    turns: list of (label, text) in chronological order (oldest->newest)
+    """
+    header = (
+        f"<div style='font-size:12px;color:#444;margin-bottom:10px;'>"
+        f"<b>Source:</b> {escape(source_name)}<br>"
+        f"<b>Generated:</b> {escape(now_str())}<br>"
+        f"</div>"
+        f"<div style='margin-bottom:10px;'>"
+        f"<b>Subject:</b> {escape(subject) if subject else '(no subject)'}"
+        f"</div>"
+        "<hr>"
+    )
+
+    # Build body: show each turn with a label
+    body_parts = []
+    for i, (lab, txt) in enumerate(turns, start=1):
+        lab_caps = lab.upper()
+        body_parts.append(
+            f"<div style='margin:10px 0;'>"
+            f"<div style='font-weight:700;color:#222;'>Turn {i} — {escape(lab_caps)}</div>"
+            f"<div style='margin-top:4px;'>{highlight_html(txt).split('<div>',1)[1].rsplit('</div>',1)[0]}</div>"
+            f"</div>"
+        )
+
+    if not body_parts:
+        body_parts = ["<div>(no usable body text extracted)</div>"]
+
+    return f"""<html>
+<head><meta charset="utf-8"><title>Sanitized Mail</title></head>
+<body style="font-family:Segoe UI,Arial; font-size:13px; line-height:1.35; padding:16px;">
+{header}
+{''.join(body_parts)}
+</body>
+</html>"""
+
+# -------------------------------------------------------------------
+# Main processing
+# -------------------------------------------------------------------
+def process_one_file(path: Path, out_dir: Path, err_log: Path, client) -> Optional[Dict]:
+    stats = {"emails": 0, "urls": 0, "phones": 0, "money": 0, "refs": 0, "addresses": 0, "names": 0}
+    try:
+        if path.suffix.lower() == ".msg":
+            subject, full_body = parse_msg_file(path)
+        else:
+            subject, full_body = parse_html_file(path)
+
+        # Subject clean: remove common prefixes but keep meaning
+        subject = subject or ""
+        subject = re.sub(r"(?i)^\s*(aw|re|wg|fw)\s*:\s*", "", subject).strip()
+
+        full_body = de_spaced_garbage(full_body)
+        full_body = clean_ws(full_body)
+
+        # Split chain to turns (oldest->newest)
+        turns_raw = split_into_turns(full_body)
+
+        turns_out: List[Tuple[str, str]] = []
+        for turn in turns_raw:
+            # Remove headers/noise
+            turn = strip_remaining_headers_and_noise(turn)
+
+            # Redact sensitive info
+            turn = redact_text(turn, stats)
+
+            # Keep only if there is meaningful content
+            if len(turn.strip()) < 8:
+                continue
+
+            # Label
+            label = llm_label_turn(client, turn)
+
+            turns_out.append((label, turn))
+
+        # If everything got stripped, keep at least something
+        if not turns_out:
+            # redact full body once and keep
+            body_once = redact_text(strip_remaining_headers_and_noise(full_body), stats)
+            body_once = body_once.strip()
+            if body_once:
+                turns_out = [("other", body_once)]
+
+        out_html = render_one_mail_html(path.name, subject, turns_out)
+        out_path = out_dir / f"{safe_stem(path)}.html"
+        out_path.write_text(out_html, encoding="utf-8", errors="ignore")
+
+        return {
+            "file": str(path),
+            "out": str(out_path),
+            "subject": subject,
+            "turns": len(turns_out),
+            "redaction_stats": stats,
+        }
+
+    except Exception as e:
+        log_error(err_log, f"{path.name} -> {repr(e)}")
+        return None
+
+def main():
+    base = Path(MSG_DIR)
+    out_base = Path(OUT_DIR)
+    out_dir = out_base / OUT_SUBFOLDER
+    log_dir = out_base / LOG_SUBFOLDER
+    ensure_dir(out_dir)
+    ensure_dir(log_dir)
+
+    err_log = log_dir / ERRORS_LOG
+    stats_path = log_dir / STATS_JSON
+
+    # Build client (optional)
+    client = build_azure_client()
+
+    # Collect files
+    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in INPUT_EXTS]
+
+    if not files:
+        print("No .msg/.html/.htm files found in:", MSG_DIR)
+        return
+
+    all_results = []
+    ok = 0
+    fail = 0
+
+    t0 = time.time()
+    for p in sorted(files):
+        res = process_one_file(p, out_dir, err_log, client)
+        if res:
+            all_results.append(res)
+            ok += 1
+        else:
+            fail += 1
+
+    dt = time.time() - t0
+    stats_path.write_text(json.dumps({"ok": ok, "fail": fail, "seconds": dt, "results": all_results}, indent=2), encoding="utf-8")
+
+    print(f"Done. OK={ok}, FAIL={fail}, seconds={dt:.2f}")
+    print("Output folder:", str(out_dir))
+    print("Logs:", str(log_dir))
+
+if __name__ == "__main__":
+    main()
