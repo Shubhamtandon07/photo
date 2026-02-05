@@ -1,4 +1,894 @@
-Cell In[9], line 569
-    ANSWER_CUES = re.compile(r"(?
-                             ^
-SyntaxError: unterminated string literal (detected at line 569)
+# -*- coding: utf-8 -*-
+"""
+Sanitize & Highlight office email artifacts for safe training / KB use.
+
+Single file, single run:
+- Reads from MSG_DIR recursively:
+  - .msg (Outlook) if extract_msg is available
+  - .html/.htm (saved mail exports)
+  - .eml (basic support)
+- Extracts useful body text (cuts quoted history and "From/Von/Sent/Gesendet/To/An/Cc/Subject/Betreff" blocks)
+- Attachment extraction from .msg (if extract_msg saves attachments):
+  - .pdf .xlsx .docx .txt .html .png .jpg .jpeg (OCR optional)
+- Produces ONE HTML per source file in:
+  OUT_DIR / sanitized_highlighted / <safe_name>.html
+  That HTML contains:
+    1) ORIGINAL text with highlighted sensitive hits (for review)
+    2) REDACTED text (delete-only, meant for safe storage)
+- Produces:
+  OUT_DIR / run.log
+  OUT_DIR / stats.json
+  OUT_DIR / errors.log (only if errors occur)
+
+Important:
+- If a library is missing, the corresponding feature is skipped; script continues.
+- No Azure/OpenAI calls are made.
+"""
+
+import re
+import os
+import json
+import time
+import hashlib
+import tempfile
+from pathlib import Path
+from datetime import datetime
+from html import escape
+from typing import Dict, List, Tuple, Optional
+
+# =========================
+# EDIT THESE
+# =========================
+MSG_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus"
+OUT_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports"
+
+# Optional curated list for supplier/company names (one per line).
+# If empty or file missing, ignored.
+COMPANY_LIST_TXT = r""  # e.g. r"C:\path\company_list.txt"
+
+# OCR
+ENABLE_OCR_IMAGES = True
+OCR_LANG = "deu+eng"
+OCR_MAX_IMAGES_PER_MSG = 6
+# =========================
+
+# =========================================================
+# Output folders
+# =========================================================
+OUT_DIR = Path(OUT_DIR)
+OUT_HTML_DIR = OUT_DIR / "sanitized_highlighted"
+OUT_HTML_DIR.mkdir(parents=True, exist_ok=True)
+
+RUN_LOG = OUT_DIR / "run.log"
+ERROR_LOG = OUT_DIR / "errors.log"
+STATS_JSON = OUT_DIR / "stats.json"
+
+TEMP_DIR = Path(tempfile.gettempdir()) / "mail_sanitize_tmp"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# =========================================================
+# Logging
+# =========================================================
+def log(msg: str):
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line)
+    RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with RUN_LOG.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def err(msg: str):
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ERROR: {msg}"
+    print(line)
+    with ERROR_LOG.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+# =========================================================
+# Optional libraries (graceful)
+# =========================================================
+HAS_EXTRACT_MSG = False
+HAS_PYPDF = False
+HAS_DOCX = False
+HAS_OPENPYXL = False
+HAS_PIL = False
+HAS_TESS = False
+
+try:
+    import extract_msg  # type: ignore
+    HAS_EXTRACT_MSG = True
+except Exception:
+    HAS_EXTRACT_MSG = False
+
+try:
+    from pypdf import PdfReader  # type: ignore
+    HAS_PYPDF = True
+except Exception:
+    HAS_PYPDF = False
+
+try:
+    from docx import Document as DocxDocument  # type: ignore
+    HAS_DOCX = True
+except Exception:
+    HAS_DOCX = False
+
+try:
+    import openpyxl  # type: ignore
+    HAS_OPENPYXL = True
+except Exception:
+    HAS_OPENPYXL = False
+
+try:
+    from PIL import Image  # type: ignore
+    HAS_PIL = True
+except Exception:
+    HAS_PIL = False
+
+try:
+    import pytesseract  # type: ignore
+    HAS_TESS = True
+except Exception:
+    HAS_TESS = False
+
+
+# =========================================================
+# Helpers
+# =========================================================
+def clean_ws(s: str) -> str:
+    return re.sub(r"[ \t]+", " ", (s or "")).strip()
+
+
+def clean_ws_keep_newlines(s: str) -> str:
+    s = (s or "").replace("\r\n", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def safe_output_name(src: Path) -> str:
+    raw = src.stem
+    cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    h = hashlib.sha1(str(src).encode("utf-8", errors="ignore")).hexdigest()[:8]
+    cleaned = cleaned[:80] if len(cleaned) > 80 else cleaned
+    if not cleaned:
+        cleaned = "file"
+    return f"{cleaned}__{h}.html"
+
+
+def detect_source_type(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext == ".msg":
+        return "msg"
+    if ext in (".html", ".htm"):
+        return "html"
+    if ext == ".eml":
+        return "eml"
+    return ext.lstrip(".")
+
+
+def de_space_single_chars(text: str) -> str:
+    """
+    Fix broken spaced tokens like: '< h t m l  x m l n s : v = ... >'
+    Merge sequences of single-character tokens when it's clearly corrupted text.
+    """
+    if not text:
+        return ""
+
+    def repl(m: re.Match) -> str:
+        return m.group(0).replace(" ", "")
+
+    return re.sub(r"(?:\b\w\b\s+){3,}\b\w\b", repl, text)
+
+
+def strip_html_tags(html: str) -> str:
+    html = html or ""
+    html = html.replace("\r\n", "\n")
+    html = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    html = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", html)
+    html = re.sub(r"(?i)</\s*p\s*>", "\n\n", html)
+    html = re.sub(r"(?i)</\s*div\s*>", "\n", html)
+    html = re.sub(r"(?i)</\s*li\s*>", "\n", html)
+    txt = re.sub(r"(?s)<[^>]+>", " ", html)
+    txt = txt.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    return clean_ws_keep_newlines(txt)
+
+
+# =========================================================
+# Sensitive patterns
+# =========================================================
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
+WWW_RE = re.compile(r"\bwww\.[^\s<>()]+\b", re.I)
+DOMAIN_RE = re.compile(r"\b(?:[A-Z0-9-]+\.)+(?:[A-Z]{2,})\b", re.I)
+
+PHONE_RE = re.compile(
+    r"(?<!\w)(?:\+?\d{1,3}[\s\-\/]?)?(?:\(?\d{2,5}\)?[\s\-\/]?)?\d{3,4}[\s\-\/]?\d{3,4}(?!\w)"
+)
+
+ADDRESS_RE = re.compile(
+    r"\b([A-ZÄÖÜ][a-zäöüß]+(?:\s[A-ZÄÖÜ][a-zäöüß]+){0,3})\s"
+    r"(Straße|Strasse|Str\.|Weg|Allee|Platz|Ring|Gasse|Damm|Ufer)\s"
+    r"\d{1,5}[a-zA-Z]?\b"
+)
+
+IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b", re.I)
+
+MONEY_RE = re.compile(
+    r"(?i)\b(?:EUR|USD|GBP|CHF)\s*\d[\d\.\,\s]*\b|\b\d[\d\.\,\s]*\s*(?:€|EUR|USD|GBP|CHF)\b|\b€\s*\d[\d\.\,\s]*\b"
+)
+
+ID_REF_RE = re.compile(
+    r"\b(?:PO|PR|NCR|Ticket|Case|Req|Request|Material|Part|SP|Projekt|Project|ID|Ref|V\d{2,}|SP\d+)\s*[:#]?\s*[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b",
+    re.I,
+)
+
+NAME_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b")
+NAME_COMMA_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{2,},\s*[A-ZÄÖÜ][a-zäöüß]{2,}\b")
+
+TITLE_NAME_RE = re.compile(
+    r"\b(?:Mr|Mrs|Ms|Miss|Dr|Prof|Herr|Frau)\.?\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b"
+)
+
+GREETING_NAME_RE = re.compile(
+    r"(?im)^\s*(hallo|hi|hello|guten\s+morgen|guten\s+tag|guten\s+abend|sehr\s+geehrte[rn]?)\s+"
+    r"([A-ZÄÖÜ][a-zäöüß]{1,})(?:\s*[,\!])?\s*$"
+)
+
+SIGNOFF_LINE_RE = re.compile(
+    r"(?im)^\s*(vg|lg|br|mfg|mit\s+freundlichen\s+grüßen|best\s+regards|kind\s+regards|with\s+best\s+regards)\b.*$"
+)
+
+NUMBER_RE = re.compile(r"\b\d+(?:[.,]\d+)?\b")
+
+# Optional curated list
+COMPANY_TERMS: List[str] = []
+COMPANY_RE: Optional[re.Pattern] = None
+
+
+def build_company_re(company_terms: List[str]) -> Optional[re.Pattern]:
+    terms = [t.strip() for t in company_terms if t.strip()]
+    if not terms:
+        return None
+    terms.sort(key=len, reverse=True)
+    pat = r"\b(" + "|".join(re.escape(t) for t in terms[:2000]) + r")\b"
+    try:
+        return re.compile(pat, re.I)
+    except Exception:
+        return None
+
+
+# =========================================================
+# Quoted history and header stripping
+# =========================================================
+QUOTE_CUT_PATTERNS = [
+    r"(?im)^\s*from\s*:\s*.*$",
+    r"(?im)^\s*von\s*:\s*.*$",
+    r"(?im)^\s*sent\s*:\s*.*$",
+    r"(?im)^\s*gesendet\s*:\s*.*$",
+    r"(?im)^\s*to\s*:\s*.*$",
+    r"(?im)^\s*an\s*:\s*.*$",
+    r"(?im)^\s*cc\s*:\s*.*$",
+    r"(?im)^\s*betreff\s*:\s*.*$",
+    r"(?im)^\s*subject\s*:\s*.*$",
+    r"(?im)^-+\s*original message\s*-+\s*$",
+    r"(?im)^_{5,}\s*$",
+]
+
+HEADER_LINE_RE = re.compile(
+    r"(?im)^\s*(from|von|sent|gesendet|to|an|cc|betreff|subject|priorität|priority)\s*:\s*.*$"
+)
+
+
+def cut_quoted_history(text: str) -> str:
+    if not text:
+        return ""
+    t = text.replace("\r\n", "\n")
+    earliest = None
+    for pat in QUOTE_CUT_PATTERNS:
+        m = re.search(pat, t)
+        if m:
+            earliest = m.start() if earliest is None else min(earliest, m.start())
+    if earliest is not None and earliest > 0:
+        t = t[:earliest]
+    return t.strip()
+
+
+def drop_header_lines(text: str) -> str:
+    if not text:
+        return ""
+    lines = text.replace("\r\n", "\n").split("\n")
+    kept = []
+    for ln in lines:
+        if HEADER_LINE_RE.search(ln):
+            continue
+        if "<mailto:" in ln.lower() or "mailto:" in ln.lower():
+            continue
+        kept.append(ln)
+    return "\n".join(kept).strip()
+
+
+def extract_important_blocks(body: str) -> str:
+    """
+    Keeps main content before the quoted thread, removes mail headers, reduces signature noise.
+    """
+    if not body:
+        return ""
+
+    t = de_space_single_chars(body)
+    t = clean_ws_keep_newlines(t)
+
+    t = cut_quoted_history(t)
+    t = drop_header_lines(t)
+
+    # Reduce signature noise (keep signoff line, drop 1-3 following contact-ish lines)
+    lines = t.split("\n")
+    out_lines = []
+    drop_budget = 0
+    for ln in lines:
+        if SIGNOFF_LINE_RE.match(ln):
+            out_lines.append(clean_ws(ln))
+            drop_budget = 4
+            continue
+
+        if drop_budget > 0:
+            if EMAIL_RE.search(ln) or PHONE_RE.search(ln) or ADDRESS_RE.search(ln) or IBAN_RE.search(ln):
+                drop_budget -= 1
+                continue
+            if NAME_RE.search(ln) or NAME_COMMA_RE.search(ln) or TITLE_NAME_RE.search(ln):
+                drop_budget -= 1
+                continue
+            if "tel" in ln.lower() or "telefon" in ln.lower():
+                drop_budget -= 1
+                continue
+            drop_budget = 0
+
+        out_lines.append(ln)
+
+    t = "\n".join(out_lines)
+    return clean_ws_keep_newlines(t)
+
+
+# =========================================================
+# Redaction (delete-only)
+# =========================================================
+def redact_sensitive(text: str) -> str:
+    if not text:
+        return ""
+    t = de_space_single_chars(text)
+
+    # remove mailto fragments and html-ish brackets
+    t = re.sub(r"(?i)<mailto:[^>]+>", " ", t)
+    t = re.sub(r"(?i)mailto\s*:\s*\S+", " ", t)
+    t = re.sub(r"<[^>]+>", " ", t)
+
+    # delete patterns
+    t = EMAIL_RE.sub(" ", t)
+    t = URL_RE.sub(" ", t)
+    t = WWW_RE.sub(" ", t)
+    t = PHONE_RE.sub(" ", t)
+    t = ADDRESS_RE.sub(" ", t)
+    t = IBAN_RE.sub(" ", t)
+    t = ID_REF_RE.sub(" ", t)
+    t = MONEY_RE.sub(" ", t)
+    t = TITLE_NAME_RE.sub(" ", t)
+    t = NAME_COMMA_RE.sub(" ", t)
+    t = NAME_RE.sub(" ", t)
+
+    # greeting names: delete the name token only
+    t = re.sub(
+        r"(?im)^(\s*(?:hallo|hi|hello|guten\s+morgen|guten\s+tag|guten\s+abend)\s+)[A-ZÄÖÜ][a-zäöüß]{1,}(\s*[,\!])?\s*$",
+        r"\1\2",
+        t,
+    )
+
+    if COMPANY_RE is not None:
+        t = COMPANY_RE.sub(" ", t)
+
+    t = drop_header_lines(t)
+
+    # normalize
+    t = t.replace("\r\n", "\n")
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"\s+([,.;:])", r"\1", t)
+    t = re.sub(r"([,.;:]){2,}", r"\1", t)
+    return t.strip()
+
+
+# =========================================================
+# Highlight spans (for review)
+# =========================================================
+HIT_COLORS = {
+    "email": "#fff59d",
+    "url": "#ffe0b2",
+    "phone": "#c8e6c9",
+    "address": "#bbdefb",
+    "iban": "#d1c4e9",
+    "ref": "#f0f4c3",
+    "money": "#f8bbd0",
+    "company": "#dcedc8",
+    "title_name": "#ffccbc",
+    "greeting_name": "#ffccbc",
+    "name": "#f8bbd0",
+    "number": "#eeeeee",
+}
+
+
+def collect_hits(text: str) -> List[Tuple[int, int, str]]:
+    if not text:
+        return []
+    original = text
+    hits: List[Tuple[int, int, str]] = []
+
+    def mark(regex: re.Pattern, label: str):
+        for m in regex.finditer(original):
+            hits.append((m.start(), m.end(), label))
+
+    mark(EMAIL_RE, "email")
+    mark(URL_RE, "url")
+    mark(WWW_RE, "url")
+    mark(PHONE_RE, "phone")
+    mark(ADDRESS_RE, "address")
+    mark(IBAN_RE, "iban")
+    mark(MONEY_RE, "money")
+    mark(ID_REF_RE, "ref")
+
+    if COMPANY_RE is not None:
+        mark(COMPANY_RE, "company")
+
+    mark(TITLE_NAME_RE, "title_name")
+    mark(NAME_COMMA_RE, "name")
+    mark(NAME_RE, "name")
+
+    for m in GREETING_NAME_RE.finditer(original):
+        hits.append((m.start(2), m.end(2), "greeting_name"))
+
+    mark(NUMBER_RE, "number")
+
+    hits.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+
+    merged: List[Tuple[int, int, str]] = []
+    last_end = -1
+    for s, e, label in hits:
+        if s < last_end:
+            continue
+        merged.append((s, e, label))
+        last_end = e
+    return merged
+
+
+def highlight_to_html(text: str) -> str:
+    hits = collect_hits(text)
+    cur = 0
+    parts: List[str] = []
+    for s, e, label in hits:
+        parts.append(escape(text[cur:s]))
+        color = HIT_COLORS.get(label, "#ffffcc")
+        parts.append(f'<span style="background:{color};padding:0 2px;border-radius:3px;">{escape(text[s:e])}</span>')
+        cur = e
+    parts.append(escape(text[cur:]))
+    return "".join(parts).replace("\n", "<br>\n")
+
+
+def build_full_html(source_name: str, meta: Dict[str, str], original_text: str, redacted_text: str) -> str:
+    legend_order = [
+        ("Email", "email"),
+        ("URL", "url"),
+        ("Phone", "phone"),
+        ("Address", "address"),
+        ("IBAN", "iban"),
+        ("Reference", "ref"),
+        ("Money", "money"),
+        ("Company/Supplier", "company"),
+        ("Title+Name", "title_name"),
+        ("Greeting name", "greeting_name"),
+        ("Name (heuristic)", "name"),
+        ("Number", "number"),
+    ]
+    legend = '<div style="font-family:Segoe UI,Arial;font-size:13px;margin-bottom:10px;"><b>Legend:</b> '
+    for label, key in legend_order:
+        if key in HIT_COLORS:
+            legend += f'<span style="background:{HIT_COLORS[key]};padding:2px 6px;border-radius:3px;margin-left:6px;">{escape(label)}</span>'
+    legend += "</div>"
+
+    meta_html = "".join([f"<div><b>{escape(k)}:</b> {escape(v)}</div>" for k, v in meta.items() if v])
+
+    orig_html = highlight_to_html(original_text)
+    red_html = escape(redacted_text).replace("\n", "<br>\n")
+
+    return f"""<html>
+<head><meta charset="utf-8"><title>Sanitized & Highlighted</title></head>
+<body style="font-family:Segoe UI,Arial;font-size:13px;line-height:1.35;padding:16px;">
+<div style="margin-bottom:10px;">
+  <div><b>Source:</b> {escape(source_name)}</div>
+  <div><b>Generated:</b> {escape(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</div>
+</div>
+{legend}
+<div style="margin-bottom:12px;">{meta_html}</div>
+<hr>
+<div><b>ORIGINAL (highlighted for review):</b></div>
+<div style="margin-top:6px;">{orig_html}</div>
+<hr>
+<div><b>REDACTED (delete-only, safe text):</b></div>
+<div style="margin-top:6px;">{red_html}</div>
+</body>
+</html>"""
+
+
+# =========================================================
+# Q/A labeling heuristic (FIXED)
+# =========================================================
+REQUEST_CUES = re.compile(
+    r"(?i)\b(bitte|kann\s+jemand|kann\s+einer|could\s+you|can\s+you|please|prüfen|check|draufschauen|feedback|rückmeldung|anmerkungen)\b"
+)
+ANSWER_CUES = re.compile(
+    r"(?i)\b(danke|unten\s+meine|hier\s+meine|anbei|as\s+discussed|following|wir\s+plädieren|wir\s+würden|unsere\s+meinung|meine\s+anmerkungen)\b"
+)
+
+
+def label_qa(subject: str, body: str) -> str:
+    s = (subject or "").strip().lower()
+    b = (body or "").strip()
+
+    if s.startswith(("aw:", "re:", "fw:", "wg:", "sv:", "fwd:")):
+        return "answer"
+    if len(b) < 700 and REQUEST_CUES.search(b):
+        return "question"
+    if ANSWER_CUES.search(b):
+        return "answer"
+    return "question" if REQUEST_CUES.search(b) else "answer"
+
+
+# =========================================================
+# Attachment readers (graceful)
+# =========================================================
+def read_txt(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def read_pdf(p: Path) -> str:
+    if not HAS_PYPDF:
+        return ""
+    try:
+        out = []
+        r = PdfReader(str(p))
+        for pg in r.pages:
+            try:
+                out.append(pg.extract_text() or "")
+            except Exception:
+                pass
+        return "\n".join(out)
+    except Exception:
+        return ""
+
+
+def extract_docx_tables_as_text(doc) -> str:
+    out = []
+    for table in getattr(doc, "tables", []):
+        for row in table.rows:
+            cells = [clean_ws(c.text) for c in row.cells]
+            if any(cells):
+                out.append(" | ".join(cells))
+    return "\n".join(out)
+
+
+def read_docx(p: Path) -> str:
+    if not HAS_DOCX:
+        return ""
+    try:
+        doc = DocxDocument(str(p))
+        paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
+        tables = extract_docx_tables_as_text(doc)
+        return clean_ws_keep_newlines(paras + "\n" + tables)
+    except Exception:
+        return ""
+
+
+def read_xlsx(p: Path) -> str:
+    if not HAS_OPENPYXL:
+        return ""
+    try:
+        wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+        out = []
+        for ws in wb.worksheets:
+            out.append(f"Sheet: {ws.title}")
+            max_rows = min(ws.max_row or 0, 200)
+            max_cols = min(ws.max_column or 0, 30)
+            for r in range(1, max_rows + 1):
+                row_vals = []
+                for c in range(1, max_cols + 1):
+                    v = ws.cell(row=r, column=c).value
+                    row_vals.append("" if v is None else str(v))
+                if any(str(x).strip() for x in row_vals):
+                    out.append(" | ".join(clean_ws(str(x)) for x in row_vals))
+        return "\n".join(out)
+    except Exception:
+        return ""
+
+
+def ocr_image(p: Path) -> str:
+    if not ENABLE_OCR_IMAGES:
+        return ""
+    if not (HAS_PIL and HAS_TESS):
+        return ""
+    try:
+        img = Image.open(str(p))
+        txt = pytesseract.image_to_string(img, lang=OCR_LANG)
+        return txt or ""
+    except Exception:
+        return ""
+
+
+def extract_text_from_attachment(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext == ".txt":
+        return read_txt(p)
+    if ext in (".html", ".htm"):
+        return strip_html_tags(read_txt(p))
+    if ext == ".pdf":
+        return read_pdf(p)
+    if ext == ".docx":
+        return read_docx(p)
+    if ext == ".xlsx":
+        return read_xlsx(p)
+    if ext in (".png", ".jpg", ".jpeg"):
+        return ocr_image(p)
+    return ""
+
+
+# =========================================================
+# MSG parsing
+# =========================================================
+def parse_msg_file(p: Path) -> Dict[str, object]:
+    data = {
+        "subject": "",
+        "from": "",
+        "to": "",
+        "cc": "",
+        "date": "",
+        "body": "",
+        "attachments": [],  # List[Tuple[name, extracted_text]]
+    }
+
+    if not HAS_EXTRACT_MSG:
+        return data
+
+    try:
+        msg = extract_msg.Message(str(p))
+        msg.process()
+
+        data["subject"] = (getattr(msg, "subject", "") or "").strip()
+        data["from"] = (getattr(msg, "sender", "") or "").strip()
+        data["to"] = (getattr(msg, "to", "") or "").strip()
+        data["cc"] = (getattr(msg, "cc", "") or "").strip()
+        data["date"] = (getattr(msg, "date", "") or "").strip()
+
+        # body: prefer htmlBody
+        body = ""
+        try:
+            html_body = getattr(msg, "htmlBody", None)
+            if html_body:
+                body = strip_html_tags(html_body)
+        except Exception:
+            body = ""
+
+        if not body:
+            try:
+                body = getattr(msg, "body", "") or ""
+            except Exception:
+                body = ""
+
+        data["body"] = body
+
+        # attachments: let extract_msg save
+        attachments: List[Tuple[str, str]] = []
+        try:
+            msg_dir = TEMP_DIR / ("msg_" + hashlib.sha1(str(p).encode("utf-8")).hexdigest()[:10])
+            msg_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                msg.save(customPath=str(msg_dir))
+            except Exception:
+                pass
+
+            candidates = [x for x in msg_dir.rglob("*") if x.is_file()]
+
+            img_count = 0
+            for ap in candidates:
+                if ap.name.startswith("~$"):
+                    continue
+                ext = ap.suffix.lower()
+                if ext in (".png", ".jpg", ".jpeg"):
+                    img_count += 1
+                    if img_count > OCR_MAX_IMAGES_PER_MSG:
+                        continue
+
+                txt = extract_text_from_attachment(ap)
+                txt = clean_ws_keep_newlines(txt)
+                if txt:
+                    attachments.append((ap.name, txt))
+        except Exception:
+            attachments = []
+
+        data["attachments"] = attachments
+        return data
+
+    except Exception as e:
+        err(f"Failed parsing .msg: {p.name} -> {e}")
+        return data
+
+
+# =========================================================
+# HTML / EML parsing
+# =========================================================
+def parse_html_file(p: Path) -> Dict[str, object]:
+    raw = read_txt(p)
+    txt = strip_html_tags(raw)
+    return {"subject": p.stem, "from": "", "to": "", "cc": "", "date": "", "body": txt, "attachments": []}
+
+
+def parse_eml_file(p: Path) -> Dict[str, object]:
+    raw = read_txt(p)
+    parts = raw.split("\n\n", 1)
+    head = parts[0] if parts else ""
+    body = parts[1] if len(parts) > 1 else ""
+    subj = ""
+    frm = ""
+    to = ""
+    cc = ""
+    for ln in head.splitlines():
+        l = ln.strip()
+        if l.lower().startswith("subject:"):
+            subj = l.split(":", 1)[1].strip()
+        elif l.lower().startswith("from:"):
+            frm = l.split(":", 1)[1].strip()
+        elif l.lower().startswith("to:"):
+            to = l.split(":", 1)[1].strip()
+        elif l.lower().startswith("cc:"):
+            cc = l.split(":", 1)[1].strip()
+    return {"subject": subj or p.stem, "from": frm, "to": to, "cc": cc, "date": "", "body": body, "attachments": []}
+
+
+# =========================================================
+# Per-file processing
+# =========================================================
+def build_combined_text(body: str, attachments: List[Tuple[str, str]]) -> str:
+    body = body or ""
+    out = [body.strip()]
+    if attachments:
+        out.append("\n\n--- ATTACHMENTS (EXTRACTED TEXT) ---\n")
+        for name, txt in attachments:
+            out.append(f"\n[Attachment: {name}]\n{txt.strip()}\n")
+    return clean_ws_keep_newlines("\n".join(out))
+
+
+def process_one_file(p: Path, stats: Dict[str, int]) -> Optional[Path]:
+    stype = detect_source_type(p)
+    if stype == "msg":
+        parsed = parse_msg_file(p)
+    elif stype == "html":
+        parsed = parse_html_file(p)
+    elif stype == "eml":
+        parsed = parse_eml_file(p)
+    else:
+        return None
+
+    subject = str(parsed.get("subject", "") or "")
+    sender = str(parsed.get("from", "") or "")
+    to_ = str(parsed.get("to", "") or "")
+    cc_ = str(parsed.get("cc", "") or "")
+    date_ = str(parsed.get("date", "") or "")
+    body = str(parsed.get("body", "") or "")
+    attachments = parsed.get("attachments", []) or []
+
+    important_body = extract_important_blocks(body)
+    combined_original = build_combined_text(important_body, attachments)
+
+    qa_label = label_qa(subject, important_body)
+
+    redacted = redact_sensitive(combined_original)
+    if not redacted.strip():
+        redacted = clean_ws_keep_newlines(subject)
+
+    meta = {
+        "Label": qa_label,
+        "Subject": clean_ws(subject),
+        "From": clean_ws(sender),
+        "To": clean_ws(to_),
+        "CC": clean_ws(cc_),
+        "Date": clean_ws(date_),
+        "SourceType": stype,
+    }
+
+    html = build_full_html(p.name, meta, combined_original, redacted)
+    out_path = OUT_HTML_DIR / safe_output_name(p)
+    out_path.write_text(html, encoding="utf-8")
+
+    stats["files_processed"] += 1
+    stats["html_written"] += 1
+    return out_path
+
+
+# =========================================================
+# Company list
+# =========================================================
+def load_company_terms() -> List[str]:
+    if not COMPANY_LIST_TXT:
+        return []
+    p = Path(COMPANY_LIST_TXT)
+    if not p.exists():
+        return []
+    try:
+        lines = [ln.strip() for ln in p.read_text(encoding="utf-8", errors="ignore").splitlines()]
+        return [ln for ln in lines if ln and not ln.startswith("#")]
+    except Exception:
+        return []
+
+
+# =========================================================
+# Main
+# =========================================================
+def main():
+    t0 = time.time()
+    msg_base = Path(MSG_DIR)
+    if not msg_base.exists():
+        raise SystemExit(f"MSG_DIR not found: {MSG_DIR}")
+
+    # reset run log each run
+    RUN_LOG.write_text("", encoding="utf-8")
+    if ERROR_LOG.exists():
+        try:
+            ERROR_LOG.unlink()
+        except Exception:
+            pass
+
+    global COMPANY_TERMS, COMPANY_RE
+    COMPANY_TERMS = load_company_terms()
+    COMPANY_RE = build_company_re(COMPANY_TERMS)
+
+    log(f"Input: {msg_base}")
+    log(f"Output HTML: {OUT_HTML_DIR}")
+    log(f"extract_msg={HAS_EXTRACT_MSG}, pypdf={HAS_PYPDF}, docx={HAS_DOCX}, openpyxl={HAS_OPENPYXL}, PIL={HAS_PIL}, pytesseract={HAS_TESS}")
+
+    # gather files
+    all_files: List[Path] = []
+    for p in msg_base.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.name.startswith("~$"):
+            continue
+        ext = p.suffix.lower()
+        if ext in (".msg", ".html", ".htm", ".eml"):
+            all_files.append(p)
+
+    if not all_files:
+        raise SystemExit("No .msg/.html/.eml files found in MSG_DIR (recursive).")
+
+    stats = {
+        "files_found": len(all_files),
+        "files_processed": 0,
+        "html_written": 0,
+        "errors": 0,
+        "seconds": 0.0,
+    }
+
+    for p in sorted(all_files):
+        try:
+            process_one_file(p, stats)
+        except Exception as e:
+            stats["errors"] += 1
+            err(f"{p}: {e}")
+
+    stats["seconds"] = round(time.time() - t0, 2)
+    STATS_JSON.write_text(json.dumps(stats, indent=2), encoding="utf-8")
+
+    log(f"Done. Found={stats['files_found']} Processed={stats['files_processed']} HTML={stats['html_written']} Errors={stats['errors']} Time={stats['seconds']}s")
+    log(f"Stats: {STATS_JSON}")
+
+
+if __name__ == "__main__":
+    main()
