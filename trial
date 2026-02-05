@@ -1,188 +1,569 @@
-Source: AW_ CO2-Ziele _ techn_ Anforderung__c7b35f5c__9facae98.html
-Label: question
-Generated: 2026-02-05 11:29:38
-Legend: EmailURLPhoneAddressIBANReferenceMoneyCompanyNameNumber 
-Subject:Sanitized & [PERSON]
+# -*- coding: utf-8 -*-
+"""
+Sanitize & Highlight office email artifacts for safe training / KB use.
 
-Sanitized & [PERSON]
-Source:AW_ CO2-Ziele _ techn_ Anforderung__c7b35f5c.html
-Generated:[PHONE]:38:18
-Legend:Email/URL/Domain/Phone/Address/IBAN/ID/Reference/Money/Supplier/Company/Names/[PERSON]:Email
-URL/[PERSON]
-Address
-IBAN
-ID/[PERSON]
-Supplier/[PERSON] cue words
-Title+Name/Greeting name
-Name (heuristic)
-[PERSON]:AW_CO2-Ziele_techn_Anforderung__c7b35f5c.html
-Subject:[PERSON]---BODY---[PERSON]
-Legend:[PERSON]
-[PERSON]+[PERSON]
-Number
-FILE:AW_CO2-Ziele_techn_Anforderung.msg
-SUBJECT:AW:CO2-Ziele/techn.Anforderung
-MESSAGECLASS:IPM.Note---BODY---Hallo zusammen,
-danke für deine
-[PERSON].Unten meine Anmerkungen.Lasst uns gerne dazu nochmal sprechen.So wie der aktuelle Plan ist, gibt es aus unserer
-[PERSON]
-bei der Umsetzung.VG
-[PERSON]:Thum, Florian A.(
-019
+What this script does (single run):
+- Reads inputs from MSG_DIR (recursively):
+  - .msg (Outlook message files) via extract_msg (if available)
+  - .html/.htm (saved mail bodies / exports)
+  - optionally .eml (simple support)
+- Extracts the *useful* body text (cuts quoted threads + header blocks like Von:/From:/Gesendet:/Sent:)
+- Deletes (not replaces) sensitive info:
+  - names (Firstname Lastname + Lastname, Firstname), greeting names, title+name
+  - emails, URLs, phone numbers, addresses, IBAN
+  - money amounts, IDs/references
+  - company/supplier names (heuristic + cue words + optional curated list)
+- Produces ONE HTML output per source file (not 4 files):
+  OUT_DIR / sanitized_highlighted / <safe_name>.html
+  Each HTML shows highlighted sensitive hits so you can visually delete/verify.
+- Produces:
+  - OUT_DIR / run.log
+  - OUT_DIR / stats.json
+  - OUT_DIR / errors.log (only if errors happen)
+
+Design notes:
+- If a library is missing (extract_msg, openpyxl, pypdf, pillow/pytesseract), that feature is skipped; script continues.
+- PNG/JPG OCR is attempted ONLY if Pillow + pytesseract are available AND Tesseract is installed.
+- Attachments inside .msg:
+  - extract_msg can extract attachments to disk; we parse supported types:
+    .pdf .xlsx .docx .txt .html .png .jpg .jpeg
+  - If an attachment parser is missing, we skip that attachment gracefully.
+
+IMPORTANT:
+- This script is for offline sanitization. It does NOT call Azure/OpenAI.
+"""
+
+import os
+import re
+import json
+import time
+import hashlib
+import tempfile
+from pathlib import Path
+from datetime import datetime
+from html import escape
+from typing import Dict, List, Tuple, Optional
+
+# =========================
+# EDIT THESE
+# =========================
+MSG_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus"
+OUT_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports"
+
+# Optional: if you have a curated supplier/company list, put it here (one per line).
+# If empty or file missing, it is ignored.
+COMPANY_LIST_TXT = r""  # e.g. r"C:\path\to\company_list.txt"
+
+# OCR settings
+ENABLE_OCR_IMAGES = True
+OCR_LANG = "deu+eng"   # tesseract language packs installed?
+OCR_MAX_IMAGES_PER_MSG = 6
+# =========================
+
+
+# =========================================================
+# Output folders
+# =========================================================
+OUT_DIR = Path(OUT_DIR)
+OUT_HTML_DIR = OUT_DIR / "sanitized_highlighted"
+OUT_HTML_DIR.mkdir(parents=True, exist_ok=True)
+
+RUN_LOG = OUT_DIR / "run.log"
+ERROR_LOG = OUT_DIR / "errors.log"
+STATS_JSON = OUT_DIR / "stats.json"
+
+TEMP_DIR = Path(tempfile.gettempdir()) / "mail_sanitize_tmp"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# =========================================================
+# Logging
+# =========================================================
+def log(msg: str):
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line)
+    RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with RUN_LOG.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def err(msg: str):
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ERROR: {msg}"
+    print(line)
+    with ERROR_LOG.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+# =========================================================
+# Optional libraries (graceful)
+# =========================================================
+HAS_EXTRACT_MSG = False
+HAS_PYPDF = False
+HAS_DOCX = False
+HAS_OPENPYXL = False
+HAS_PIL = False
+HAS_TESS = False
+
+try:
+    import extract_msg  # type: ignore
+    HAS_EXTRACT_MSG = True
+except Exception:
+    HAS_EXTRACT_MSG = False
+
+try:
+    from pypdf import PdfReader  # type: ignore
+    HAS_PYPDF = True
+except Exception:
+    HAS_PYPDF = False
+
+try:
+    from docx import Document as DocxDocument  # type: ignore
+    HAS_DOCX = True
+except Exception:
+    HAS_DOCX = False
+
+try:
+    import openpyxl  # type: ignore
+    HAS_OPENPYXL = True
+except Exception:
+    HAS_OPENPYXL = False
+
+try:
+    from PIL import Image  # type: ignore
+    HAS_PIL = True
+except Exception:
+    HAS_PIL = False
+
+try:
+    import pytesseract  # type: ignore
+    HAS_TESS = True
+except Exception:
+    HAS_TESS = False
+
+
+# =========================================================
+# Helpers
+# =========================================================
+def clean_ws(s: str) -> str:
+    return re.sub(r"[ \t]+", " ", (s or "")).strip()
+
+
+def clean_ws_keep_newlines(s: str) -> str:
+    s = (s or "").replace("\r\n", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def safe_output_name(src: Path) -> str:
+    raw = src.stem
+    cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    h = hashlib.sha1(str(src).encode("utf-8", errors="ignore")).hexdigest()[:8]
+    cleaned = cleaned[:80] if len(cleaned) > 80 else cleaned
+    if not cleaned:
+        cleaned = "file"
+    return f"{cleaned}__{h}.html"
+
+
+def detect_source_type(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext == ".msg":
+        return "msg"
+    if ext in (".html", ".htm"):
+        return "html"
+    if ext == ".eml":
+        return "eml"
+    return ext.lstrip(".")
+
+
+def de_space_single_chars(text: str) -> str:
+    """
+    Fix artifacts like: '< h t m l  x m l n s : v = "...">'
+    We merge sequences of single characters separated by spaces,
+    but only when the sequence is long enough to be obviously broken text.
+    """
+    if not text:
+        return ""
+    # Merge sequences like "h t m l" -> "html"
+    def repl(m):
+        chunk = m.group(0)
+        merged = chunk.replace(" ", "")
+        return merged
+
+    # 4+ single-char tokens in a row
+    return re.sub(r"(?:\b\w\b\s+){3,}\b\w\b", repl, text)
+
+
+def strip_html_tags(html: str) -> str:
+    html = html or ""
+    html = html.replace("\r\n", "\n")
+    # remove scripts/styles
+    html = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    # convert <br>, <p>, <div>, <li> to newlines
+    html = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", html)
+    html = re.sub(r"(?i)</\s*p\s*>", "\n\n", html)
+    html = re.sub(r"(?i)</\s*div\s*>", "\n", html)
+    html = re.sub(r"(?i)</\s*li\s*>", "\n", html)
+    # remove the rest tags
+    txt = re.sub(r"(?s)<[^>]+>", " ", html)
+    # decode common entities minimally
+    txt = txt.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    return clean_ws_keep_newlines(txt)
+
+
+# =========================================================
+# Patterns for sensitive detection + deletion
+# =========================================================
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
+WWW_RE = re.compile(r"\bwww\.[^\s<>()]+\b", re.I)
+
+# Domains (only used for highlighting, we delete full URLs anyway)
+DOMAIN_RE = re.compile(r"\b(?:[A-Z0-9-]+\.)+(?:[A-Z]{2,})\b", re.I)
+
+PHONE_RE = re.compile(
+    r"(?<!\w)(?:\+?\d{1,3}[\s\-\/]?)?(?:\(?\d{2,5}\)?[\s\-\/]?)?\d{3,4}[\s\-\/]?\d{3,4}(?!\w)"
 )
-Gesendet:Mittwoch,
-8.Mai
-2024
-16:05
-An:Troester, Rasmus (
-050
-) ; Kehrberger, Ralf (
-019
-) ; Roth, Carmen C.(
-010
-) ; Troatz, Johannes (
-059
-) ; Helff, Andreas (
-059
+
+ADDRESS_RE = re.compile(
+    r"\b([A-ZÄÖÜ][a-zäöüß]+(?:\s[A-ZÄÖÜ][a-zäöüß]+){0,3})\s"
+    r"(Straße|Strasse|Str\.|Weg|Allee|Platz|Ring|Gasse|Damm|Ufer)\s"
+    r"\d{1,5}[a-zA-Z]?\b"
 )
-Cc:Euba, Birgit (
-050
-) ;
-[PERSON]
-,
-[PERSON]
-(
-050
-) ; Dietrich, Dario (
-050
-) ; Klein, Daniel (
-050
-) ; Lauinger, Marvin (
-050
-) ; Gevers, Bianca (
-019
+
+IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b", re.I)
+
+MONEY_RE = re.compile(
+    r"(?i)\b(?:EUR|USD|GBP|CHF)\s*\d[\d\.\,\s]*\b|\b\d[\d\.\,\s]*\s*(?:€|EUR|USD|GBP|CHF)\b|\b€\s*\d[\d\.\,\s]*\b"
 )
-Betreff:AW:CO2-Ziele/techn.[PERSON] [PERSON],
-danke für die Rückmeldung und eure Einschätzung, Rasmus!
-[PERSON]
-zur Verlagerung der Nachhaltigkeits-Ziele in die „
-[PERSON]
-VAN“ (bei Cars LHV genannt) passt ja zunächst gut zu eurem Vorhaben, die Ziele aus den Nachhaltigkeitsprämissen in die (allgemeinen) technischen Anforderungen zu verschieben.Da es bei Vergabeumfängen ohne technische Komponentenlastenhefte zu Informationslücken kommen kann, muss der Prozess hier natürlich sauber abgestimmt sein.[PERSON]
-auf die
-[PERSON]
-kann hier unserer Meinung nach eine Lösung darstellen-auch für Vergaben ohne technisches Komponentenlastenheft.Wir haben uns dazu mit unserem Lastenheftmanagement unterhalten und folgende Informationen dazu erhalten:* Mit dem Verweis in den Nachhaltigkeitsprämissen auf die
-[PERSON]
-(oder einzelne Kapitel dieser) werden diese Bestandteil der Vergabeunterlagen--> der Verweis in den Nachhaltigkeitsprämissen verweist nur auf übergreifende Anforderungen, die es auch gibt.(
-[PERSON]
-gibt es z.B.kein LHV).Unterlagen werden erst dann wirksam, wenn sie dem Liefervertrag angehängt werden.Ein reines Anhängen an die Anfrageunterlagen macht es nicht wirksam
-* Auch auf
-[PERSON]
-können Verweise auf
-[PERSON]
-vorgenommen werden
-* In den technischen Zeichnungen wurde meines Wissens noch nichts angepasst.Dies sollte aus unserer Sicht zentral gesteuert werden.*
-[PERSON]
-Anforderungen (VAN) können dem FEK vom BRM in den Anfrageunterlagen bereitgestellt werden, können vom
-Lieferanten
-aber auch über den DocMaster abgerufen werden
-* Richtig.Dies hat aber keine Vertragswirksamkeit.[PERSON]
-, die an den Liefervertrag gehängt werden, sind vertragswirksam.[PERSON]
-ist analog Prämissenblatt (ist auch kein Dokument, das an den Liefervertrag gehängt wird).Beim LHV kommt dazu, dass Inhalte aufgeführt sind, die ggf.nicht zu dem Umfang passen.[PERSON]
-haben wir zumindest das auf dem Schirm.Es gibt momentan sprachlich einige Kopplungen der
-[PERSON]
-an die technischen Komponentenlastenhefte.Diese können entweder in den Verweisen oder einem Update der Unterlagen ggf.angepasst werden.Wir würden uns gerne an einem Austausch für einen einheitlichen Prozess beteiligen.Prinzipiell würden wir ein „Ein-Quellen-Prinzip“ der Zielwerte in den technischen Anforderungen bevorzugen.Daher würden wir die Zielwerte aus den Nachhaltigkeitsprämissen entfernen und nur auf die
-[PERSON]
-verweisen wollen.[PERSON]
-,
-[PERSON] freundlichen Grüßen/Best regards
-Dr.[PERSON]
-[PERSON] VANs-VAN/EFP______________________________________________________________Mercedes [COMPANY] AG
-Plant
-019
-–A[PHONE]
-Stuttgart-Untertürkheim, [PERSON]:[EMAIL]
-<mailto:[EMAIL]
->
-Telefon:[PHONE]
-Von:Troester, Rasmus (
-050
-) <
-[EMAIL]
-<mailto:[EMAIL]
-> >
-Gesendet:Mittwoch,
-8.Mai
-2024
-13:03
-An:Thum, Florian A.(
-019
-) <
-[EMAIL]
-<mailto:[EMAIL]
-> >; Kehrberger, Ralf (
-019
-) <
-[EMAIL]
-<mailto:[EMAIL]
-> >; Roth, Carmen C.(
-010
-) <
-[EMAIL]
-<mailto:[EMAIL]
-> >; Troatz, Johannes (
-059
-) <
-[EMAIL]
-<mailto:[EMAIL]
-> >; Helff, Andreas (
-059
-) <
-[EMAIL]
-<mailto:[EMAIL]
-> >
-Cc:Euba, Birgit (
-050
-) <
-[EMAIL]
-<mailto:[EMAIL]
-> >;
-[PERSON]
-,
-[PERSON]
-(
-050
-) <
-[EMAIL]
-<mailto:[EMAIL]
-> >; Dietrich, Dario (
-050
-) <
-[EMAIL]
-<mailto:[EMAIL]
-> >; Klein, Daniel (
-050
-) <
-[EMAIL]
-<mailto:[EMAIL]
-> >; Lauinger, Marvin (
-050
-) <
-[EMAIL]
-<mailto:[EMAIL]
-> >
-Betreff:CO2-Ziele/techn.[PERSON] [PERSON],
-wir haben von euch (@Thum, Florian A.(
-019
-) <mailto:[EMAIL]
-> ) erfahren, dass ihr für die VAN-Vergaben plant, die LHVs inkl.CO2-Ziele im ProSource bei den Bauteilen einzufügen, die keine LHVs haben (z.B.Rohbau).Aus unserer Sicht ist das nicht zielführend, da die LHVs erst wirksam werden, wenn sie an den Liefervertrag angehängt werden.Das würde in diesem Fall nicht passieren, da dann z.B.beim Rohbau die technische Zeichnung statt des LHVs angehängt würde – damit wären die CO2-Ziele nicht wirksam.Wir plädieren dafür, dass ein einheitlicher Prozess entwickelt wird, der sicherstellt, dass die Anforderungen in allen relevanten Produktanforderungen (sei es LHV, technische Zeichnung, etc.) integriert sind.Wir hatten dazu schon in der letzten MP/RSE-Runde unsere Vorstellung/Erwartung dargestellt.[PERSON]
-passt auch gut zu dem Vorgang, dass wir die CO2-Ziele mittel-bis langfristig aus den Prämissenblättern entfernen wollen (bessere Absicherung durch technische Anforderungen vs.Prämissenblätter).[PERSON]
-[PERSON] freundlichen Grüßen/Kind regards
-Dr.[PERSON]
-[PERSON] [PERSON]-[PERSON]
-and
-[PERSON]
-MP/RM1
-Schickardstr.[PHONE]
-[PERSON]:[PHONE]
-mail to:[EMAIL]
-<mailto:[EMAIL]
+
+# References: requires at least one digit
+ID_REF_RE = re.compile(
+    r"\b(?:PO|PR|NCR|Ticket|Case|Req|Request|Material|Part|SP|Projekt|Project|ID|Ref|V\d{2,}|SP\d+)\s*[:#]?\s*[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b",
+    re.I,
+)
+
+# Names (heuristics)
+NAME_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b")
+NAME_COMMA_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{2,},\s*[A-ZÄÖÜ][a-zäöüß]{2,}\b")
+
+TITLE_NAME_RE = re.compile(
+    r"\b(?:Mr|Mrs|Ms|Miss|Dr|Prof|Herr|Frau)\.?\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b"
+)
+
+# Greeting name patterns like "Hallo Timur," "Hi John," "Guten Morgen Max"
+GREETING_NAME_RE = re.compile(
+    r"(?im)^\s*(hallo|hi|hello|guten\s+morgen|guten\s+tag|guten\s+abend|sehr\s+geehrte[rn]?)\s+"
+    r"([A-ZÄÖÜ][a-zäöüß]{1,})(?:\s*[,\!])?\s*$"
+)
+
+# Signoff blocks: "VG", "LG", "BR", "Best regards", etc. (we keep the signoff tokens but delete names that follow)
+SIGNOFF_LINE_RE = re.compile(r"(?im)^\s*(vg|lg|br|mfg|mit\s+freundlichen\s+grüßen|best\s+regards|kind\s+regards|with\s+best\s+regards)\b.*$")
+
+# Company / supplier heuristic cues
+SUPPLIER_CUE_RE = re.compile(r"(?i)\b(lieferant|supplier|firma|company|gmbh|ag|kg|ltd|inc|s\.?a\.?|sarl|bv|oy|sp\.?z\.?o\.?o\.?)\b")
+
+# Optional curated list (loaded at runtime)
+COMPANY_TERMS: List[str] = []
+
+
+def build_company_re(company_terms: List[str]) -> Optional[re.Pattern]:
+    terms = [t.strip() for t in company_terms if t.strip()]
+    if not terms:
+        return None
+    # Longest first to reduce partials
+    terms.sort(key=len, reverse=True)
+    pat = r"\b(" + "|".join(re.escape(t) for t in terms[:2000]) + r")\b"
+    try:
+        return re.compile(pat, re.I)
+    except Exception:
+        return None
+
+
+COMPANY_RE: Optional[re.Pattern] = None
+
+
+# Header/quoted cutting (robust)
+QUOTE_CUT_PATTERNS = [
+    r"(?im)^\s*from\s*:\s*.*$",
+    r"(?im)^\s*von\s*:\s*.*$",
+    r"(?im)^\s*sent\s*:\s*.*$",
+    r"(?im)^\s*gesendet\s*:\s*.*$",
+    r"(?im)^\s*to\s*:\s*.*$",
+    r"(?im)^\s*an\s*:\s*.*$",
+    r"(?im)^\s*cc\s*:\s*.*$",
+    r"(?im)^\s*betreff\s*:\s*.*$",
+    r"(?im)^\s*subject\s*:\s*.*$",
+    r"(?im)^-+\s*original message\s*-+\s*$",
+    r"(?im)^_{5,}\s*$",
+]
+
+HEADER_LINE_RE = re.compile(
+    r"(?im)^\s*(from|von|sent|gesendet|to|an|cc|betreff|subject|priorität|priority)\s*:\s*.*$"
+)
+
+
+def cut_quoted_history(text: str) -> str:
+    if not text:
+        return ""
+    t = text.replace("\r\n", "\n")
+    earliest = None
+    for pat in QUOTE_CUT_PATTERNS:
+        m = re.search(pat, t)
+        if m:
+            if earliest is None or m.start() < earliest:
+                earliest = m.start()
+    if earliest is not None and earliest > 0:
+        t = t[:earliest]
+    return t.strip()
+
+
+def drop_header_lines(text: str) -> str:
+    if not text:
+        return ""
+    lines = text.replace("\r\n", "\n").split("\n")
+    kept = []
+    for ln in lines:
+        if HEADER_LINE_RE.search(ln):
+            continue
+        if "<mailto:" in ln.lower() or "mailto:" in ln.lower():
+            continue
+        if ln.count(";") >= 2 and len(ln) > 60:
+            continue
+        kept.append(ln)
+    return "\n".join(kept).strip()
+
+
+def extract_important_blocks(body: str) -> str:
+    """
+    Keep what is typically useful for work/training:
+    - main text before quoted history
+    - remove header blocks (Von/An/Cc etc)
+    - keep paragraphs
+    """
+    if not body:
+        return ""
+
+    t = de_space_single_chars(body)
+    t = clean_ws_keep_newlines(t)
+
+    # cut quoted history first
+    t = cut_quoted_history(t)
+    # remove header lines anywhere
+    t = drop_header_lines(t)
+
+    # Remove dense signature chunks (common pattern: many contact lines)
+    lines = t.split("\n")
+    out_lines = []
+    sig_hits = 0
+    for ln in lines:
+        # if signoff line, keep it but do not keep subsequent name-heavy lines
+        if SIGNOFF_LINE_RE.match(ln):
+            out_lines.append(clean_ws(ln))
+            sig_hits = 3  # start dropping a few following lines if they look like contact details
+            continue
+
+        if sig_hits > 0:
+            # drop if it looks like contact details (phone/email/address/department/plant codes)
+            if EMAIL_RE.search(ln) or PHONE_RE.search(ln) or ADDRESS_RE.search(ln) or IBAN_RE.search(ln) or "tel" in ln.lower() or "telefon" in ln.lower():
+                sig_hits -= 1
+                continue
+            # also drop if it's basically a name line
+            if NAME_RE.search(ln) or NAME_COMMA_RE.search(ln) or TITLE_NAME_RE.search(ln):
+                sig_hits -= 1
+                continue
+            # stop dropping if normal sentence resumes
+            sig_hits = 0
+
+        out_lines.append(ln)
+
+    t = "\n".join(out_lines)
+    t = clean_ws_keep_newlines(t)
+    return t
+
+
+# =========================================================
+# Redaction (DELETE ONLY)
+# =========================================================
+def redact_sensitive(text: str) -> str:
+    if not text:
+        return ""
+    t = de_space_single_chars(text)
+
+    # remove mailto fragments + angle bracket blobs early
+    t = re.sub(r"(?i)<mailto:[^>]+>", " ", t)
+    t = re.sub(r"(?i)mailto\s*:\s*\S+", " ", t)
+    t = re.sub(r"<[^>]+>", " ", t)
+
+    # delete sensitive patterns
+    t = EMAIL_RE.sub(" ", t)
+    t = URL_RE.sub(" ", t)
+    t = WWW_RE.sub(" ", t)
+    t = PHONE_RE.sub(" ", t)
+    t = ADDRESS_RE.sub(" ", t)
+    t = IBAN_RE.sub(" ", t)
+    t = ID_REF_RE.sub(" ", t)
+    t = MONEY_RE.sub(" ", t)
+    t = TITLE_NAME_RE.sub(" ", t)
+    t = NAME_COMMA_RE.sub(" ", t)
+    t = NAME_RE.sub(" ", t)
+
+    # delete greeting names (just the name part)
+    t = re.sub(r"(?im)^(\s*(?:hallo|hi|hello|guten\s+morgen|guten\s+tag|guten\s+abend)\s+)[A-ZÄÖÜ][a-zäöüß]{1,}(\s*[,\!])?\s*$", r"\1\2", t)
+
+    # delete company terms from curated list
+    if COMPANY_RE is not None:
+        t = COMPANY_RE.sub(" ", t)
+
+    # drop header lines again
+    t = drop_header_lines(t)
+
+    # normalize whitespace/punct
+    t = t.replace("\r\n", "\n")
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"\s+([,.;:])", r"\1", t)
+    t = re.sub(r"([,.;:]){2,}", r"\1", t)
+    return t.strip()
+
+
+# =========================================================
+# Highlighting spans (for visual review)
+# =========================================================
+HIT_COLORS = {
+    "email": "#fff59d",
+    "url": "#ffe0b2",
+    "domain": "#ffe0b2",
+    "phone": "#c8e6c9",
+    "address": "#bbdefb",
+    "iban": "#d1c4e9",
+    "ref": "#f0f4c3",
+    "money": "#f8bbd0",
+    "title_name": "#ffccbc",
+    "greeting_name": "#ffccbc",
+    "name": "#f8bbd0",
+    "name_comma": "#f8bbd0",
+    "company": "#dcedc8",
+    "number": "#eeeeee",
+}
+
+NUMBER_RE = re.compile(r"\b\d+(?:[.,]\d+)?\b")
+
+
+def collect_hits(text: str) -> List[Tuple[int, int, str]]:
+    """
+    Return non-overlapping spans to highlight.
+    This is for the ORIGINAL (pre-redaction) extracted text.
+    """
+    if not text:
+        return []
+    original = text
+    hits: List[Tuple[int, int, str]] = []
+
+    def mark(regex: re.Pattern, label: str):
+        for m in regex.finditer(original):
+            hits.append((m.start(), m.end(), label))
+
+    # Specific first
+    mark(EMAIL_RE, "email")
+    mark(URL_RE, "url")
+    mark(WWW_RE, "url")
+    mark(PHONE_RE, "phone")
+    mark(ADDRESS_RE, "address")
+    mark(IBAN_RE, "iban")
+    mark(MONEY_RE, "money")
+    mark(ID_REF_RE, "ref")
+
+    if COMPANY_RE is not None:
+        mark(COMPANY_RE, "company")
+
+    mark(TITLE_NAME_RE, "title_name")
+    mark(NAME_COMMA_RE, "name_comma")
+    mark(NAME_RE, "name")
+
+    # Greeting name: highlight the name token only
+    for m in GREETING_NAME_RE.finditer(original):
+        name_part = m.group(2)
+        # find span of that name within match
+        s = m.start(2)
+        e = m.end(2)
+        hits.append((s, e, "greeting_name"))
+
+    mark(NUMBER_RE, "number")
+
+    # sort, keep non-overlapping preferring longer
+    hits.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+
+    merged: List[Tuple[int, int, str]] = []
+    last_end = -1
+    for s, e, label in hits:
+        if s < last_end:
+            continue
+        merged.append((s, e, label))
+        last_end = e
+    return merged
+
+
+def to_highlight_html(title: str, source_name: str, meta: Dict[str, str], body_text: str) -> str:
+    hits = collect_hits(body_text)
+    original = body_text
+
+    parts: List[str] = []
+    cur = 0
+    for s, e, label in hits:
+        parts.append(escape(original[cur:s]))
+        color = HIT_COLORS.get(label, "#ffffcc")
+        parts.append(
+            f'<span style="background:{color}; padding:0 2px; border-radius:3px;">{escape(original[s:e])}</span>'
+        )
+        cur = e
+    parts.append(escape(original[cur:]))
+
+    body_html = "".join(parts).replace("\n", "<br>\n")
+
+    legend_order = [
+        ("Email", "email"),
+        ("URL", "url"),
+        ("Phone", "phone"),
+        ("Address", "address"),
+        ("IBAN", "iban"),
+        ("Reference", "ref"),
+        ("Money", "money"),
+        ("Company/Supplier", "company"),
+        ("Title+Name", "title_name"),
+        ("Greeting name", "greeting_name"),
+        ("Name (heuristic)", "name"),
+        ("Number", "number"),
+    ]
+    legend = '<div style="font-family:Segoe UI,Arial; font-size:13px; margin-bottom:10px;"><b>Legend:</b> '
+    for label, key in legend_order:
+        if key not in HIT_COLORS:
+            continue
+        legend += f'<span style="background:{HIT_COLORS[key]};padding:2px 6px;border-radius:3px;margin-left:6px;">{escape(label)}</span>'
+    legend += "</div>"
+
+    meta_lines = []
+    for k, v in meta.items():
+        meta_lines.append(f"<div><b>{escape(k)}:</b> {escape(v)}</div>")
+
+    return f"""<html>
+<head><meta charset="utf-8"><title>Sanitized & Highlighted</title></head>
+<body style="font-family:Segoe UI,Arial; font-size:13px; line-height:1.35; padding:16px;">
+<div style="margin-bottom:10px;">
+  <div><b>Source:</b> {escape(source_name)}</div>
+  <div><b>Generated:</b> {escape(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</div>
+</div>
+{legend}
+<div style="margin-bottom:12px;">{''.join(meta_lines)}</div>
+<hr>
+<div>{body_html}</div>
+</body>
+</html>"""
+
+
+# =========================================================
+# Q/A labeling heuristic
+# =========================================================
+REQUEST_CUES = re.compile(r"(?i)\b(bit(t)?e|kann\s+jemand|kann\s+einer|could\s+you|can\s+you|please|prüfen|check|draufschauen|feedback|rückmeldung|anmerkungen)\b")
+ANSWER_CUES = re.compile(r"(?
