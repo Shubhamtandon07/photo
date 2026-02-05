@@ -1,488 +1,124 @@
-# -*- coding: utf-8 -*-
-"""
-MSG -> ONE HTML output per .msg (highlighted sensitive info)
-
-Outputs per msg:
-- <msg_folder>/message_redact_me.html   (ONLY ONE HTML FILE)
-- <msg_folder>/attachments/            (saved attachments)
-
-The HTML highlights:
-- emails, urls, domains
-- phones
-- addresses (basic DE pattern)
-- IDs/refs
-- money
-- names (heuristics incl. greeting/signoff)
-- numbers
-- company/supplier names (heuristics)
-
-Note: Highlights are applied to a *plain-text rendering* of the email body to avoid breaking HTML markup.
-"""
-
-import re
-import os
-import hashlib
-from pathlib import Path
-from html import escape
-from typing import List, Tuple
-
-import win32com.client as win32
-
-# Optional dependencies for attachment extraction
-try:
-    from pypdf import PdfReader
-except Exception:
-    PdfReader = None
-
-try:
-    import openpyxl
-except Exception:
-    openpyxl = None
-
-try:
-    from docx import Document as DocxDocument
-except Exception:
-    DocxDocument = None
-
-# =========================================================
-# EDIT THESE PATHS
-# =========================================================
-MSG_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus"
-OUT_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports"
-
-# If you have legacy .doc attachments and MS Word installed, enable:
-ENABLE_WORD_COM_FOR_DOC = False
-
-# =========================================================
-# HIGHLIGHT CONFIG
-# =========================================================
-HIGHLIGHT_NAMES = True
-HIGHLIGHT_TITLES = True
-HIGHLIGHT_COMPANIES = True
-HIGHLIGHT_IDS = True
-HIGHLIGHT_MONEY = True
-HIGHLIGHT_DOMAINS = True
-HIGHLIGHT_IBAN = True
-
-# ---------------------------------------------------------
-# Regex patterns (sensitive info)
-# ---------------------------------------------------------
-EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
-URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
-WWW_RE = re.compile(r"\bwww\.[^\s<>()]+\b", re.I)
-DOMAIN_RE = re.compile(
-    r"\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,24})\b",
-    re.I
-)
-
-PHONE_RE = re.compile(
-    r"(?<!\w)(?:\+?\d{1,3}[\s\-\/]?)?(?:\(?\d{2,5}\)?[\s\-\/]?)?\d[\d\s\-\/]{6,}\d(?!\w)"
-)
-
-ADDRESS_RE = re.compile(
-    r"\b([A-ZÄÖÜ][a-zäöüß]+(?:\s[A-ZÄÖÜ][a-zäöüß]+){0,3})\s"
-    r"(Straße|Strasse|Str\.|Weg|Allee|Platz|Ring|Gasse|Damm|Ufer)\s"
-    r"\d{1,5}[a-zA-Z]?\b"
-)
-
-ID_RE = re.compile(
-    r"\b(?:PO|PR|NCR|Ticket|Case|Req|Request|Material|Part|Supplier|Portal|Round|ID|Ref|Reference|Order)\s*[:#]?\s*"
-    r"[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b",
-    re.I
-)
-
-MONEY_RE = re.compile(
-    r"(?i)\b(?:EUR|USD|GBP|CHF)\s*\d[\d\.\,\s]*\b|\b\d[\d\.\,\s]*\s*(?:€|EUR|USD|GBP|CHF)\b|\b€\s*\d[\d\.\,\s]*\b"
-)
-
-IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[ ]?(?:[A-Z0-9][ ]?){11,30}\b", re.I)
-
-# Name heuristics
-NAME_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{1,}\s+[A-ZÄÖÜ][a-zäöüß]{1,}(?:\s+[A-ZÄÖÜ][a-zäöüß]{1,})?\b")
-TITLE_NAME_RE = re.compile(
-    r"\b(?:Mr|Mrs|Ms|Miss|Dr|Prof|Herr|Frau)\.?\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b"
-)
-GREETING_NAME_RE = re.compile(
-    r"(?im)^(?:hello|hi|hallo|dear|guten\s+tag|good\s+morning|good\s+afternoon)\s+([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2})\s*[,\!]\s*$"
-)
-SIGNOFF_NAME_RE = re.compile(
-    r"(?is)\b(?:best\s+regards|kind\s+regards|regards|mit\s+freundlichen\s+gr[üu]ßen|freundliche\s+gr[üu]ße)\b[\s,:-]*\n\s*([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2})\b"
-)
-
-# Company / supplier heuristic
-COMPANY_RE = re.compile(
-    r"\b(?:[A-ZÄÖÜ][A-Za-zÄÖÜäöüß&\.\-]+(?:\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß&\.\-]+){0,6})\s+"
-    r"(?:GmbH|AG|SE|KG|UG|Ltd|Limited|Inc|LLC|S\.A\.|S\.p\.A\.|BV|NV|Oy|AB|Co\.|Company)\b"
-)
-SUPPLIER_LINE_RE = re.compile(
-    r"(?im)^(?:supplier|lieferant|supplier\s+name|lieferantenname)\s*[:\-]\s*(.+?)\s*$"
-)
-
-NUMBER_RE = re.compile(r"\b\d+(?:[.,]\d+)?\b")
-
-
-# =========================================================
-# Utilities
-# =========================================================
-def clean_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
-
-def safe_folder_name(stem: str) -> str:
-    raw = stem or "file"
-    cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", raw)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    h = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:8]
-    cleaned = cleaned[:80] if len(cleaned) > 80 else cleaned
-    return f"{cleaned}__{h}"
-
-def ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-def html_page(title: str, body_html: str) -> str:
-    return f"""<html>
-<head>
-<meta charset="utf-8">
-<title>{escape(title)}</title>
-</head>
-<body style="font-family:Segoe UI,Arial; font-size:13px; line-height:1.35; padding:16px;">
-{body_html}
-</body>
-</html>"""
-
-def strip_html_to_text(html: str) -> str:
-    txt = re.sub(r"<br\s*/?>", "\n", html or "", flags=re.I)
-    txt = re.sub(r"</p\s*>", "\n\n", txt, flags=re.I)
-    txt = re.sub(r"<[^>]+>", " ", txt, flags=re.S)
-    return (txt or "").replace("\r\n", "\n")
-
-def dt_str(dt) -> str:
-    try:
-        return dt.strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return ""
-
-
-# =========================================================
-# Highlight engine (returns HTML with colored spans)
-# =========================================================
-def apply_highlights(text: str) -> str:
-    original = text or ""
-    hits: List[Tuple[int, int, str]] = []
-
-    def mark(regex, label):
-        for m in regex.finditer(original):
-            hits.append((m.start(), m.end(), label))
-
-    # Specific first
-    mark(EMAIL_RE, "email")
-    mark(URL_RE, "url")
-    mark(WWW_RE, "url")
-    if HIGHLIGHT_DOMAINS:
-        mark(DOMAIN_RE, "domain")
-
-    mark(PHONE_RE, "phone")
-    mark(ADDRESS_RE, "address")
-
-    if HIGHLIGHT_IBAN:
-        mark(IBAN_RE, "iban")
-
-    if HIGHLIGHT_IDS:
-        mark(ID_RE, "id")
-
-    if HIGHLIGHT_MONEY:
-        mark(MONEY_RE, "money")
-
-    # Supplier line value
-    if HIGHLIGHT_COMPANIES:
-        for m in SUPPLIER_LINE_RE.finditer(original):
-            g1 = m.group(1)
-            if g1:
-                hits.append((m.start(1), m.end(1), "supplier"))
-        mark(COMPANY_RE, "company")
-
-    if HIGHLIGHT_TITLES:
-        mark(TITLE_NAME_RE, "title_name")
-
-    if HIGHLIGHT_NAMES:
-        for m in GREETING_NAME_RE.finditer(original):
-            hits.append((m.start(1), m.end(1), "name_strong"))
-        for m in SIGNOFF_NAME_RE.finditer(original):
-            hits.append((m.start(1), m.end(1), "name_strong"))
-        mark(NAME_RE, "name")
-
-    # Numbers (least specific)
-    mark(NUMBER_RE, "number")
-
-    # Sort spans by start, prefer longer if same start
-    hits.sort(key=lambda x: (x[0], -(x[1] - x[0])))
-
-    # Remove overlaps
-    merged = []
-    last_end = -1
-    for s, e, label in hits:
-        if s < last_end:
-            continue
-        merged.append((s, e, label))
-        last_end = e
-
-    color = {
-        "email": "#fff59d",
-        "url": "#ffe0b2",
-        "domain": "#ffe0b2",
-        "phone": "#c8e6c9",
-        "address": "#bbdefb",
-        "iban": "#d1c4e9",
-        "id": "#d7ccc8",
-        "money": "#ffecb3",
-        "company": "#c5cae9",
-        "supplier": "#b3e5fc",
-        "title_name": "#ffccbc",
-        "name_strong": "#f48fb1",
-        "name": "#f8bbd0",
-        "number": "#eeeeee",
-    }
-
-    parts = []
-    cur = 0
-    for s, e, label in merged:
-        parts.append(escape(original[cur:s]))
-        parts.append(
-            f'<span style="background:{color.get(label,"#ffffcc")}; padding:0 2px; border-radius:3px;">'
-            f'{escape(original[s:e])}</span>'
-        )
-        cur = e
-    parts.append(escape(original[cur:]))
-
-    body_html = "".join(parts).replace("\n", "<br>\n")
-
-    legend_items = [
-        ("Email", "email"),
-        ("URL/Domain", "url"),
-        ("Phone", "phone"),
-        ("Address", "address"),
-        ("IBAN", "iban"),
-        ("ID/Reference", "id"),
-        ("Money", "money"),
-        ("Supplier", "supplier"),
-        ("Company", "company"),
-        ("Title+Name", "title_name"),
-        ("Name (strong)", "name_strong"),
-        ("Name (heuristic)", "name"),
-        ("Number", "number"),
-    ]
-    legend = '<div style="margin-bottom:12px;"><b>Legend:</b> '
-    for label, key in legend_items:
-        if key == "iban" and not HIGHLIGHT_IBAN:
-            continue
-        if key == "company" and not HIGHLIGHT_COMPANIES:
-            continue
-        if key == "title_name" and not HIGHLIGHT_TITLES:
-            continue
-        if key in ("name", "name_strong") and not HIGHLIGHT_NAMES:
-            continue
-        if key == "id" and not HIGHLIGHT_IDS:
-            continue
-        if key == "money" and not HIGHLIGHT_MONEY:
-            continue
-        legend += f'<span style="background:{color.get(key)}; padding:2px 6px; border-radius:3px; margin-left:6px;">{escape(label)}</span>'
-    legend += "</div>"
-
-    return legend + f"<div>{body_html}</div>"
-
-
-# =========================================================
-# Attachment extraction
-# =========================================================
-def extract_text_from_pdf(p: Path) -> str:
-    if PdfReader is None:
-        return ""
-    try:
-        out = []
-        r = PdfReader(str(p))
-        for pg in r.pages:
-            try:
-                out.append(pg.extract_text() or "")
-            except Exception:
-                pass
-        return clean_ws("\n".join(out))
-    except Exception:
-        return ""
-
-def extract_text_from_docx(p: Path) -> str:
-    if DocxDocument is None:
-        return ""
-    try:
-        doc = DocxDocument(str(p))
-        paras = [clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text)]
-        tbl = []
-        for table in doc.tables:
-            for row in table.rows:
-                cells = [clean_ws(c.text) for c in row.cells]
-                if any(cells):
-                    tbl.append(" | ".join(cells))
-        return clean_ws("\n".join(paras + ([""] if paras and tbl else []) + tbl))
-    except Exception:
-        return ""
-
-def extract_text_from_xlsx(p: Path) -> str:
-    if openpyxl is None:
-        return ""
-    try:
-        wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
-        out = []
-        for ws in wb.worksheets:
-            out.append(f"Sheet: {ws.title}")
-            max_rows = min(ws.max_row or 0, 200)
-            max_cols = min(ws.max_column or 0, 40)
-            for r in range(1, max_rows + 1):
-                row_vals = []
-                for c in range(1, max_cols + 1):
-                    v = ws.cell(row=r, column=c).value
-                    row_vals.append("" if v is None else str(v))
-                if any(x.strip() for x in row_vals):
-                    out.append(" | ".join(clean_ws(x) for x in row_vals))
-        return clean_ws("\n".join(out))
-    except Exception:
-        return ""
-
-def extract_text_from_txt(p: Path) -> str:
-    try:
-        return clean_ws(p.read_text(encoding="utf-8", errors="ignore"))
-    except Exception:
-        return ""
-
-def extract_text_from_file(p: Path) -> str:
-    ext = p.suffix.lower()
-    if ext == ".pdf":
-        return extract_text_from_pdf(p)
-    if ext == ".docx":
-        return extract_text_from_docx(p)
-    if ext == ".xlsx":
-        return extract_text_from_xlsx(p)
-    if ext == ".txt":
-        return extract_text_from_txt(p)
-    return ""
-
-
-# =========================================================
-# MSG processing via Outlook COM
-# =========================================================
-def open_msg_item(app, ns, msg_path: Path):
-    try:
-        return app.CreateItemFromTemplate(str(msg_path))
-    except Exception:
-        pass
-    try:
-        return ns.OpenSharedItem(str(msg_path))
-    except Exception:
-        return None
-
-def save_attachments(item, attach_folder: Path) -> List[dict]:
-    out = []
-    try:
-        atts = item.Attachments
-        count = atts.Count
-    except Exception:
-        return out
-
-    for i in range(1, count + 1):
-        try:
-            att = atts.Item(i)
-            fname = getattr(att, "FileName", None) or f"attachment_{i}"
-            base = Path(fname).name
-            save_path = attach_folder / base
-            if save_path.exists():
-                save_path = attach_folder / f"{save_path.stem}__{i}{save_path.suffix}"
-            att.SaveAsFile(str(save_path))
-            out.append({"name": save_path.name, "path": save_path, "ext": save_path.suffix.lower()})
-        except Exception:
-            continue
-
-    return out
-
-def msg_to_single_html(msg_path: Path, out_base: Path) -> None:
-    app = win32.Dispatch("Outlook.Application")
-    ns = app.GetNamespace("MAPI")
-
-    item = open_msg_item(app, ns, msg_path)
-    if item is None:
-        print("FAIL open msg:", msg_path.name)
-        return
-
-    out_folder = out_base / safe_folder_name(msg_path.stem)
-    attach_folder = out_folder / "attachments"
-    ensure_dir(out_folder)
-    ensure_dir(attach_folder)
-
-    subject = getattr(item, "Subject", "") or ""
-    sender_name = getattr(item, "SenderName", "") or ""
-    sender_email = getattr(item, "SenderEmailAddress", "") or ""
-    to_line = getattr(item, "To", "") or ""
-    cc_line = getattr(item, "CC", "") or ""
-    received = getattr(item, "ReceivedTime", None)
-    sent = getattr(item, "SentOn", None)
-    date_str = dt_str(received) or dt_str(sent)
-
-    html_body = getattr(item, "HTMLBody", "") or ""
-    plain_body = strip_html_to_text(html_body) if html_body else (getattr(item, "Body", "") or "")
-    plain_body = plain_body.replace("\r\n", "\n")
-
-    attachments = save_attachments(item, attach_folder)
-
-    # Extract text from attachments and append as section
-    extracted_blocks = []
-    for a in attachments:
-        txt = extract_text_from_file(a["path"])
-        if txt:
-            extracted_blocks.append(f"--- Attachment: {a['name']} ---\n{txt}\n")
-
-    combined = []
-    combined.append(f"Subject: {subject}")
-    combined.append(f"From: {sender_name} {sender_email}")
-    combined.append(f"To: {to_line}")
-    combined.append(f"CC: {cc_line}")
-    combined.append(f"Date: {date_str}")
-    combined.append("\n--- BODY ---\n")
-    combined.append(plain_body or "")
-    combined.append("\n--- ATTACHMENTS (extracted text) ---\n")
-    combined.append("\n".join(extracted_blocks) if extracted_blocks else "(none extracted)")
-
-    combined_text = "\n".join(combined)
-
-    page = f"""
-    <h2>Message (highlight to delete sensitive info)</h2>
-    <p style="color:#555;">Source: {escape(msg_path.name)}</p>
-    {apply_highlights(combined_text)}
-    <hr>
-    <h3>Attachments saved</h3>
-    <ul>
-      {''.join([f"<li><code>attachments/{escape(a['name'])}</code></li>" for a in attachments]) or "<li>(none)</li>"}
-    </ul>
-    """
-
-    out_html = html_page(f"REDACT - {subject}", page)
-    (out_folder / "message_redact_me.html").write_text(out_html, encoding="utf-8")
-
-    print("OK:", msg_path.name, "->", str(out_folder))
-
-def main():
-    msg_dir = Path(MSG_DIR)
-    out_base = Path(OUT_DIR)
-    ensure_dir(out_base)
-
-    if not msg_dir.exists():
-        raise SystemExit(f"MSG_DIR not found: {MSG_DIR}")
-
-    msg_files = sorted(msg_dir.rglob("*.msg"))
-    print("MSG files found:", len(msg_files))
-
-    for m in msg_files:
-        try:
-            msg_to_single_html(m, out_base)
-        except Exception as e:
-            print("FAIL:", m.name, "-", e)
-
-    print("DONE.")
-
-if __name__ == "__main__":
-    main()
+Source: AW_ Nachhaltigkeitsprämissen V530 Rohbau-WU-Paket SP2-10741 Kirchhoff.msg
+Legend: EmailURL/DomainPhoneAddressIBANID/ReferenceMoneySupplierCompanyTitle+NameName (strong)Name (heuristic)Number
+Subject: AW: Nachhaltigkeitsprämissen V530 Rohbau-WU-Paket SP2-10741 Kirchhoff
+From: Dietrich, Dario (050) /O=EXCHANGELABS/OU=EXCHANGE ADMINISTRATIVE GROUP (FYDIBOHF23SPDLT)/CN=RECIPIENTS/CN=CA668993F8D1492AB92CD0FEB62AE914-DIETRDA
+To: Kasiew, Timur (050)
+CC: Troester, Rasmus (050); Euba, Birgit (050)
+Date: 2025-01-24 14:18
+
+--- BODY ---
+
+v\:* {behavior:url(#default#VML);}
+o\:* {behavior:url(#default#VML);}
+w\:* {behavior:url(#default#VML);}
+.shape {behavior:url(#default#VML);}
+
+
+
+
+
+Hi Timur, 
+
+Kirchhoff verweist mal wieder auf Mehrkosten zu den CO2-Zielen. Das hat er in der Vergangenheit auch immer gemacht. 
+
+Kommende Woche geht das Thema Mehrkosten V530 Rohbau auf die PLS. Danach können wir sagen wie sich das Projekt aufstellt. 
+
+Die Formulierung, dass die Kosten zu 100 % von MB zu tragen sind finde ich aber nicht akzeptabel. 
+
+Kirchhoff soll es transparent machen wenn er Mehr-Kosten sieht. 
+
+
+
+Von: Kasiew, Timur (050) 
+
+Gesendet: Mittwoch, 22. Januar 2025 11:20
+
+An: Dietrich, Dario (050) ; Troester, Rasmus (050) 
+
+Betreff: Nachhaltigkeitsprämissen V530 Rohbau-WU-Paket SP2-10741 Kirchhoff
+
+Priorität: Hoch 
+
+
+
+Hallo Rasmus, Dario, 
+
+
+
+kann einer von euch bitte draufschauen? 
+
+Kirchhoff hat hier Diskussionsbedarf angemeldet. 
+
+
+
+Mit freundlichen Grüßen / Üdvözlettel / With best regards 
+
+
+
+Timur Kas***
+
+
+
+Mercedes-Benz Cars Procurement and Supplier Quality 
+
+Mercedes-Benz Werk Sindelfingen 
+
+Mercedes-Benz AG 
+
+050-G277 
+
+71059 Sindelfingen / Germany 
+
+
+
+Mobil: +49 151 58 60 7....
+
+mailto : timur.k**iew@mercedes-benz.com 
+
+
+
+edited version
+
+Subject: AW: Nachhaltigkeitsprämissen 
+
+
+Date: 2025-01-24 14:18
+
+
+
+
+
+
+
+
+Kirchhoff verweist mal wieder auf Mehrkosten zu den CO2-Zielen. Das hat er in der Vergangenheit auch immer gemacht. 
+
+Kommende Woche geht das Thema Mehrkosten V530 Rohbau auf die PLS. Danach können wir sagen wie sich das Projekt aufstellt. 
+
+Die Formulierung, dass die Kosten zu 100 % von MB zu tragen sind finde ich aber nicht akzeptabel. 
+
+Kirchhoff soll es transparent machen wenn er Mehr-Kosten sieht. 
+
+
+Gesendet: Mittwoch, 22. Januar 2025 11:20
+
+Betreff: Nachhaltigkeitsprämissen 
+
+Priorität: Hoch 
+
+
+
+
+
+
+
+kann einer von euch bitte draufschauen? 
+
+Kirchhoff hat hier Diskussionsbedarf angemeldet. 
+
+
+
+
+
+
+
