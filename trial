@@ -1,46 +1,22 @@
----------------------------------------------------------------------------
-FileNotFoundError                         Traceback (most recent call last)
-Cell In[14], line 5
-      2 from pathlib import Path
-      4 p = Path(r"PASTE_FULL_PATH_OF_ONE_FAILING_MSG_HERE")
-----> 5 m = extract_msg.Message(str(p))
-      6 m.process()
-      8 print("subject:", m.subject)
+import extract_msg
+from pathlib import Path
 
-File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\extract_msg\msg_classes\message_base.py:84, in MessageBase.__init__(self, path, **kwargs)
-     65 def __init__(self, path, **kwargs):
-     66     """
-     67     Supports all of the options from :meth:`MSGFile.__init__` with some
-     68     additional ones.
-   (...)     82         deencapsulation method will not run if this is set.
-     83     """
----> 84     super().__init__(path, **kwargs)
-     85     # The rest needs to be in a try-except block to ensure the file closes
-     86     # if an error occurs.
-     87     try:
+MSG_DIR = Path(r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus")
 
-File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\extract_msg\msg_classes\msg.py:155, in MSGFile.__init__(self, path, **kwargs)
-    153     else:
-    154         defect = olefile.DEFECT_INCORRECT
---> 155     self.__ole = olefile.OleFileIO(path, raise_defects = defect)
-    156 except OSError as e:
-    157     logger.error(e)
+msg_files = sorted(MSG_DIR.rglob("*.msg"))
+print("Found .msg:", len(msg_files))
+if not msg_files:
+    raise SystemExit("No .msg files found in MSG_DIR.")
 
-File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\olefile\olefile.py:1127, in OleFileIO.__init__(self, filename, raise_defects, write_mode, debug, path_encoding)
-   1124 if filename:
-   1125     # try opening, ensure fp is closed if that fails
-   1126     try:
--> 1127         self.open(filename, write_mode=write_mode)
-   1128     except Exception:
-   1129         # caller has no chance of calling close() now
-   1130         self._close(warn=False)
+p = msg_files[0]
+print("Testing:", p)
 
-File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\olefile\olefile.py:1231, in OleFileIO.open(self, filename, write_mode)
-   1228 else:
-   1229     # read-only mode by default
-   1230     mode = 'rb'
--> 1231 self.fp = open(filename, mode)
-   1232 self._we_opened_fp = True
-   1233 self._open_stack = traceback.extract_stack()   # remember for warning
+m = extract_msg.Message(str(p))
+m.process()
 
-FileNotFoundError: [Errno 2] No such file or directory: 'PASTE_FULL_PATH_OF_ONE_FAILING_MSG_HERE'
+print("subject:", m.subject)
+print("len(body):", len(getattr(m, "body", "") or ""))
+print("has htmlBody:", bool(getattr(m, "htmlBody", None)))
+print("len(htmlBody):", len(getattr(m, "htmlBody", "") or ""))
+print("has rtfBody:", bool(getattr(m, "rtfBody", None)))
+print("len(rtfBody):", len(getattr(m, "rtfBody", "") or ""))
