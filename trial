@@ -1,25 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-MSG Sanitizer (Outlook COM) - ONE OUTPUT PER .MSG
+MSG Chain Sanitizer (Outlook COM) - ONE OUTPUT PER .MSG, MULTIPLE SEGMENTS INSIDE
 
-Reads .msg files using Outlook COM (no extract_msg, Python 3.14 OK)
-- Extracts Subject + Body (prefers HTMLBody, fallback Body)
-- Extracts attachments and appends their text (best-effort)
-  - .pdf via pypdf (if installed)
-  - .docx via python-docx (if installed)
-  - .xlsx via openpyxl (if installed)
-  - .txt via plain read
-  - .png/.jpg OCR via pytesseract + pillow (if installed + tesseract present)
-- Sanitizes:
-  - removes header blocks (From/Von, To/An, CC, Sent/Gesendet etc.)
-  - removes emails, URLs, domains, phones, IBAN, references/IDs, money, addresses
-  - removes names (heuristics: greeting name, title+name, Firstname Lastname, Exchange /O=EXCH…)
-  - removes signatures (VG/LG/BR/MfG/Kind regards etc.)
-- Outputs exactly 1 file per input msg (HTML or TXT).
-- Labels: question / answer (heuristic)
+- Reads .msg files using Outlook COM (no extract_msg).
+- Extracts subject + body (prefers HTMLBody).
+- Splits email chains into segments (each segment ~ one email in thread).
+- Sanitizes each segment: removes names/emails/phones/IDs/addresses/money/etc (deletes, no [PERSON] tokens).
+- Labels EACH SEGMENT as question/answer (heuristic).
+- Optionally extracts attachments and appends extracted text to the newest segment.
 
 Run:
-  python sanitize_msg_outlook.py
+  python sanitize_msg_outlook_chain.py
 """
 
 import os
@@ -40,20 +31,17 @@ OUT_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\
 
 RECURSIVE = True
 OUTPUT_FORMAT = "html"   # "html" or "txt"
-SKIP_TEMP = True         # skip "~$" files etc.
+SKIP_TEMP = True         # skip "~$" files
 
-MAX_BODY_CHARS = 25000
+MAX_BODY_CHARS = 50000
 ATTACH_MAX_CHARS_EACH = 8000
 ATTACH_MAX_FILES = 10
 
-# =========================
-# Optional: treat supplier words as sensitive
-# If you want to KEEP supplier names, set this to False.
-# =========================
+# If you want to REMOVE supplier words entirely:
 REMOVE_SUPPLIER_WORDS = True
 SUPPLIER_CUE_WORDS = [
     "lieferant", "lieferanten", "supplier",
-    "kirchhoff", "bosch", "continental", "zf", "magna", "forvia", "faurecia"
+    # add known supplier names if you prefer delete instead of anonymize
 ]
 
 # =========================
@@ -63,12 +51,13 @@ SIGNATURE_CLOSINGS = [
     "best regards", "kind regards", "regards",
     "mit freundlichen grüßen", "freundliche grüße", "viele grüße",
     "vg", "lg", "br", "mfg", "thanks and regards",
-    "with best regards", "üdvözlettel"
+    "with best regards", "üdvözlettel",
+    "danke und viele grüße", "danke und freundliche grüße"
 ]
 
 GREETING_CUES = [
     "hallo", "hi", "hello", "guten morgen", "guten tag", "good morning",
-    "dear", "liebe", "lieber"
+    "dear", "liebe", "lieber", "sehr geehrte", "sehr geehrter"
 ]
 
 REPLY_PREFIXES = ("re:", "aw:", "wg:", "fw:", "fwd:")
@@ -110,14 +99,23 @@ TITLE_NAME_RE = re.compile(
     r"(?i)\b(?:mr|mrs|ms|miss|dr|prof|herr|frau)\.?\s+"
     r"[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b"
 )
-
 NAME_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b")
 
+# Greeting line capturing possible name after greeting
 GREETING_NAME_RE = re.compile(
-    r"(?im)^\s*(?:hallo|hi|hello|guten\s+morgen|guten\s+tag|good\s+morning|dear)\s+([^\n,]{2,40})"
+    r"(?im)^\s*(?:hallo|hi|hello|guten\s+morgen|guten\s+tag|good\s+morning|dear|liebe|lieber|sehr\s+geehrte)\s+([^\n,]{2,50})"
 )
 
-THREAD_SEP_RE = re.compile(r"(?im)^\s*(?:von:|from:|sent:|gesendet:|an:|to:|cc:|betreff:|subject:)\s+.*$")
+# Chain header detection (German + English)
+HDR_FROM_RE = re.compile(r"(?im)^\s*(von|from)\s*:\s*.+$")
+HDR_SENT_RE = re.compile(r"(?im)^\s*(gesendet|sent)\s*:\s*.+$")
+HDR_TO_RE   = re.compile(r"(?im)^\s*(an|to)\s*:\s*.+$")
+HDR_CC_RE   = re.compile(r"(?im)^\s*(cc)\s*:\s*.+$")
+HDR_SUBJ_RE = re.compile(r"(?im)^\s*(betreff|subject)\s*:\s*.+$")
+
+# A "header block" often begins with From/Von and contains Sent/To/Subject lines
+HEADER_BLOCK_START = re.compile(r"(?im)^\s*(von|from)\s*:\s*.+$")
+
 QUOTE_MARKERS_RE = re.compile(r"(?im)^\s*(?:-----original message-----|_{5,}|begin forwarded message:)\s*$")
 
 
@@ -154,169 +152,68 @@ def html_to_text(raw: str) -> str:
     return text
 
 
-def strip_thread_headers(text: str) -> str:
-    if not text:
-        return ""
-    lines = text.split("\n")
-    out = []
-    for ln in lines:
-        if "mailto:" in ln.lower():
-            continue
-        if THREAD_SEP_RE.match(ln):
-            continue
-        if re.match(r"(?im)^\s*(priorität|priority)\s*:\s*.*$", ln):
-            continue
-        out.append(ln)
+def outlook_open_msg(path: str):
+    """Outlook COM open .msg via OpenSharedItem."""
+    try:
+        import win32com.client as win32
+    except Exception as e:
+        raise SystemExit("pywin32 is required. Install: pip install pywin32") from e
 
-    t = "\n".join(out)
-    m = QUOTE_MARKERS_RE.search(t)
-    if m:
-        t = t[:m.start()].strip()
-    return re.sub(r"\n{3,}", "\n\n", t).strip()
+    app = win32.Dispatch("Outlook.Application")
+    ns = app.GetNamespace("MAPI")
+    try:
+        return ns.OpenSharedItem(path)
+    except Exception:
+        return None
 
 
-def extract_useful_body(text: str) -> str:
-    """
-    Keep conversational content. Prefer from first greeting until signature.
-    Fallback: stripped thread.
-    """
-    t = strip_thread_headers(text)
+def get_msg_body_text(mail_item) -> str:
+    """Prefer HTMLBody, fallback Body."""
+    html = ""
+    body = ""
+    try:
+        html = getattr(mail_item, "HTMLBody", "") or ""
+    except Exception:
+        html = ""
+    try:
+        body = getattr(mail_item, "Body", "") or ""
+    except Exception:
+        body = ""
 
-    if len(t) > MAX_BODY_CHARS:
-        t = t[:MAX_BODY_CHARS]
+    if html.strip():
+        return html_to_text(html)
+    return body or ""
 
-    lines = t.split("\n")
-    start_idx = 0
-    for i, ln in enumerate(lines):
-        l = ln.strip().lower()
-        if any(l.startswith(gc) for gc in GREETING_CUES):
-            start_idx = i
+
+def extract_attachments_to_temp(mail_item, temp_dir: Path):
+    """Save attachments to temp; returns list of saved paths."""
+    saved = []
+    try:
+        atts = mail_item.Attachments
+    except Exception:
+        return saved
+
+    count = 0
+    for i in range(1, getattr(atts, "Count", 0) + 1):
+        if count >= ATTACH_MAX_FILES:
             break
-
-    end_idx = len(lines)
-    for i in range(len(lines)):
-        l = lines[i].strip().lower()
-        if any(l == sc or l.startswith(sc + " ") for sc in SIGNATURE_CLOSINGS):
-            end_idx = i
-            break
-        if any(sc in l for sc in SIGNATURE_CLOSINGS):
-            end_idx = i
-            break
-
-    body = "\n".join(lines[start_idx:end_idx]).strip()
-    body = re.sub(r"\n{3,}", "\n\n", body).strip()
-
-    if len(clean_ws(body)) < 30:
-        fallback = strip_thread_headers(text).strip()
-        return fallback[:MAX_BODY_CHARS] if len(clean_ws(fallback)) >= 30 else ""
-    return body
-
-
-def redact_text(text: str):
-    """
-    Delete sensitive info completely (no [PERSON] token).
-    Returns (redacted_text, stats)
-    """
-    stats = {
-        "emails": 0, "phones": 0, "urls": 0, "domains": 0, "iban": 0,
-        "money": 0, "refs": 0, "addresses": 0, "names": 0, "companies": 0
-    }
-    if not text:
-        return "", stats
-
-    t = text
-
-    if REMOVE_SUPPLIER_WORDS:
-        for w in SUPPLIER_CUE_WORDS:
-            if not w:
-                continue
-            t2, n = re.subn(rf"(?i)\b{re.escape(w)}\b", "", t)
-            if n:
-                stats["companies"] += n
-                t = t2
-
-    def sub_count(pattern, key):
-        nonlocal t
-        t2, n = pattern.subn("", t)
-        if n:
-            stats[key] += n
-            t = t2
-
-    sub_count(EMAIL_RE, "emails")
-    sub_count(URL_RE, "urls")
-    sub_count(WWW_RE, "urls")
-    sub_count(IBAN_RE, "iban")
-    sub_count(MONEY_RE, "money")
-    sub_count(REF_RE, "refs")
-    sub_count(ADDRESS_RE, "addresses")
-    sub_count(PHONE_RE, "phones")
-
-    # Domains (optional aggressive) – keep after URLs
-    sub_count(DOMAIN_RE, "domains")
-
-    # Title+Name
-    t2, n = TITLE_NAME_RE.subn("", t)
-    if n:
-        stats["names"] += n
-        t = t2
-
-    # Greeting name (remove captured part only)
-    def _strip_greeting_name(m):
-        stats["names"] += 1
-        return m.group(0).replace(m.group(1), "").strip()
-
-    t = GREETING_NAME_RE.sub(_strip_greeting_name, t)
-
-    # Firstname Lastname
-    t2, n = NAME_RE.subn("", t)
-    if n:
-        stats["names"] += n
-        t = t2
-
-    # Exchange DN fragments
-    t2, n = re.subn(r"(?i)/o=exch[^ \n]+", "", t)
-    if n:
-        stats["names"] += n
-        t = t2
-
-    # Final cleanup
-    t = strip_thread_headers(t)
-    t = re.sub(r"[ \t]+", " ", t)
-    t = re.sub(r"\n[ \t]+", "\n", t)
-    t = re.sub(r"\n{3,}", "\n\n", t).strip()
-    t = re.sub(r"\s+([,.;:])", r"\1", t)
-    t = re.sub(r"([,.;:]){2,}", r"\1", t)
-    t = re.sub(r"\(\s*\)", "", t)
-
-    return t.strip(), stats
-
-
-def label_question_answer(subject: str, body: str) -> str:
-    s = (subject or "").strip().lower()
-    b = (body or "").strip().lower()
-
-    if "?" in (body or ""):
-        return "question"
-
-    ask_cues = ["kannst du", "könnt ihr", "kann einer", "please", "bitte", "could you", "can you", "draufschauen", "check", "prüfen"]
-    if any(x in b for x in ask_cues):
-        return "question"
-
-    answer_cues = ["danke", "unten", "anmerkungen", "hier", "wir plädieren", "folgende informationen", "as discussed", "as agreed"]
-    if any(x in b for x in answer_cues):
-        return "answer"
-
-    if s.startswith(REPLY_PREFIXES):
-        return "answer"
-
-    return "question"
+        try:
+            att = atts.Item(i)
+            fname = getattr(att, "FileName", "") or f"attachment_{i}"
+            safe = re.sub(r"[\\/:*?\"<>|]+", "_", fname).strip() or f"attachment_{i}"
+            out_path = temp_dir / safe
+            if out_path.exists():
+                out_path = temp_dir / f"{out_path.stem}_{i}{out_path.suffix}"
+            att.SaveAsFile(str(out_path))
+            saved.append(out_path)
+            count += 1
+        except Exception:
+            continue
+    return saved
 
 
 def try_extract_attachment_text(file_path: Path) -> str:
-    """
-    Best effort text extraction from attachment file.
-    Missing libs => return "" (skip silently).
-    """
+    """Best effort extraction. Missing libs => return ''."""
     ext = file_path.suffix.lower()
 
     try:
@@ -371,7 +268,6 @@ def try_extract_attachment_text(file_path: Path) -> str:
             return "\n".join(out)
 
         if ext in (".png", ".jpg", ".jpeg"):
-            # OCR optional
             try:
                 from PIL import Image
             except Exception:
@@ -392,44 +288,235 @@ def try_extract_attachment_text(file_path: Path) -> str:
     return ""
 
 
-def format_output_html(source_name: str, label: str, subject: str, body: str, stats: dict) -> str:
-    gen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def redact_text(text: str):
+    """Delete sensitive info entirely (no [PERSON] tokens). Returns (redacted_text, stats)."""
+    stats = {
+        "emails": 0, "phones": 0, "urls": 0, "domains": 0, "iban": 0,
+        "money": 0, "refs": 0, "addresses": 0, "names": 0, "companies": 0
+    }
+    if not text:
+        return "", stats
 
-    subj_red, _ = redact_text(subject)
-    body_display = body if body else "(no usable body text extracted)"
-    body_display = escape(body_display).replace("\n\n", "<br><br>").replace("\n", "<br>")
+    t = text
+
+    if REMOVE_SUPPLIER_WORDS:
+        for w in SUPPLIER_CUE_WORDS:
+            if not w:
+                continue
+            t2, n = re.subn(rf"(?i)\b{re.escape(w)}\b", "", t)
+            if n:
+                stats["companies"] += n
+                t = t2
+
+    def sub_count(pattern, key):
+        nonlocal t
+        t2, n = pattern.subn("", t)
+        if n:
+            stats[key] += n
+            t = t2
+
+    sub_count(EMAIL_RE, "emails")
+    sub_count(URL_RE, "urls")
+    sub_count(WWW_RE, "urls")
+    sub_count(IBAN_RE, "iban")
+    sub_count(MONEY_RE, "money")
+    sub_count(REF_RE, "refs")
+    sub_count(ADDRESS_RE, "addresses")
+    sub_count(PHONE_RE, "phones")
+    sub_count(DOMAIN_RE, "domains")
+
+    t2, n = TITLE_NAME_RE.subn("", t)
+    if n:
+        stats["names"] += n
+        t = t2
+
+    def _strip_greeting_name(m):
+        stats["names"] += 1
+        return m.group(0).replace(m.group(1), "").strip()
+
+    t = GREETING_NAME_RE.sub(_strip_greeting_name, t)
+
+    t2, n = NAME_RE.subn("", t)
+    if n:
+        stats["names"] += n
+        t = t2
+
+    t2, n = re.subn(r"(?i)/o=exch[^ \n]+", "", t)
+    if n:
+        stats["names"] += n
+        t = t2
+
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    t = re.sub(r"\s+([,.;:])", r"\1", t)
+    t = re.sub(r"([,.;:]){2,}", r"\1", t)
+    t = re.sub(r"\(\s*\)", "", t)
+    return t.strip(), stats
+
+
+def extract_useful_body(text: str) -> str:
+    """
+    For a segment: prefer from greeting until signature.
+    If no greeting, keep trimmed segment excluding obvious header lines.
+    """
+    if not text:
+        return ""
+
+    t = text.strip()
+    if len(t) > MAX_BODY_CHARS:
+        t = t[:MAX_BODY_CHARS]
+
+    lines = t.split("\n")
+
+    # Drop pure header lines inside segment
+    filtered = []
+    for ln in lines:
+        if HDR_FROM_RE.match(ln) or HDR_SENT_RE.match(ln) or HDR_TO_RE.match(ln) or HDR_CC_RE.match(ln) or HDR_SUBJ_RE.match(ln):
+            continue
+        filtered.append(ln)
+    lines = filtered
+
+    # Try find greeting start
+    start_idx = 0
+    for i, ln in enumerate(lines):
+        l = ln.strip().lower()
+        if any(l.startswith(gc) for gc in GREETING_CUES):
+            start_idx = i
+            break
+
+    # Find signature
+    end_idx = len(lines)
+    for i in range(len(lines)):
+        l = lines[i].strip().lower()
+        if any(l == sc or l.startswith(sc + " ") for sc in SIGNATURE_CLOSINGS) or any(sc in l for sc in SIGNATURE_CLOSINGS):
+            end_idx = i
+            break
+
+    body = "\n".join(lines[start_idx:end_idx]).strip()
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+
+    # If too short, fallback to whole segment (minus header lines)
+    if len(clean_ws(body)) < 30:
+        fallback = "\n".join(lines).strip()
+        return fallback if len(clean_ws(fallback)) >= 30 else ""
+    return body
+
+
+def label_question_answer(subject: str, body: str) -> str:
+    s = (subject or "").strip().lower()
+    b = (body or "").strip().lower()
+
+    # Strong indicators
+    if "?" in (body or ""):
+        return "question"
+
+    ask_cues = ["kannst du", "könnt ihr", "kann einer", "please", "bitte", "could you", "can you", "draufschauen", "check", "prüfen", "request", "anfrage"]
+    if any(x in b for x in ask_cues):
+        return "question"
+
+    answer_cues = ["danke", "unten", "anmerkungen", "hier", "folgende", "we suggest", "we propose", "we recommend", "as discussed", "as agreed"]
+    if any(x in b for x in answer_cues):
+        return "answer"
+
+    if s.startswith(REPLY_PREFIXES):
+        return "answer"
+
+    return "unknown"
+
+
+def split_chain_into_segments(full_text: str):
+    """
+    Split thread into segments.
+    We treat each block starting with From/Von as the start of an older email.
+    The newest email is the text before the first header block.
+    Returns list of segments in chronological order (oldest -> newest).
+    """
+    if not full_text:
+        return []
+
+    t = full_text.replace("\r\n", "\n")
+    # Common forward marker cut (optional)
+    m = QUOTE_MARKERS_RE.search(t)
+    # do NOT cut here; just keep; splitting uses header blocks.
+
+    # Find all "From/Von:" start lines
+    starts = [m.start() for m in HEADER_BLOCK_START.finditer(t)]
+    segments = []
+
+    if not starts:
+        # whole body is one segment
+        segments.append({"raw": t, "meta": {}})
+        return segments
+
+    # Newest segment: before first "From/Von"
+    newest = t[:starts[0]].strip()
+    if newest:
+        segments.append({"raw": newest, "meta": {"kind": "newest"}})
+
+    # Older segments: between From/Von markers
+    for i, st in enumerate(starts):
+        en = starts[i + 1] if i + 1 < len(starts) else len(t)
+        block = t[st:en].strip()
+        if block:
+            segments.append({"raw": block, "meta": {"kind": "older"}})
+
+    # The list right now is [newest, older1, older2, ...] (newest first)
+    # Convert to chronological order (oldest->newest) for readability/training:
+    segments = list(reversed(segments))
+    return segments
+
+
+def format_output_html(source_name: str, orig_subject: str, segments_out: list, global_stats: dict) -> str:
+    gen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    subj_red, _ = redact_text(orig_subject)
+
+    parts = []
+    parts.append(f"<div><b>Source:</b> {escape(source_name)}</div>")
+    parts.append(f"<div><b>Generated:</b> {escape(gen)}</div>")
+    parts.append(f"<div><b>ThreadSubject:</b> {escape(subj_red) if subj_red else '(empty subject)'}</div>")
+    parts.append("<hr>")
+
+    for idx, seg in enumerate(segments_out, start=1):
+        label = seg["label"]
+        body = seg["body"] or "(empty after sanitization)"
+        stats = seg["stats"]
+
+        body_html = escape(body).replace("\n\n", "<br><br>").replace("\n", "<br>")
+        parts.append(f"<h3 style='margin-top:18px;'>Segment {idx} — Label: {escape(label)}</h3>")
+        parts.append(f"<div style='margin:8px 0 10px 0;'>{body_html}</div>")
+        parts.append("<details style='margin-bottom:12px;'><summary><b>RedactionStats (segment)</b></summary>")
+        parts.append(f"<pre style='background:#f6f6f6; padding:10px; border-radius:8px;'>{escape(json.dumps(stats, ensure_ascii=False))}</pre>")
+        parts.append("</details>")
+        parts.append("<hr>")
+
+    parts.append("<h3>RedactionStats (total)</h3>")
+    parts.append(f"<pre style='background:#f6f6f6; padding:10px; border-radius:8px;'>{escape(json.dumps(global_stats, ensure_ascii=False))}</pre>")
 
     return f"""<html>
-<head><meta charset="utf-8"><title>Sanitized Mail</title></head>
+<head><meta charset="utf-8"><title>Sanitized Mail Thread</title></head>
 <body style="font-family:Segoe UI,Arial; font-size:13px; line-height:1.35; padding:16px;">
-<div style="margin-bottom:12px;">
-  <div><b>Source:</b> {escape(source_name)}</div>
-  <div><b>Label:</b> {escape(label)}</div>
-  <div><b>Generated:</b> {escape(gen)}</div>
-  <div><b>Subject:</b> {escape(subj_red) if subj_red else "(empty subject)"}</div>
-</div>
-<hr>
-<div><b>Body:</b></div>
-<div style="margin-top:8px;">{body_display}</div>
-<hr>
-<div><b>RedactionStats:</b></div>
-<pre style="background:#f6f6f6; padding:10px; border-radius:8px;">{escape(json.dumps(stats, ensure_ascii=False))}</pre>
+{''.join(parts)}
 </body>
 </html>"""
 
 
-def format_output_txt(source_name: str, label: str, subject: str, body: str, stats: dict) -> str:
+def format_output_txt(source_name: str, orig_subject: str, segments_out: list, global_stats: dict) -> str:
     gen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    subj_red, _ = redact_text(subject)
-    b = body if body else "(no usable body text extracted)"
-    return (
-        f"Source: {source_name}\n"
-        f"Label: {label}\n"
-        f"Generated: {gen}\n"
-        f"Subject: {subj_red}\n"
-        f"--- BODY ---\n{b}\n\n"
-        f"RedactionStats: {json.dumps(stats, ensure_ascii=False)}\n"
-    )
+    subj_red, _ = redact_text(orig_subject)
+
+    out = []
+    out.append(f"Source: {source_name}")
+    out.append(f"Generated: {gen}")
+    out.append(f"ThreadSubject: {subj_red}")
+    out.append("")
+
+    for idx, seg in enumerate(segments_out, start=1):
+        out.append(f"--- Segment {idx} | Label: {seg['label']} ---")
+        out.append(seg["body"] or "(empty after sanitization)")
+        out.append(f"RedactionStats(segment): {json.dumps(seg['stats'], ensure_ascii=False)}")
+        out.append("")
+
+    out.append(f"RedactionStats(total): {json.dumps(global_stats, ensure_ascii=False)}")
+    return "\n".join(out)
 
 
 def collect_msg_files(base_dir: str):
@@ -449,83 +536,6 @@ def collect_msg_files(base_dir: str):
     return sorted(files)
 
 
-def outlook_open_msg(path: str):
-    """
-    Outlook COM open .msg:
-      ns.OpenSharedItem(path)
-    Returns MailItem or None.
-    """
-    try:
-        import win32com.client as win32
-    except Exception as e:
-        raise SystemExit("pywin32 is required for Outlook COM. Install: pip install pywin32") from e
-
-    app = win32.Dispatch("Outlook.Application")
-    ns = app.GetNamespace("MAPI")
-    try:
-        item = ns.OpenSharedItem(path)
-        return item
-    except Exception:
-        return None
-
-
-def get_msg_body_text(mail_item) -> str:
-    """
-    Prefer HTMLBody -> text conversion, fallback Body.
-    Some mails might have empty body if exported weirdly.
-    """
-    html = ""
-    body = ""
-    try:
-        html = getattr(mail_item, "HTMLBody", "") or ""
-    except Exception:
-        html = ""
-    try:
-        body = getattr(mail_item, "Body", "") or ""
-    except Exception:
-        body = ""
-
-    if html.strip():
-        return html_to_text(html)
-    return body or ""
-
-
-def extract_attachments_to_temp(mail_item, temp_dir: Path):
-    """
-    Save attachments to temp dir.
-    Returns list of saved paths.
-    Skips if access fails.
-    """
-    saved = []
-    try:
-        atts = mail_item.Attachments
-    except Exception:
-        return saved
-
-    count = 0
-    for i in range(1, getattr(atts, "Count", 0) + 1):
-        if count >= ATTACH_MAX_FILES:
-            break
-        try:
-            att = atts.Item(i)
-            fname = getattr(att, "FileName", "") or f"attachment_{i}"
-            # sanitize filename
-            safe = re.sub(r"[\\/:*?\"<>|]+", "_", fname).strip()
-            if not safe:
-                safe = f"attachment_{i}"
-            out_path = temp_dir / safe
-            # ensure uniqueness
-            if out_path.exists():
-                out_path = temp_dir / f"{out_path.stem}_{i}{out_path.suffix}"
-            att.SaveAsFile(str(out_path))
-            saved.append(out_path)
-            count += 1
-        except Exception:
-            continue
-
-    return saved
-
-
 def main():
     in_dir = Path(MSG_DIR)
     out_dir = Path(OUT_DIR)
@@ -536,33 +546,37 @@ def main():
     print(".msg found:", len(msg_files))
 
     if not msg_files:
-        print("No .msg files found. Verify MSG_DIR path and RECURSIVE setting.")
+        print("No .msg files found. Verify MSG_DIR and RECURSIVE.")
         return
 
     written = 0
     skipped = 0
 
-    # temp for attachments extraction
-    temp_root = Path(tempfile.mkdtemp(prefix="msg_sanitize_"))
+    temp_root = Path(tempfile.mkdtemp(prefix="msg_chain_sanitize_"))
 
     try:
         for p in msg_files:
             try:
-                item = outlook_open_msg(str(p))
+                item = None
+                try:
+                    item = outlook_open_msg(str(p))
+                except Exception:
+                    item = None
                 if item is None:
                     skipped += 1
                     continue
 
-                subject = ""
+                orig_subject = ""
                 try:
-                    subject = getattr(item, "Subject", "") or ""
+                    orig_subject = getattr(item, "Subject", "") or ""
                 except Exception:
-                    subject = ""
+                    orig_subject = ""
 
-                raw_text = get_msg_body_text(item)
-                raw_text = raw_text.replace("\r\n", "\n")
+                raw_text = get_msg_body_text(item).replace("\r\n", "\n").strip()
+                if not raw_text:
+                    raw_text = ""
 
-                # Extract attachments -> append their extracted text (best effort)
+                # Attachments -> append into newest segment (after split)
                 temp_dir = temp_root / (p.stem[:60] + "__" + hashlib.sha1(str(p).encode("utf-8", errors="ignore")).hexdigest()[:8])
                 temp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -570,32 +584,57 @@ def main():
                 attach_blocks = []
                 for ap in attach_paths:
                     txt = try_extract_attachment_text(ap)
-                    txt = txt.strip()
+                    txt = (txt or "").strip()
                     if txt:
                         if len(txt) > ATTACH_MAX_CHARS_EACH:
                             txt = txt[:ATTACH_MAX_CHARS_EACH] + "…"
                         attach_blocks.append(f"[Attachment: {ap.name}]\n{txt}")
 
+                # Split chain into segments
+                segments = split_chain_into_segments(raw_text)
+
+                # If we have attachments text, append it to the newest segment (last in chronological order)
                 if attach_blocks:
-                    raw_text = (raw_text.strip() + "\n\n" + "\n\n".join(attach_blocks)).strip()
+                    if segments:
+                        segments[-1]["raw"] = (segments[-1]["raw"].strip() + "\n\n" + "\n\n".join(attach_blocks)).strip()
+                    else:
+                        segments = [{"raw": "\n\n".join(attach_blocks), "meta": {"kind": "newest"}}]
 
-                useful = extract_useful_body(raw_text)
-                red_body, stats = redact_text(useful)
+                segments_out = []
+                global_stats = {
+                    "emails": 0, "phones": 0, "urls": 0, "domains": 0, "iban": 0,
+                    "money": 0, "refs": 0, "addresses": 0, "names": 0, "companies": 0
+                }
 
-                red_body = red_body.strip()
-                if len(clean_ws(red_body)) < 30:
-                    red_body = ""
+                for seg in segments:
+                    seg_raw = seg.get("raw", "") or ""
+                    useful = extract_useful_body(seg_raw)
+                    red, stats = redact_text(useful)
 
-                label = label_question_answer(subject, red_body)
+                    red = (red or "").strip()
+                    label = label_question_answer(orig_subject, red)
+
+                    # Keep only meaningful segments
+                    if len(clean_ws(red)) < 20:
+                        continue
+
+                    for k in global_stats:
+                        global_stats[k] += int(stats.get(k, 0) or 0)
+
+                    segments_out.append({"label": label, "body": red, "stats": stats})
+
+                # If everything got filtered out, still write file (so you can see that it failed)
+                if not segments_out:
+                    segments_out = [{"label": "unknown", "body": "(no usable content extracted from chain)", "stats": global_stats}]
 
                 out_name = safe_output_name(p)
                 out_path = out_dir / out_name
 
                 if OUTPUT_FORMAT.lower() == "txt":
-                    out_text = format_output_txt(p.name, label, subject, red_body, stats)
-                    out_path.write_text(out_text, encoding="utf-8", errors="ignore")
+                    out_txt = format_output_txt(p.name, orig_subject, segments_out, global_stats)
+                    out_path.write_text(out_txt, encoding="utf-8", errors="ignore")
                 else:
-                    out_html = format_output_html(p.name, label, subject, red_body, stats)
+                    out_html = format_output_html(p.name, orig_subject, segments_out, global_stats)
                     out_path.write_text(out_html, encoding="utf-8", errors="ignore")
 
                 written += 1
@@ -605,7 +644,6 @@ def main():
                 print("SKIP:", p.name, "-", e)
 
     finally:
-        # keep temp root? Usually we delete. If you want to inspect attachments, comment out next line.
         try:
             shutil.rmtree(temp_root, ignore_errors=True)
         except Exception:
