@@ -1,22 +1,3 @@
-import extract_msg
-from pathlib import Path
-
-MSG_DIR = Path(r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus")
-
-msg_files = sorted(MSG_DIR.rglob("*.msg"))
-print("Found .msg:", len(msg_files))
-if not msg_files:
-    raise SystemExit("No .msg files found in MSG_DIR.")
-
-p = msg_files[0]
-print("Testing:", p)
-
-m = extract_msg.Message(str(p))
-m.process()
-
-print("subject:", m.subject)
-print("len(body):", len(getattr(m, "body", "") or ""))
-print("has htmlBody:", bool(getattr(m, "htmlBody", None)))
-print("len(htmlBody):", len(getattr(m, "htmlBody", "") or ""))
-print("has rtfBody:", bool(getattr(m, "rtfBody", None)))
-print("len(rtfBody):", len(getattr(m, "rtfBody", "") or ""))
+import sys
+print(sys.executable)
+print(sys.version)
