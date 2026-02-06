@@ -1,562 +1,755 @@
-{
-  "ok": 37,
-  "fail": 6,
-  "seconds": 60.37559247016907,
-  "results": [
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Bitte um Zusendung der Nachhaltigkeitspr\u00e4missenbl\u00e4tter__f0eb01b3.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Bitte um Zusendung der Nachhaltigkeitspr\u00e4missenbl\u00e4tter__f0eb01b3__62045f28.html",
-      "subject": "AW_ Bitte um Zusendung der Nachhaltigkeitspr\u00e4missenbl\u00e4tter__f0eb01b3",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 1,
-        "names": 3
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ CO2-Ziele _ techn_ Anforderung__2640f2b3.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ CO2-Ziele _ techn_ Anforderung__2640f2b3__306c7909.html",
-      "subject": "AW_ CO2-Ziele _ techn_ Anforderung__2640f2b3",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 2
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Fragen zu Pr\u00e4missenblatt CO2 Zielwerte__215814a0.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Fragen zu Pr\u00e4missenblatt CO2 Zielwerte__215814a0__64cf13f0.html",
-      "subject": "AW_ Fragen zu Pr\u00e4missenblatt CO2 Zielwerte__215814a0",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 2
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Nachhaltigkeit Pr\u00e4missenblatt EB-L Sch\u00fctze__e7b12e48.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Nachhaltigkeit Pr\u00e4missenblatt EB-L Sch\u00fctze__e7b12e48__cf804007.html",
-      "subject": "AW_ Nachhaltigkeit Pr\u00e4missenblatt EB-L Sch\u00fctze__e7b12e48",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 4
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Nachhaltigkeitspr\u00e4missen Conti__5a05fc5b.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Nachhaltigkeitspr\u00e4missen Conti__5a05fc5b__568d0b6b.html",
-      "subject": "AW_ Nachhaltigkeitspr\u00e4missen Conti__5a05fc5b",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 4
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Nachhaltigkeitspr\u00e4missen Lokal USA Charleston__9e9b4362.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Nachhaltigkeitspr\u00e4missen Lokal USA Charleston__9e9b4362__71064609.html",
-      "subject": "AW_ Nachhaltigkeitspr\u00e4missen Lokal USA Charleston__9e9b4362",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 4
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Nachhaltigkeitspr\u00e4missenblatt__35c7f9f0.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Nachhaltigkeitspr\u00e4missenblatt__35c7f9f0__da1bc397.html",
-      "subject": "AW_ Nachhaltigkeitspr\u00e4missenblatt__35c7f9f0",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 2
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ RFQ Scheinwerfer MMA Mopf - Ambition 2039__74c46cf8.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ RFQ Scheinwerfer MMA Mopf - Ambition 2039__74c46cf8__2262bfc1.html",
-      "subject": "AW_ RFQ Scheinwerfer MMA Mopf - Ambition 2039__74c46cf8",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 2
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitspr\u00e4missen__dcc0091e.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitspr\u00e4missen__dcc0091e__02d043aa.html",
-      "subject": "AW_ RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitspr\u00e4missen__dcc0091e",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 2
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ V530 Update _ Nachhaltigkeitspr\u00e4missen__4b8f101d.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ V530 Update _ Nachhaltigkeitspr\u00e4missen__4b8f101d__7e771875.html",
-      "subject": "AW_ V530 Update _ Nachhaltigkeitspr\u00e4missen__4b8f101d",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 2
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ V530_ Vergabeerweiterung PVC__abf97f4b.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ V530_ Vergabeerweiterung PVC__abf97f4b__f2ff97d4.html",
-      "subject": "AW_ V530_ Vergabeerweiterung PVC__abf97f4b",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 2
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Veraltete Links in Nachhaltigkeitspr\u00e4missen__01b029e2.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Veraltete Links in Nachhaltigkeitspr\u00e4missen__01b029e2__8bc1fd3d.html",
-      "subject": "AW_ Veraltete Links in Nachhaltigkeitspr\u00e4missen__01b029e2",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 1,
-        "names": 4
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ VU 2-2025-01735 Fokusvergabe (wiegt nur 60g)__36647a2b.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ VU 2-2025-01735 Fokusvergabe (wiegt nur 60g)__36647a2b__910f5288.html",
-      "subject": "AW_ VU 2-2025-01735 Fokusvergabe (wiegt nur 60g)__36647a2b",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 4,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 2
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\Legal Feedback CATL RSS Kommentare__6348f963.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\Legal Feedback CATL RSS Kommentare__6348f963__ad044baf.html",
-      "subject": "Legal Feedback CATL RSS Kommentare__6348f963",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 4
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitspr\u00e4missen__a2373986.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitspr\u00e4missen__a2373986__94976b09.html",
-      "subject": "RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitspr\u00e4missen__a2373986",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 2
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\WG_ Brose __ LL __ Pr\u00e4missen__5be8a001.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\WG_ Brose __ LL __ Pr\u00e4missen__5be8a001__17cd6d23.html",
-      "subject": "WG_ Brose __ LL __ Pr\u00e4missen__5be8a001",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 2
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\WG_ RFQ Scheinwerfer MMA Mopf - Ambition 2039__fb214bb6.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\WG_ RFQ Scheinwerfer MMA Mopf - Ambition 2039__fb214bb6__6952b2ba.html",
-      "subject": "WG_ RFQ Scheinwerfer MMA Mopf - Ambition 2039__fb214bb6",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 2
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\~$_ Bitte um Zusendung der Nachhaltigkeitspr\u00e4missenbl\u00e4tter__f0eb01b3.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\~$_ Bitte um Zusendung der Nachhaltigkeitspr\u00e4missenbl\u00e4tter__f0eb01b3__5b420c36.html",
-      "subject": "~$_ Bitte um Zusendung der Nachhaltigkeitspr\u00e4missenbl\u00e4tter__f0eb01b3",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 0,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 0
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\~$_ CO2-Ziele _ techn_ Anforderung__2640f2b3.html",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\~$_ CO2-Ziele _ techn_ Anforderung__2640f2b3__12f11c17.html",
-      "subject": "~$_ CO2-Ziele _ techn_ Anforderung__2640f2b3",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 0,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 0
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\AW_ Fragen zu Pr\u00e4missenblatt CO2 Zielwerte.msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Fragen zu Pr\u00e4missenblatt CO2 Zielwerte__215814a0.html",
-      "subject": "Fragen zu Pr\u00e4missenblatt CO2 Zielwerte",
-      "turns": 5,
-      "redaction_stats": {
-        "emails": 8,
-        "urls": 0,
-        "phones": 0,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 3
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\AW_ Nachhaltigkeit Pr\u00e4missenblatt EB-L Sch\u00fctze.msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Nachhaltigkeit Pr\u00e4missenblatt EB-L Sch\u00fctze__e7b12e48.html",
-      "subject": "Nachhaltigkeit Pr\u00e4missenblatt EB-L Sch\u00fctze",
-      "turns": 5,
-      "redaction_stats": {
-        "emails": 6,
-        "urls": 2,
-        "phones": 4,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 22
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\AW_ Nachhaltigkeitspr\u00e4missen Conti.msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Nachhaltigkeitspr\u00e4missen Conti__5a05fc5b.html",
-      "subject": "Nachhaltigkeitspr\u00e4missen Conti",
-      "turns": 8,
-      "redaction_stats": {
-        "emails": 18,
-        "urls": 0,
-        "phones": 3,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 11
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\AW_ Nachhaltigkeitspr\u00e4missen Lokal USA Charleston.msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Nachhaltigkeitspr\u00e4missen Lokal USA Charleston__9e9b4362.html",
-      "subject": "Nachhaltigkeitspr\u00e4missen Lokal USA Charleston",
-      "turns": 4,
-      "redaction_stats": {
-        "emails": 15,
-        "urls": 0,
-        "phones": 7,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 19
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\AW_ Nachhaltigkeitspr\u00e4missen V530 Rohbau-WU-Paket SP2-10741 Kirchhoff.msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Nachhaltigkeitspr\u00e4missen V530 Rohbau-WU-Paket SP2-10741 Kirchhoff__1d2c9e4b.html",
-      "subject": "Nachhaltigkeitspr\u00e4missen V530 Rohbau-WU-Paket SP2-10741 Kirchhoff",
-      "turns": 2,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 10
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\AW_ Nachhaltigkeitspr\u00e4missen_VU 2-2024-01727 M177 EVO GT BS Hotend_Coldend.msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Nachhaltigkeitspr\u00e4missen_VU 2-2024-01727 M177 EVO GT BS Hotend_Coldend__11c2da71.html",
-      "subject": "Nachhaltigkeitspr\u00e4missen_VU 2-2024-01727 M177 EVO GT BS Hotend/Coldend",
-      "turns": 3,
-      "redaction_stats": {
-        "emails": 5,
-        "urls": 0,
-        "phones": 3,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 36
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\AW_ Nachhaltigkeitspr\u00e4missenblatt .msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Nachhaltigkeitspr\u00e4missenblatt__35c7f9f0.html",
-      "subject": "Nachhaltigkeitspr\u00e4missenblatt",
-      "turns": 4,
-      "redaction_stats": {
-        "emails": 5,
-        "urls": 0,
-        "phones": 6,
-        "money": 0,
-        "refs": 0,
-        "addresses": 1,
-        "names": 35
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\AW_ RFQ Scheinwerfer MMA Mopf - Ambition 2039 .msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ RFQ Scheinwerfer MMA Mopf - Ambition 2039__74c46cf8.html",
-      "subject": "RFQ Scheinwerfer MMA Mopf - Ambition 2039",
-      "turns": 7,
-      "redaction_stats": {
-        "emails": 11,
-        "urls": 0,
-        "phones": 14,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 59
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\AW_ RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitspr\u00e4missen .msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitspr\u00e4missen__dcc0091e.html",
-      "subject": "RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitspr\u00e4missen",
-      "turns": 3,
-      "redaction_stats": {
-        "emails": 2,
-        "urls": 0,
-        "phones": 6,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 37
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\AW_ SAQ Woco_ _ Erg\u00e4nzt um weitere Fragen _ Nachhaltigkeitspr\u00e4missenblatt.msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ SAQ Woco_ _ Erg\u00e4nzt um weitere Fragen _ Nachhaltigkeitspr\u00e4missenblatt__5f47f024.html",
-      "subject": "SAQ Woco? / Erg\u00e4nzt um weitere Fragen / Nachhaltigkeitspr\u00e4missenblatt",
-      "turns": 10,
-      "redaction_stats": {
-        "emails": 22,
-        "urls": 0,
-        "phones": 9,
-        "money": 0,
-        "refs": 0,
-        "addresses": 1,
-        "names": 39
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\AW_ V530 Update _ Nachhaltigkeitspr\u00e4missen .msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ V530 Update _ Nachhaltigkeitspr\u00e4missen__4b8f101d.html",
-      "subject": "V530 Update | Nachhaltigkeitspr\u00e4missen",
-      "turns": 5,
-      "redaction_stats": {
-        "emails": 13,
-        "urls": 0,
-        "phones": 4,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 20
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\AW_ V530_ Vergabeerweiterung PVC.msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ V530_ Vergabeerweiterung PVC__abf97f4b.html",
-      "subject": "V530: Vergabeerweiterung PVC",
-      "turns": 7,
-      "redaction_stats": {
-        "emails": 17,
-        "urls": 0,
-        "phones": 11,
-        "money": 0,
-        "refs": 2,
-        "addresses": 0,
-        "names": 45
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\AW_ Veraltete Links in Nachhaltigkeitspr\u00e4missen.msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ Veraltete Links in Nachhaltigkeitspr\u00e4missen__01b029e2.html",
-      "subject": "Veraltete Links in Nachhaltigkeitspr\u00e4missen",
-      "turns": 2,
-      "redaction_stats": {
-        "emails": 4,
-        "urls": 0,
-        "phones": 4,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 39
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\AW_ VU 2-2025-01735 Fokusvergabe (wiegt nur 60g).msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\AW_ VU 2-2025-01735 Fokusvergabe (wiegt nur 60g)__36647a2b.html",
-      "subject": "VU 2-2025-01735 Fokusvergabe (wiegt nur 60g)",
-      "turns": 3,
-      "redaction_stats": {
-        "emails": 5,
-        "urls": 0,
-        "phones": 2,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 3
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\Legal Feedback CATL RSS Kommentare.msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\Legal Feedback CATL RSS Kommentare__6348f963.html",
-      "subject": "Legal Feedback CATL RSS Kommentare",
-      "turns": 2,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 1,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 11
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitspr\u00e4missen .msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitspr\u00e4missen__a2373986.html",
-      "subject": "RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitspr\u00e4missen",
-      "turns": 1,
-      "redaction_stats": {
-        "emails": 0,
-        "urls": 0,
-        "phones": 3,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 18
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\WG_ Brose __ LL __ Pr\u00e4missen.msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\WG_ Brose __ LL __ Pr\u00e4missen__5be8a001.html",
-      "subject": "Brose // LL // Pr\u00e4missen",
-      "turns": 6,
-      "redaction_stats": {
-        "emails": 5,
-        "urls": 0,
-        "phones": 4,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 11
-      }
-    },
-    {
-      "file": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\WG_ RFQ Scheinwerfer MMA Mopf - Ambition 2039 .msg",
-      "out": "C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\sanitized_one_per_mail\\WG_ RFQ Scheinwerfer MMA Mopf - Ambition 2039__fb214bb6.html",
-      "subject": "RFQ Scheinwerfer MMA Mopf - Ambition 2039",
-      "turns": 5,
-      "redaction_stats": {
-        "emails": 6,
-        "urls": 0,
-        "phones": 11,
-        "money": 0,
-        "refs": 0,
-        "addresses": 0,
-        "names": 40
-      }
+# -*- coding: utf-8 -*-
+"""
+PURPOSE
+-------
+Batch-sanitize Outlook .msg files for safe internal training / QA use:
+- EXACTLY 1 output HTML per input .msg (no splitting into multiple files)
+- Keeps Subject + main Body content (thread-aware), removes sensitive data:
+  names, email addresses, phone numbers, addresses, URLs, money, IDs/references, org/supplier names (heuristic)
+- Labels EACH "turn" inside the chain as: question / answer / other
+  (turns are derived from reply separators; oldest message is processed first)
+- Uses Outlook COM to parse .msg (works on Python 3.14 if Outlook is installed)
+- Optional: also reads common attachments (pdf/docx/xlsx/txt) if libraries exist;
+  if a library is missing, that attachment step is skipped (no crash)
+
+KEY REQUIREMENT YOU ASKED FOR
+-----------------------------
+Every run writes to a NEW, uniquely named output folder, so trials do not overwrite prior runs.
+
+DEPENDENCIES
+------------
+Required:
+- pywin32 (win32com) and Outlook installed on this machine/profile
+
+Optional (auto-skip if missing):
+- beautifulsoup4 (HTML -> text cleaner)
+- pypdf (PDF text)
+- python-docx (DOCX text)
+- openpyxl (XLSX text)
+
+NOTE
+----
+- This script does NOT require Python 3.12/3.11. It is designed for Python 3.14.
+- If Outlook cannot open .msg (rights-managed/protected), that file will be logged and skipped.
+
+EDIT ME
+-------
+Set MSG_DIR and OUT_BASE_DIR below.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import json
+import time
+import hashlib
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from html import escape
+from typing import List, Dict, Tuple, Optional
+
+# =========================
+# EDIT THESE PATHS
+# =========================
+MSG_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus"
+OUT_BASE_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports"
+
+# Give your trial a short tag so folders are human-readable:
+RUN_TAG = "trial"
+
+# Process .msg recursively:
+RECURSIVE = True
+
+# How many .msg to process (None = all)
+MAX_FILES: Optional[int] = None
+
+# If True, also process .html/.htm files in MSG_DIR (sometimes you have exported mails)
+INCLUDE_HTML_FILES = False
+
+# Attempt attachment extraction (pdf/docx/xlsx/txt) via Outlook COM SaveAsFile + optional libs
+PROCESS_ATTACHMENTS = True
+MAX_ATTACHMENTS_PER_MAIL = 8
+MAX_ATTACHMENT_CHARS_TOTAL = 15000
+
+# Safety / output size limits
+MAX_TURN_CHARS = 12000
+MAX_TOTAL_BODY_CHARS = 50000
+
+STARTUP_DELAY_SEC = 0
+
+# =========================
+# OPTIONAL LIBS (AUTO-SKIP)
+# =========================
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:
+    BeautifulSoup = None
+
+try:
+    from pypdf import PdfReader  # type: ignore
+except Exception:
+    PdfReader = None
+
+try:
+    from docx import Document as DocxDocument  # type: ignore
+except Exception:
+    DocxDocument = None
+
+try:
+    import openpyxl  # type: ignore
+except Exception:
+    openpyxl = None
+
+# =========================
+# OUTLOOK COM (REQUIRED)
+# =========================
+try:
+    import win32com.client as win32  # type: ignore
+except Exception as e:
+    raise SystemExit(
+        "pywin32/win32com is required for Python 3.14 .msg parsing via Outlook COM.\n"
+        "Install: py -m pip install pywin32\n"
+        f"Import error: {e}"
+    )
+
+# =========================
+# OUTPUT FOLDER (UNIQUE PER RUN)
+# =========================
+def make_run_out_dir(base_dir: str, tag: str) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_tag = re.sub(r"[^A-Za-z0-9._-]+", "_", tag.strip()) or "run"
+    out = Path(base_dir) / f"run_{ts}_{safe_tag}"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "_logs").mkdir(parents=True, exist_ok=True)
+    (out / "sanitized_one_per_mail").mkdir(parents=True, exist_ok=True)
+    return out
+
+OUT_DIR = make_run_out_dir(OUT_BASE_DIR, RUN_TAG)
+OUT_SAN = OUT_DIR / "sanitized_one_per_mail"
+OUT_LOG = OUT_DIR / "_logs"
+ERR_LOG = OUT_LOG / "errors.log"
+STATS_JSON = OUT_LOG / "stats.json"
+
+ATTACH_TMP = Path(tempfile.gettempdir()) / "msg_sanitize_attach_tmp"
+ATTACH_TMP.mkdir(parents=True, exist_ok=True)
+
+# =========================
+# LOGGING
+# =========================
+def log_error(msg: str) -> None:
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{stamp}] ERROR: {msg}\n"
+    with ERR_LOG.open("a", encoding="utf-8", errors="ignore") as f:
+        f.write(line)
+
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def safe_filename(stem: str, ext: str = ".html") -> str:
+    raw = stem or "mail"
+    raw = raw.strip()
+    raw = re.sub(r"[\\/:*?\"<>|]+", "_", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    raw = raw[:90] if len(raw) > 90 else raw
+    h = hashlib.sha1(stem.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    return f"{raw}__{h}{ext}"
+
+# =========================
+# HTML -> TEXT HELPERS
+# =========================
+def html_to_text(html: str) -> str:
+    html = html or ""
+    if not html.strip():
+        return ""
+    if BeautifulSoup is None:
+        # fallback: strip tags roughly
+        txt = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+        txt = re.sub(r"</p\s*>", "\n\n", txt, flags=re.I)
+        txt = re.sub(r"<[^>]+>", " ", txt)
+        return normalize_spaced_letters(clean_ws(txt))
+    soup = BeautifulSoup(html, "html.parser")
+    # replace <br> with newline
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+    txt = soup.get_text("\n")
+    return normalize_spaced_letters(txt)
+
+def normalize_spaced_letters(text: str) -> str:
+    """
+    Fix cases like: 'h t m l  x m l n s : v = ...' (letters separated by spaces)
+    If a line has lots of single-letter tokens, collapse spaces between them.
+    """
+    if not text:
+        return ""
+    lines = text.splitlines()
+    out = []
+    for ln in lines:
+        toks = ln.strip().split()
+        if not toks:
+            out.append("")
+            continue
+        # heuristic: if >= 60% tokens are single-char (or punctuation-like), collapse
+        singleish = sum(1 for t in toks if len(t) == 1 or (len(t) == 2 and t[0].isalnum() and not t[1].isalnum()))
+        if len(toks) >= 8 and singleish / max(1, len(toks)) >= 0.6:
+            out.append(ln.replace(" ", ""))
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+# =========================
+# THREAD SPLITTING
+# =========================
+REPLY_SEP_PATTERNS = [
+    r"^\s*From\s*:\s+",
+    r"^\s*Von\s*:\s+",
+    r"^\s*Sent\s*:\s+",
+    r"^\s*Gesendet\s*:\s+",
+    r"^\s*-{2,}\s*Original Message\s*-{2,}\s*$",
+    r"^\s*_{5,}\s*$",
+]
+
+REPLY_SEP_RE = re.compile("|".join(REPLY_SEP_PATTERNS), re.IGNORECASE | re.MULTILINE)
+
+def split_into_turns(full_text: str) -> List[str]:
+    """
+    Split thread into turns (best-effort) using reply separators.
+    Then return turns in OLD -> NEW order (since you said questions start at bottom).
+    """
+    t = full_text or ""
+    t = t.replace("\r\n", "\n")
+    t = t.strip()
+    if not t:
+        return []
+
+    # split at separator matches (keep separators by manual slicing)
+    idxs = [m.start() for m in REPLY_SEP_RE.finditer(t)]
+    if not idxs:
+        return [t[:MAX_TURN_CHARS]]
+
+    chunks = []
+    starts = [0] + idxs
+    starts = sorted(set(starts))
+    for i in range(len(starts)):
+        s = starts[i]
+        e = starts[i+1] if i + 1 < len(starts) else len(t)
+        piece = t[s:e].strip()
+        if piece:
+            chunks.append(piece)
+
+    # In typical Outlook: newest is on top, oldest at bottom.
+    # Our split usually yields newest first. Reverse to make oldest->newest.
+    chunks = list(reversed(chunks))
+
+    # cap each
+    return [c[:MAX_TURN_CHARS] for c in chunks]
+
+# =========================
+# SENSITIVE PATTERNS (DELETE, DO NOT REPLACE)
+# =========================
+EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b|\bwww\.[^\s<>()]+\b", re.IGNORECASE)
+DOMAIN_RE = re.compile(r"\b[a-z0-9.-]+\.(?:de|com|net|org|eu|io|co|ch|at|fr|it|es|nl|se|no|dk|pl|cz|hu|ro|sk|si|pt)\b", re.IGNORECASE)
+
+PHONE_RE = re.compile(
+    r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d"
+)
+
+MONEY_RE = re.compile(
+    r"(?i)\b(?:EUR|USD|GBP|CHF)\s*\d[\d\.\,\s]*\b|\b\d[\d\.\,\s]*\s*(?:€|EUR|USD|GBP|CHF)\b|\b€\s*\d[\d\.\,\s]*\b"
+)
+
+IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b")
+REF_RE = re.compile(
+    r"\b(?:PO|PR|NCR|Ticket|Case|Req|Request|Material|Part|VU|VU\s*\d|SP|ID|Ref|RFQ)\s*[:#]?\s*[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b",
+    re.IGNORECASE
+)
+
+# addresses (German + broad)
+STREET_RE = re.compile(
+    r"\b[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-]+(?:\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-]+){0,4}\s+"
+    r"(Straße|Strasse|Str\.|Weg|Allee|Platz|Ring|Gasse|Damm|Ufer|Chaussee|Gürtel)\b"
+    r"(?:\s+\d{1,5}[a-zA-Z]?)?",
+    re.IGNORECASE
+)
+# street-only tokens like "Schickardstraße" without number
+STREET_ONLY_RE = re.compile(r"\b[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-]{2,}(straße|strasse|weg|allee|platz|ring|gasse|damm|ufer)\b", re.IGNORECASE)
+
+# names (aggressive-ish, but scoped with heuristics below)
+TITLE_NAME_RE = re.compile(
+    r"\b(?:Mr|Mrs|Ms|Miss|Dr|Prof|Herr|Frau)\.?\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b"
+)
+FIRST_LAST_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b")
+LAST_FIRST_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{2,},\s*[A-ZÄÖÜ][a-zäöüß]{2,}\b")
+
+# greetings with names: "Hallo Timur," / "Hi John," / "Guten Morgen Max,"
+GREET_NAME_RE = re.compile(
+    r"^\s*(Hallo|Hi|Hey|Moin|Guten\s+Morgen|Guten\s+Tag|Guten\s+Abend|Dear|Hello)\s+(.{1,60}?)([,!:])\s*$",
+    re.IGNORECASE | re.MULTILINE
+)
+
+# signoffs: "VG Max" "Mit freundlichen Grüßen\nMax"
+SIGNOFF_LINE_RE = re.compile(
+    r"^\s*(VG|Lg|LG|BR|MfG|Mit\s+freundlichen\s+Grüßen|Best\s+regards|Kind\s+regards|Regards|Thanks|Thank\s+you)[\s,]*.*$",
+    re.IGNORECASE | re.MULTILINE
+)
+
+# company / supplier (heuristic)
+COMPANY_SUFFIX_RE = re.compile(r"\b[A-Z][A-Za-z0-9&\-. ]{1,80}\s+(GmbH|AG|KG|SE|Inc\.?|Ltd\.?|LLC|S\.p\.A\.|SARL|BV|NV)\b")
+SUPPLIER_CUE_RE = re.compile(r"\b(Lieferant|Supplier|Firma|Company|Unternehmen)\b\s*[:\-]?\s*([A-Za-z0-9&\-. ]{2,80})", re.IGNORECASE)
+
+# header lines to drop entirely
+HEADER_LINE_RE = re.compile(
+    r"^\s*(Von|From|An|To|Cc|CC|Bcc|BCC|Betreff|Subject|Gesendet|Sent|Date|Datum|Priorität|Priority)\s*:\s*.*$",
+    re.IGNORECASE | re.MULTILINE
+)
+
+# "mailto:" junk
+MAILTO_RE = re.compile(r"mailto\s*:\s*\S+", re.IGNORECASE)
+
+def redact_delete(text: str) -> Tuple[str, Dict[str, int]]:
+    """
+    Delete sensitive content. Returns (clean_text, stats).
+    Never inserts placeholders like [PERSON].
+    """
+    stats = {
+        "emails": 0, "phones": 0, "urls": 0, "domains": 0, "iban": 0,
+        "money": 0, "refs": 0, "addresses": 0, "names": 0, "companies": 0
     }
-  ]
-}
+
+    t = text or ""
+    t = t.replace("\r\n", "\n")
+
+    # Drop header lines
+    t = HEADER_LINE_RE.sub("", t)
+
+    # Drop obvious HTML/CSS boilerplate fragments sometimes leaking through
+    t = re.sub(r"^\s*v\\:\*.*$", "", t, flags=re.IGNORECASE | re.MULTILINE)
+    t = re.sub(r"^\s*o\\:\*.*$", "", t, flags=re.IGNORECASE | re.MULTILINE)
+    t = re.sub(r"^\s*w\\:\*.*$", "", t, flags=re.IGNORECASE | re.MULTILINE)
+    t = re.sub(r"^\s*\.shape\s*\{.*$", "", t, flags=re.IGNORECASE | re.MULTILINE)
+
+    # Remove mailto fragments
+    t, n = MAILTO_RE.subn("", t)
+    stats["urls"] += n
+
+    # Remove greeting names (keep greeting word)
+    def _greet_sub(m: re.Match) -> str:
+        # keep "Hallo ," or "Hello ,"
+        return f"{m.group(1)}{m.group(3)}"
+    t, n = GREET_NAME_RE.subn(_greet_sub, t)
+    stats["names"] += n
+
+    # URLs, emails, domains
+    t, n = URL_RE.subn("", t); stats["urls"] += n
+    t, n = EMAIL_RE.subn("", t); stats["emails"] += n
+    t, n = DOMAIN_RE.subn("", t); stats["domains"] += n
+
+    # IBAN, money, refs, phone
+    t, n = IBAN_RE.subn("", t); stats["iban"] += n
+    t, n = MONEY_RE.subn("", t); stats["money"] += n
+    t, n = REF_RE.subn("", t); stats["refs"] += n
+    t, n = PHONE_RE.subn("", t); stats["phones"] += n
+
+    # Addresses
+    t, n = STREET_RE.subn("", t); stats["addresses"] += n
+    t, n = STREET_ONLY_RE.subn("", t); stats["addresses"] += n
+
+    # Company / supplier names (heuristic)
+    t, n = COMPANY_SUFFIX_RE.subn("", t); stats["companies"] += n
+    t, n = SUPPLIER_CUE_RE.subn(lambda m: m.group(1) + ":", t); stats["companies"] += n
+
+    # Names (titles + common formats)
+    t, n = TITLE_NAME_RE.subn("", t); stats["names"] += n
+    t, n = LAST_FIRST_RE.subn("", t); stats["names"] += n
+    # First Last is risky; we apply but we will avoid nuking short technical terms by requiring lowercase pattern already
+    t, n = FIRST_LAST_RE.subn("", t); stats["names"] += n
+
+    # Strip signature tails: if a signoff appears late in the message, cut off from there
+    t = strip_signature_tail(t)
+
+    # Normalize whitespace
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = "\n".join(line.strip() for line in t.splitlines())
+    t = t.strip()
+
+    return t, stats
+
+def strip_signature_tail(text: str) -> str:
+    """
+    Cut off signature block if we detect signoff near the end.
+    Keeps content above.
+    """
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if len(lines) < 4:
+        return text.strip()
+
+    # find last signoff line
+    last_idx = None
+    for i, ln in enumerate(lines):
+        if SIGNOFF_LINE_RE.match(ln):
+            last_idx = i
+
+    if last_idx is None:
+        return text.strip()
+
+    # Only cut if signoff appears in last ~40% of lines (signature-like)
+    if last_idx < int(0.6 * len(lines)):
+        return text.strip()
+
+    return "\n".join(lines[:last_idx]).strip()
+
+# =========================
+# QUESTION / ANSWER LABELING (PER TURN)
+# =========================
+QUESTION_CUES = re.compile(
+    r"(\?|bitte|kannst\s+du|könnt\s+ihr|could\s+you|can\s+you|please\s+send|please\s+share|"
+    r"wie\s+ist|was\s+ist|wann|wo|warum|wieso|benötigen\s+wir|brauchen\s+wir|"
+    r"uns\s+bitte|bitte\s+um|request|anfrage|frage|fragen)",
+    re.IGNORECASE
+)
+
+ANSWER_CUES = re.compile(
+    r"\b(danke|anbei|im\s+Anhang|hier\s+die|hiermit|zurückmeldung|antwort|we\s+will|we\s+can|"
+    r"as\s+discussed|following|below|siehe|siehe\s+unten|wir\s+werden|wir\s+können|"
+    r"ich\s+finde|aus\s+unserer\s+sicht|vorschlag|empfehlen)\b",
+    re.IGNORECASE
+)
+
+def label_turn_heuristic(turn_text: str) -> str:
+    t = (turn_text or "").strip().lower()
+    if not t:
+        return "other"
+
+    q = len(QUESTION_CUES.findall(t))
+    a = len(ANSWER_CUES.findall(t))
+
+    # If it contains explicit questions and also a lot of answer cues, decide by ratio:
+    if q >= 2 and a == 0:
+        return "question"
+    if a >= 2 and q == 0:
+        return "answer"
+    if a > q and a >= 1:
+        return "answer"
+    if q > a and q >= 1:
+        return "question"
+    return "other"
+
+# =========================
+# ATTACHMENT TEXT EXTRACTION (OPTIONAL)
+# =========================
+def extract_text_from_attachment_file(p: Path) -> str:
+    ext = p.suffix.lower()
+    try:
+        if ext == ".txt":
+            return p.read_text(encoding="utf-8", errors="ignore")
+        if ext == ".pdf" and PdfReader is not None:
+            r = PdfReader(str(p))
+            parts = []
+            for pg in r.pages:
+                try:
+                    parts.append(pg.extract_text() or "")
+                except Exception:
+                    pass
+            return "\n".join(parts)
+        if ext == ".docx" and DocxDocument is not None:
+            doc = DocxDocument(str(p))
+            paras = [clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text)]
+            return "\n".join(paras)
+        if ext == ".xlsx" and openpyxl is not None:
+            wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+            out = []
+            for ws in wb.worksheets[:6]:
+                out.append(f"Sheet: {ws.title}")
+                max_r = min(ws.max_row or 0, 120)
+                max_c = min(ws.max_column or 0, 25)
+                for r in range(1, max_r + 1):
+                    row = []
+                    for c in range(1, max_c + 1):
+                        v = ws.cell(row=r, column=c).value
+                        row.append("" if v is None else str(v))
+                    if any(x.strip() for x in row):
+                        out.append(" | ".join(clean_ws(x) for x in row))
+            return "\n".join(out)
+    except Exception:
+        return ""
+    return ""
+
+def extract_attachments_text(mail_item) -> str:
+    """
+    Save attachments to temp, extract text if possible.
+    Skips if libs missing or save fails. Never crashes the run.
+    """
+    if not PROCESS_ATTACHMENTS:
+        return ""
+
+    try:
+        atts = mail_item.Attachments
+    except Exception:
+        return ""
+
+    collected = []
+    total = 0
+    count = 0
+
+    for i in range(1, min(atts.Count, MAX_ATTACHMENTS_PER_MAIL) + 1):
+        try:
+            att = atts.Item(i)
+            fname = getattr(att, "FileName", "") or f"attachment_{i}"
+            ext = Path(fname).suffix.lower()
+            if ext not in {".txt", ".pdf", ".docx", ".xlsx"}:
+                continue
+
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "_", fname)
+            tmp_path = ATTACH_TMP / f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}__{safe}"
+            try:
+                att.SaveAsFile(str(tmp_path))
+            except Exception:
+                continue
+
+            txt = extract_text_from_attachment_file(tmp_path)
+            txt = normalize_spaced_letters(txt)
+            txt = txt.strip()
+            if txt:
+                # redact-delete attachment text too
+                txt_red, _ = redact_delete(txt)
+                if txt_red:
+                    block = f"\n\n[Attachment: {fname}]\n{txt_red}\n"
+                    if total + len(block) > MAX_ATTACHMENT_CHARS_TOTAL:
+                        break
+                    collected.append(block)
+                    total += len(block)
+                    count += 1
+        except Exception:
+            continue
+
+    return "\n".join(collected).strip()
+
+# =========================
+# OUTLOOK .MSG PARSING (PY 3.14 SAFE)
+# =========================
+def open_msg_via_outlook(ns, msg_path: Path):
+    """
+    Works for most .msg with Outlook installed.
+    """
+    try:
+        return ns.OpenSharedItem(str(msg_path))
+    except Exception:
+        try:
+            return ns.Application.CreateItemFromTemplate(str(msg_path))
+        except Exception as e:
+            raise RuntimeError(str(e))
+
+def extract_subject_and_body(ns, msg_path: Path) -> Tuple[str, str, str]:
+    """
+    Returns: (subject, body_text, body_html)
+    """
+    item = open_msg_via_outlook(ns, msg_path)
+
+    subj = getattr(item, "Subject", "") or ""
+    html_body = getattr(item, "HTMLBody", "") or ""
+    body = getattr(item, "Body", "") or ""
+
+    # Prefer HTMLBody if it exists; it usually contains the full chain better
+    if html_body and html_body.strip():
+        text = html_to_text(html_body)
+    else:
+        text = normalize_spaced_letters(body)
+
+    # Attachments text (optional)
+    att_text = extract_attachments_text(item)
+    if att_text:
+        text = (text + "\n\n" + att_text).strip()
+
+    return subj, text, html_body
+
+# =========================
+# HTML OUTPUT
+# =========================
+def render_one_html(source_name: str, subject: str, turns: List[Tuple[str, str]], stats: Dict[str, int]) -> str:
+    """
+    turns: list of (label, sanitized_text)
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    subj_show = escape(subject.strip() or "(no subject)")
+
+    # stats table
+    stats_rows = ""
+    for k in ["emails","phones","urls","domains","iban","money","refs","addresses","names","companies"]:
+        stats_rows += f"<tr><td>{escape(k)}</td><td style='text-align:right'>{int(stats.get(k,0))}</td></tr>\n"
+
+    turn_blocks = []
+    for idx, (lbl, txt) in enumerate(turns, start=1):
+        safe_txt = escape(txt).replace("\n", "<br>\n")
+        turn_blocks.append(
+            f"<div style='margin:12px 0;padding:10px;border:1px solid #ddd;border-radius:8px;'>"
+            f"<div style='font-weight:600;margin-bottom:6px;'>Turn {idx} — {escape(lbl)}</div>"
+            f"<div style='white-space:normal;line-height:1.35'>{safe_txt or '<i>(empty after sanitization)</i>'}</div>"
+            f"</div>"
+        )
+
+    body = "\n".join(turn_blocks) if turn_blocks else "<i>(no usable body text extracted)</i>"
+
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Sanitized Mail</title>
+</head>
+<body style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;padding:16px;">
+  <div style="margin-bottom:10px;">
+    <div><b>Source:</b> {escape(source_name)}</div>
+    <div><b>Generated:</b> {escape(now)}</div>
+    <div><b>Subject:</b> {subj_show}</div>
+  </div>
+
+  <div style="margin:12px 0;">
+    <b>RedactionStats</b>
+    <table style="border-collapse:collapse;margin-top:6px;">
+      <thead>
+        <tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid #ddd;">Type</th>
+            <th style="text-align:right;padding:4px 8px;border-bottom:1px solid #ddd;">Count</th></tr>
+      </thead>
+      <tbody>
+        {stats_rows}
+      </tbody>
+    </table>
+  </div>
+
+  <hr style="margin:14px 0;">
+
+  {body}
+</body>
+</html>"""
+
+# =========================
+# MAIN PROCESS
+# =========================
+def gather_inputs() -> List[Path]:
+    base = Path(MSG_DIR)
+    if not base.exists():
+        raise SystemExit(f"MSG_DIR not found: {MSG_DIR}")
+
+    patterns = ["*.msg"]
+    if INCLUDE_HTML_FILES:
+        patterns += ["*.html", "*.htm"]
+
+    files: List[Path] = []
+    for pat in patterns:
+        if RECURSIVE:
+            files.extend(base.rglob(pat))
+        else:
+            files.extend(base.glob(pat))
+
+    files = [p for p in files if p.is_file()]
+
+    # filter out office temp files like "~$..."
+    files = [p for p in files if not p.name.startswith("~$")]
+
+    files.sort(key=lambda p: p.name.lower())
+    if MAX_FILES is not None:
+        files = files[:MAX_FILES]
+    return files
+
+def process_one_msg(ns, path: Path) -> Tuple[bool, str]:
+    """
+    Returns: (success, output_filename_or_error)
+    """
+    try:
+        subj, full_text, _html = extract_subject_and_body(ns, path)
+
+        # Cap total text
+        if len(full_text) > MAX_TOTAL_BODY_CHARS:
+            full_text = full_text[:MAX_TOTAL_BODY_CHARS]
+
+        turns_raw = split_into_turns(full_text)
+        if not turns_raw:
+            turns_raw = [full_text] if full_text.strip() else []
+
+        total_stats = {"emails":0,"phones":0,"urls":0,"domains":0,"iban":0,"money":0,"refs":0,"addresses":0,"names":0,"companies":0}
+        turns_out: List[Tuple[str, str]] = []
+
+        # sanitize subject too
+        subj_clean, subj_stats = redact_delete(subj)
+        for k,v in subj_stats.items():
+            total_stats[k] += int(v)
+
+        for turn in turns_raw:
+            t_clean, st = redact_delete(turn)
+            for k,v in st.items():
+                total_stats[k] += int(v)
+
+            lbl = label_turn_heuristic(t_clean)
+            # if empty after sanitization, still keep a placeholder in the same file (not a separate file)
+            turns_out.append((lbl, t_clean))
+
+        out_name = safe_filename(path.stem)
+        out_path = OUT_SAN / out_name
+
+        html = render_one_html(path.name, subj_clean, turns_out, total_stats)
+        out_path.write_text(html, encoding="utf-8", errors="ignore")
+
+        return True, out_name
+
+    except Exception as e:
+        log_error(f"{path.name} -> {repr(e)}")
+        return False, repr(e)
+
+def main():
+    time.sleep(STARTUP_DELAY_SEC)
+
+    inputs = gather_inputs()
+    if not inputs:
+        raise SystemExit(
+            f"No input files found.\n"
+            f"Checked: {MSG_DIR}\n"
+            f"Looking for: .msg" + (" + .html/.htm" if INCLUDE_HTML_FILES else "")
+        )
+
+    # Outlook COM session
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+    stats = {
+        "run_out_dir": str(OUT_DIR),
+        "input_dir": MSG_DIR,
+        "count_inputs": len(inputs),
+        "count_ok": 0,
+        "count_failed": 0,
+        "outputs": [],
+        "failed": [],
+        "settings": {
+            "python_version_expected": "3.14",
+            "include_html_files": INCLUDE_HTML_FILES,
+            "process_attachments": PROCESS_ATTACHMENTS,
+            "optional_libs": {
+                "beautifulsoup4": bool(BeautifulSoup),
+                "pypdf": bool(PdfReader),
+                "python_docx": bool(DocxDocument),
+                "openpyxl": bool(openpyxl),
+            },
+        },
+    }
+
+    for p in inputs:
+        ok, info = process_one_msg(ns, p)
+        if ok:
+            stats["count_ok"] += 1
+            stats["outputs"].append({"input": p.name, "output": info})
+        else:
+            stats["count_failed"] += 1
+            stats["failed"].append({"input": p.name, "error": info})
+
+    STATS_JSON.write_text(json.dumps(stats, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    print("DONE")
+    print("Run output folder:", OUT_DIR)
+    print("Sanitized HTML:", OUT_SAN)
+    print("Logs:", OUT_LOG)
+    print("OK:", stats["count_ok"], "FAILED:", stats["count_failed"])
+
+if __name__ == "__main__":
+    main()
