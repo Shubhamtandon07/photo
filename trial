@@ -1,20 +1,4 @@
-[2026-02-07 12:10:43] ERROR: AW_ 12_2_Awarding Premises Sustainability 20241206 (only for new focus VUs).msg -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:10:43] ERROR: AW_ 14082024_MBAG_Vertragstemplate Absicherungskonzept_docx.msg -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:10:43] ERROR: AW_ Acceptability of ISO-based pathway toward MB Ambition 2039.msg -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:10:43] ERROR: AW_ AMG - BR236 M177EVO_2 - RFQ _ Angebot 24-031-4-AMG .msg -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:10:43] ERROR: AW_ BR530 Miko __  03_Nachhaltigkeitsprämissen_mit KLH EMBEAM_pdf.msg -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:10:43] ERROR: AW_ MBAG Premises_ Standard awarding premises sustainability.msg -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:10:43] ERROR: AW_ Nachhaltigkeit Türmodul MB_EA-L - Abstimmung zu den Rückmeldungen Brose.msg -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:10:43] ERROR: AW_ Nachhaltigkeitsprämissenblatt VU 2-2022-00461 & 00462.msg -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:10:44] ERROR: AW_ offene Verträge -  feedback telco vom 12_11_2024.msg -> com_error(-2147352567, 'Ausnahmefehler aufgetreten.', (4096, 'Microsoft Outlook', 'Der Name Ihrer digitalen ID kann im zugrunde liegenden Sicherheitssystem nicht gefunden werden.', None, 0, -2146893792), None)
-[2026-02-07 12:10:44] ERROR: AW_ R6 - MB-EA_L_only_sustainability premises - update 2024-10-10_xlsx.msg -> com_error(-2147352567, 'Ausnahmefehler aufgetreten.', (4096, 'Microsoft Outlook', "Die Datei 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 -...' kann nicht geöffnet werden. Möglicherweise ist die Datei bereits geöffnet, oder Sie sind nicht berechtigt, die Datei zu öffnen.\n\nKlicken Sie mit der rechten Maustaste auf den Dateiordner, und klicken Sie dann auf 'Eigenschaften', um Ihre Berechtigungen zu überprüfen.", None, 0, -2147287008), None)
-[2026-02-07 12:10:44] ERROR: AW_ V530 Update _ Nachhaltigkeitsprämissen__28d64057.html -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:10:44] ERROR: AW_ WG_ AW_ Ambition Letter and RSS - Knowit Connectivity AB.msg -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:10:45] ERROR: sustainability_premises_V202302-1-S-IND_Conti_pdf.msg -> com_error(-2147352567, 'Ausnahmefehler aufgetreten.', (4096, 'Microsoft Outlook', "Die Datei 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 -...' kann nicht geöffnet werden. Möglicherweise ist die Datei bereits geöffnet, oder Sie sind nicht berechtigt, die Datei zu öffnen.\n\nKlicken Sie mit der rechten Maustaste auf den Dateiordner, und klicken Sie dann auf 'Eigenschaften', um Ihre Berechtigungen zu überprüfen.", None, 0, -2147287008), None)
-[2026-02-07 12:10:45] ERROR: sustainability_premises_V202302-1-S-IND_Conti_pdf__58a782aa.html -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:10:48] ERROR: WG_ Bitte um Zusendung des Nachhaltigkeitsprämissenblatt.msg -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:10:48] ERROR: WG_ DRINGEND! Angebotseingang_ VU 2-2022-01179 - Fa_ Inalfa.msg -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:10:55] ERROR: WG_ Nachhaltigkeitsprämissen Martinrea und Voest Welle 12 MMA ZB Komplex.msg -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:10:55] ERROR: WG_ Nachhaltigkeitsprämissen MB_EA-L_  (für CDCC und Zone).msg -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:10:56] ERROR: WG_ Prüfung Nachhaltigkeitsdokumente V530 Vergabe__e1213ba1.html -> FileNotFoundError(2, 'No such file or directory')
-[2026-02-07 12:11:05] ERROR: WG_ VU 2-2025-02854_ E-motor modular platform EDU - Prüfung der Nachhaltigkeits-Rückmeldungen.msg -> FileNotFoundError(2, 'No such file or directory')
+Goal: Reduce manual effort for repetitive sustainability / procurement email replies while keeping strict control over confidentiality and correctness.
+
+What it does (in 1 sentence):
+Reads an incoming email + relevant internal reference documents, then creates a draft reply in Outlook that the user reviews and sends.
