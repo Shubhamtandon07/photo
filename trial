@@ -1,2 +1,5 @@
-k = os.getenv("OPENAI_API_KEY")
-print("OPENAI_API_KEY present:", bool(k), "len:", len(k) if k else 0)
+Loading KB from: C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data
+KB loaded (chunks): 48
+Mailbox=shubham.tandon@mercedes-benz.com | Folder=Inbox
+Mail error: bot - Error code: 401 - {'message': 'Unauthorized'}
+Done. Checked=201, Drafted=0
