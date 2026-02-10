@@ -1,24 +1,35 @@
-import os
-from openai import AzureOpenAI
+endpoint: https://genai-nexus.api.corpinter.net/apikey/
+deployment: gpt-4o
+Cell In[19], line 19
+     16 print("endpoint:", AZURE_OPENAI_ENDPOINT)
+     17 print("deployment:", AZURE_DEPLOYMENT_NAME)
+---> 19 resp = client.chat.completions.create(
+     20     model=AZURE_DEPLOYMENT_NAME,
+     21     messages=[{"role":"user","content":"ping"}],
+     22     temperature=0,
+     23 )
+     24 print(resp.choices[0].message.content)
 
-AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net/apikey/"  # your current
-AZURE_API_VERSION = "2024-06-01"
-AZURE_DEPLOYMENT_NAME = "gpt-4o"
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\openai\_utils\_utils.py:286, in required_args.<locals>.inner.<locals>.wrapper(*args, **kwargs)
+    284             msg = f"Missing required argument: {quote(missing[0])}"
+    285     raise TypeError(msg)
+--> 286 return func(*args, **kwargs)
 
-key = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\openai\resources\chat\completions\completions.py:1156, in Completions.create(self, messages, model, audio, frequency_penalty, function_call, functions, logit_bias, logprobs, max_completion_tokens, max_tokens, metadata, modalities, n, parallel_tool_calls, prediction, presence_penalty, prompt_cache_key, reasoning_effort, response_format, safety_identifier, seed, service_tier, stop, store, stream, stream_options, temperature, tool_choice, tools, top_logprobs, top_p, user, verbosity, web_search_options, extra_headers, extra_query, extra_body, timeout)
+   1110 @required_args(["messages", "model"], ["messages", "model", "stream"])
+   1111 def create(
+   1112     self,
+   (...)   1153     timeout: float | httpx.Timeout | None | NotGiven = not_given,
+   1154 ) -> ChatCompletion | Stream[ChatCompletionChunk]:
+   1155     validate_response_format(response_format)
+-> 1156     return self._post(
+...
+-> 1047         raise self._make_status_error_from_response(err.response) from None
+   1049     break
+   1051 assert response is not None, "could not resolve response (should never happen)"
 
-client = AzureOpenAI(
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_version=AZURE_API_VERSION,
-    api_key=key,
-)
+AuthenticationError: Error code: 401 - {'message': 'Unauthorized'}
+Output is truncated. View as a scrollable element or open in a text editor. Adjust cell output settings...
 
-print("endpoint:", AZURE_OPENAI_ENDPOINT)
-print("deployment:", AZURE_DEPLOYMENT_NAME)
 
-resp = client.chat.completions.create(
-    model=AZURE_DEPLOYMENT_NAME,
-    messages=[{"role":"user","content":"ping"}],
-    temperature=0,
-)
-print(resp.choices[0].message.content)
+
