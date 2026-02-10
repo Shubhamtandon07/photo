@@ -1,15 +1,5 @@
-=== CONFIG CHECK ===
-OPENAI_API_KEY present: True len: 36
-Azure API version: 2024-06-01
-Deployment name: gpt-4o
-Endpoint: https://genai-nexus.api.corpinter.net/apikey/
-====================
-Loading KB from: C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data
-KB loaded: 12 documents
-Mailbox=shubham.tandon@mercedes-benz.com | Folder=Inbox
-Mail error: bot - Error code: 401 - {'message': 'Unauthorized'}
-Mail error: bot - Error code: 401 - {'message': 'Unauthorized'}
-Mail error: bot - Error code: 401 - {'message': 'Unauthorized'}
-Mail error: bot - Error code: 401 - {'message': 'Unauthorized'}
-Mail error: bot - Error code: 401 - {'message': 'Unauthorized'}
-Done. Checked=201, Drafted=0
+import sys, openai, os
+print("python:", sys.version)
+print("exe:", sys.executable)
+print("openai version:", getattr(openai, "__version__", "unknown"))
+print("key present:", bool(os.getenv("OPENAI_API_KEY")), "len:", len(os.getenv("OPENAI_API_KEY") or ""))
