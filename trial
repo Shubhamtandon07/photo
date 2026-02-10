@@ -1,582 +1,523 @@
 # -*- coding: utf-8 -*-
-"""
-Outlook -> Azure OpenAI (genai-nexus) -> Draft reply (RUN ONCE) + Self notification
-
-This is your main "draft reply" bot code, with ONE change:
-- Azure endpoint changed to base endpoint (no /apikey/): https://genai-nexus.api.corpinter.net/
-
-Everything else is kept aligned with your earlier working flow:
-- Strict subject gate: ONLY subject == "bot" (case-insensitive)
-- Uses local KB folder
-- Draft reply (AUTO_SEND=False by default)
-- Adds greeting/signature
-- Redacts sensitive info before sending to AOAI and again on output
-- Paragraphs + => bullets encouraged via prompt
-"""
+# KI Risiko – Präziser Scraper (Top-3 pro Seite)
+# ------------------------------------------------
+# Liest:
+#   C:\Users\SHTANDO\Desktop\KI Risko\Textdoks_für_Einstellungen_der_Suche\
+#       Einstellungen_Analyse.csv
+#       Bekannte_Seiten.csv
+#       Schlagwörter.csv
+#
+# Schreibt:
+#   C:\Users\SHTANDO\Desktop\KI Risko\gescrapte_Artikel-Links\
+#       gescrapte_links_<rohst>.csv
+#
+# Logik:
+#   - Für jede bekannte Seite (Domain) mehrere Risiko-Suchanfragen auf DuckDuckGo
+#   - Pro Seite max. 3 sehr relevante Artikel (HR / Umwelt)
+#   - Datum >= max_datum (falls erkennbar)
+#   - Vor-Filter: Risiko-Schlagwörter im Titel/Snippet
+#   - GPT-Filter: strikt 0/1 relevant
+# ------------------------------------------------
 
 import os
-import re
+import csv
 import time
 from pathlib import Path
-from typing import List, Tuple, Optional
+from datetime import datetime
 
-import win32com.client as win32
-from openai import AzureOpenAI
-from docx import Document as DocxDocument
-from pypdf import PdfReader
-from dotenv import load_dotenv
+import dateparser
+from bs4 import BeautifulSoup
 
-load_dotenv()
+import openai
 
-# =========================
-# EDIT THESE
-# =========================
-TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"   # Outlook store DisplayName substring match
-WATCH_FOLDER_NAME = "Inbox"                           # "Inbox" or subfolder under Inbox
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
+from urllib.parse import quote_plus
 
-STRICT_SUBJECT = "bot"        # subject must be EXACTLY this (case-insensitive)
 
-REQUIRE_UNREAD = True
-AUTO_SEND = False             # Draft only
-PROCESS_PER_RUN = 3
-SCAN_LIMIT = 200
-STARTUP_DELAY_SEC = 3
+# =========================================================
+# 1) Pfade / Konfiguration
+# =========================================================
 
-ALLOWED_SENDERS = set()       # empty = allow anyone
+PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
 
-# Azure OpenAI (corporate) settings
-# IMPORTANT CHANGE: base endpoint ONLY (no /apikey/)
-AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net/"
-AZURE_API_VERSION = "2024-06-01"
-AZURE_DEPLOYMENT_NAME = "gpt-4o"   # MUST be your deployment name
+SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
+SCRAPED_DIR  = PROJECT_ROOT / "gescrapte_Artikel-Links"
+SCRAPED_DIR.mkdir(parents=True, exist_ok=True)
 
-# Notify yourself after draft created
-SELF_NOTIFY = True
-SELF_NOTIFY_TO = TARGET_MAILBOX
-# =========================
+EINSTELLUNGEN_CSV = SETTINGS_DIR / "Einstellungen_Analyse.csv"
+BEKANNTE_SEITEN_CSV = SETTINGS_DIR / "Bekannte_Seiten.csv"
+SCHLAGWORT_CSV = SETTINGS_DIR / "Schlagwörter.csv"
 
-PROCESSED_CATEGORY = "AI-Drafted"
-MAX_FILES = 6
-MAX_CHARS_PER_FILE = 4000
-MAX_TOTAL_CHARS = 12000
-SUPPORTED_EXTS = {".txt", ".docx", ".pdf"}
+# pro Seite max. X Artikel
+MAX_ARTICLES_PER_SITE = 3
 
-SPECIAL_QA_DOC_NAME = "2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx"
+# max. DuckDuckGo-Seiten pro Query
+MAX_DDG_PAGES = 2
 
-# -------------------------
-# Redaction configuration
-# -------------------------
-REDACT_COMPANY_TERMS = [
-    "Mercedes-Benz",
-    "Mercedes Benz",
-    "Mercedes",
-    "Daimler",
-    "corpinter",
-    "Catena-X",
-    "Catena X",
+# Browser headless oder sichtbar?
+HEADLESS = False
+
+# Risiko-Schlagwörter (zusätzlich zu deinen aus Schlagwörter.csv)
+RISK_TERMS_BASE = [
+    "human rights",
+    "violation",
+    "abuse",
+    "forced labour",
+    "forced labor",
+    "child labour",
+    "child labor",
+    "pollution",
+    "environmental damage",
+    "contamination",
+    "toxic waste",
+    "spill",
+    "deforestation",
+    "protest",
+    "conflict",
+    "strike",
 ]
 
-REDACT_PATTERNS = [
-    # Email addresses -> remove
-    (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", ""),
 
-    # URLs -> remove
-    (r"\bhttps?://[^\s<>()]+\b", ""),
-    (r"\bwww\.[^\s<>()]+\b", ""),
+# =========================================================
+# 2) OpenAI Client
+# =========================================================
 
-    # Phone numbers -> remove (broad)
-    (r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d", ""),
-
-    # IDs / references -> neutral text (requires at least one digit)
-    (r"\b(?:PO|PR|NCR|Ticket|Case|Req|Request|Material|Part)\s*[:#]?\s*[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b",
-     "the relevant reference"),
-
-    # Money / amounts -> replace with neutral phrase
-    (r"(?i)\b(?:EUR|USD|GBP|CHF)\s*\d[\d\.\,\s]*\b", "an amount"),
-    (r"\b\d[\d\.\,\s]*\s*(?:€|EUR|USD|GBP|CHF)\b", "an amount"),
-    (r"\b€\s*\d[\d\.\,\s]*\b", "an amount"),
-]
-
-AGGRESSIVE_NAME_REDACTION = False
-NAME_LIKE_PATTERN = r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b"
+client = openai.AzureOpenAI(
+    api_version="2024-06-01",
+    azure_endpoint="https://genai-nexus.api.corpinter.net/apikey/",
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
 
 
-def clean_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
+# =========================================================
+# 3) Einstellungen lesen
+# =========================================================
+
+rohst = rawm = max_datum_str = None
+seitenumfang = 3
+scraperpfad = None
+
+def lese_einstellungen():
+    global rohst, rawm, max_datum_str, seitenumfang, scraperpfad
+
+    if not EINSTELLUNGEN_CSV.exists():
+        raise FileNotFoundError(f"Einstellungsdatei nicht gefunden: {EINSTELLUNGEN_CSV}")
+
+    with EINSTELLUNGEN_CSV.open("r", encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.reader(f, delimiter=","))
+
+    def get_row(idx, default=""):
+        if len(rows) > idx and len(rows[idx]) > 0:
+            return rows[idx][0].strip()
+        return default
+
+    rohst         = get_row(5, "Stahl")
+    rawm          = get_row(8, "Steel")
+    max_datum_str = get_row(11, "20.11.2020")
+    seitenumfang  = int(get_row(14, "3") or "3")
+    scraperpfad   = get_row(17, "")
+
+    print("SETTINGS:")
+    print(f"  rohst        = {rohst}")
+    print(f"  rawm         = {rawm}")
+    print(f"  max_datum    = {max_datum_str}")
+    print(f"  seitenumfang = {seitenumfang}")
+    print(f"  scraperpfad  = {scraperpfad or '(auto)'}")
+
+    # Datum parsen (deutsch)
+    max_date = dateparser.parse(max_datum_str, languages=["de"])
+    if not max_date:
+        # Fallback: alles zulassen
+        return None
+    return max_date.date()
 
 
-def is_strict_subject(subject: str) -> bool:
-    """Only allow subject exactly == STRICT_SUBJECT (case-insensitive). Rejects RE:/AW: etc."""
-    s = (subject or "").strip()
-    return s.casefold() == STRICT_SUBJECT.casefold()
+# =========================================================
+# 4) Listen einlesen (Seiten & Schlagwörter)
+# =========================================================
+
+def lese_einfache_liste(pfad: Path, delimiter=",") -> list[str]:
+    if not pfad.exists():
+        print(f"⚠️ Datei nicht gefunden: {pfad} → leere Liste")
+        return []
+    werte: list[str] = []
+    with pfad.open("r", encoding="utf-8-sig", newline="") as f:
+        r = csv.reader(f, delimiter=delimiter)
+        for row in r:
+            for cell in row:
+                val = cell.strip()
+                if val:
+                    werte.append(val)
+    # Duplikate entfernen, Reihenfolge beibehalten
+    seen = set()
+    uniq = []
+    for v in werte:
+        if v not in seen:
+            seen.add(v)
+            uniq.append(v)
+    return uniq
 
 
-def first_name_from_email(email: str) -> str:
-    """Extract first name from email like 'rahul.singh@...' -> 'Rahul'. Fallback: 'there'."""
-    e = (email or "").strip().lower()
-    if "@" not in e:
-        return "there"
-    local = e.split("@", 1)[0]
-    first = local.split(".", 1)[0].strip()
-    if not first:
-        return "there"
-    return first[:1].upper() + first[1:]
+# =========================================================
+# 5) Selenium Driver
+# =========================================================
+
+def make_driver() -> webdriver.Chrome:
+    opts = Options()
+    if HEADLESS:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--enable-javascript")
+    opts.add_argument("--start-maximized")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+
+    driver = webdriver.Chrome(options=opts)
+    return driver
 
 
-def redact_sensitive(text: str) -> str:
-    """Redact/neutralize sensitive content. Used for subject/body/snippets AND final answer."""
-    if not text:
-        return ""
+# =========================================================
+# 6) DuckDuckGo Suchanfragen bauen
+# =========================================================
 
-    t = text
+def build_queries_for_site(domain: str, rawm: str, schlagwoerter: list[str]) -> list[str]:
+    """
+    Für eine Domain mehrere Queries bauen.
+    - Wir benutzen KEINE Anführungszeichen und KEIN OR,
+      um 'Filter löschen' zu vermeiden.
+    - Schlagwörter-Zeilen mit + werden zu Leerzeichen umgewandelt.
+    """
+    base_terms = [rawm, "mining"]
+    queries: list[str] = []
 
-    for term in REDACT_COMPANY_TERMS:
-        if term:
-            t = re.sub(re.escape(term), "", t, flags=re.IGNORECASE)
+    # 1) Basisrisiko-Query (nur rawm + risk terms)
+    base_query_terms = base_terms + RISK_TERMS_BASE
+    q1 = "site:www." + domain + " " + " ".join(base_query_terms)
+    queries.append(q1)
 
-    for pat, repl in REDACT_PATTERNS:
-        t = re.sub(pat, repl, t)
+    # 2) Noch eine Basisvariante ohne "mining"
+    base_query_terms2 = [rawm] + RISK_TERMS_BASE
+    q2 = "site:www." + domain + " " + " ".join(base_query_terms2)
+    queries.append(q2)
 
-    if AGGRESSIVE_NAME_REDACTION:
-        t = re.sub(NAME_LIKE_PATTERN, "", t)
+    # 3) ein paar Schlagwort-Kombis hinzunehmen (z.B. die ersten 3)
+    for sw in schlagwoerter[:3]:
+        sw_clean = sw.replace("+", " ")
+        q_sw = "site:www." + domain + " " + rawm + " " + sw_clean
+        queries.append(q_sw)
 
-    t = re.sub(r"\s+", " ", t).strip()
-    t = re.sub(r"\s+([,.;:])", r"\1", t)
-    t = re.sub(r"([,.;:]){2,}", r"\1", t)
-    t = re.sub(r"\(\s*\)", "", t)
-
-    return t.strip()
-
-
-def strip_redaction_tokens(text: str) -> str:
-    """Safety: remove any leftover [REDACTED_*] markers if they appear."""
-    if not text:
-        return ""
-    t = re.sub(r"\[REDACTED_[A-Z_]+\]", "", text)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-
-# ---------- Azure OpenAI client ----------
-def build_azure_client() -> AzureOpenAI:
-    key = (os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
-    if not key:
-        raise SystemExit("Missing AZURE_OPENAI_API_KEY (or OPENAI_API_KEY) env var.")
-    return AzureOpenAI(
-        api_version=AZURE_API_VERSION,
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        api_key=key,
-    )
+    return queries
 
 
-# ---------- KB readers ----------
-def read_txt(p: Path) -> str:
-    return p.read_text(encoding="utf-8", errors="ignore")
+def ddg_search_url(query: str) -> str:
+    return "https://duckduckgo.com/?q=" + quote_plus(query) + "&kp=1&ia=web"
 
 
-def extract_docx_tables_as_text(doc: DocxDocument) -> str:
-    out = []
-    for table in doc.tables:
-        for row in table.rows:
-            cells = [clean_ws(c.text) for c in row.cells]
-            if any(cells):
-                out.append(" | ".join(cells))
-    return "\n".join(out)
+# =========================================================
+# 7) DuckDuckGo Resultate scrapen
+# =========================================================
 
+def scrape_ddg_results(driver: webdriver.Chrome, search_url: str, max_pages: int) -> list[dict]:
+    """
+    Scrape DuckDuckGo Resultatskarten für eine Such-URL.
+    Gibt Liste von Dicts zurück: {url, title, snippet, date_txt}
+    """
+    items: list[dict] = []
 
-def find_col_index(headers: List[str], target: str) -> Optional[int]:
-    target_norm = re.sub(r"\s+", "", target).lower()
-    for i, h in enumerate(headers):
-        hn = re.sub(r"\s+", "", (h or "")).lower()
-        if hn == target_norm:
-            return i
-    return None
+    try:
+        driver.get(search_url)
+    except Exception as e:
+        print(f"❌ Konnte Suchseite nicht laden: {e}")
+        return items
 
+    pages_seen = 0
 
-def read_special_qa_docx(p: Path) -> str:
-    doc = DocxDocument(str(p))
-    qa_lines = []
-
-    for table in doc.tables:
-        if not table.rows:
-            continue
-
-        header_cells = [clean_ws(c.text) for c in table.rows[0].cells]
-        if not any(header_cells):
-            continue
-
-        q_idx = find_col_index(header_cells, "Fragen")
-        a_idx = (
-            find_col_index(header_cells, "Antwort/ Erklärung")
-            or find_col_index(header_cells, "Antwort/Erklärung")
-            or find_col_index(header_cells, "Antwort")
-            or find_col_index(header_cells, "Erklärung")
-        )
-
-        if q_idx is None or a_idx is None:
-            continue
-
-        for row in table.rows[1:]:
-            cells = [clean_ws(c.text) for c in row.cells]
-            if q_idx >= len(cells) or a_idx >= len(cells):
-                continue
-            q = clean_ws(cells[q_idx])
-            a = clean_ws(cells[a_idx])
-            if not q and not a:
-                continue
-            if q and a:
-                qa_lines.append(f"Q: {q}\nA: {a}")
-            elif q and not a:
-                qa_lines.append(f"Q: {q}\nA: (no answer provided)")
-            elif a and not q:
-                qa_lines.append(f"Q: (missing question)\nA: {a}")
-
-    if not qa_lines:
-        paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
-        tables = extract_docx_tables_as_text(doc)
-        return clean_ws(paras + "\n" + tables)
-
-    return "\n\n".join(qa_lines)
-
-
-def read_docx(p: Path) -> str:
-    if p.name.strip().lower() == SPECIAL_QA_DOC_NAME.strip().lower():
-        return read_special_qa_docx(p)
-
-    doc = DocxDocument(str(p))
-    paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
-    tables = extract_docx_tables_as_text(doc)
-    return clean_ws(paras + "\n" + tables)
-
-
-def read_pdf(p: Path) -> str:
-    out = []
-    r = PdfReader(str(p))
-    for pg in r.pages:
+    while pages_seen < max_pages:
         try:
-            out.append(pg.extract_text() or "")
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_all_elements_located(
+                    (By.CSS_SELECTOR, 'article[data-testid="result"]')
+                )
+            )
         except Exception:
-            pass
-    return "\n".join(out)
+            html = driver.page_source
+            soup = BeautifulSoup(html, "html.parser")
+            txt = soup.get_text(" ", strip=True)
+            if "Keine Ergebnisse" in txt or "No results" in txt:
+                print("   → DuckDuckGo: keine Ergebnisse.")
+                break
+            else:
+                print("   → DuckDuckGo: Resultate nicht stabil erkennbar.")
+                break
 
+        articles = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="result"]')
+        for art in articles:
+            # Link & Titel
+            link_el = None
+            try:
+                link_el = art.find_element(By.CSS_SELECTOR, "a[data-testid='result-title-a']")
+            except Exception:
+                try:
+                    link_el = art.find_element(By.CSS_SELECTOR, "a.Rn_JXVtoPVAFyGkcaXyK")
+                except Exception:
+                    continue
 
-def load_kb(dirpath: str) -> List[Tuple[str, str]]:
-    base = Path(dirpath)
-    if not base.exists() or not base.is_dir():
-        raise SystemExit(f"KB_DIR not found or not a folder: {dirpath}")
-
-    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
-    if not files:
-        raise SystemExit(f"No .txt/.docx/.pdf found in: {dirpath}")
-
-    out: List[Tuple[str, str]] = []
-    for p in sorted(files):
-        try:
-            ext = p.suffix.lower()
-            txt = read_txt(p) if ext == ".txt" else (read_docx(p) if ext == ".docx" else read_pdf(p))
-            txt = clean_ws(txt)
-            if txt:
-                out.append((p.name, txt[:MAX_CHARS_PER_FILE]))
-        except Exception as e:
-            print("Skip KB file:", p.name, "-", e)
-
-    if not out:
-        raise SystemExit("Docs found, but no extractable text. Use text PDFs or .txt/.docx.")
-    return out
-
-
-# ---------- simple retrieval ----------
-def pick_relevant(files: List[Tuple[str, str]], subject: str, body_text: str) -> List[Tuple[str, str]]:
-    q = (subject + " " + body_text).lower()
-    scores = []
-    for name, text in files:
-        score = 0
-        for token in re.split(r"[^a-z0-9]+", Path(name).stem.lower()):
-            if token and token in q:
-                score += 6
-        for token in set(re.split(r"[^a-z0-9]+", q)):
-            if token and token in text.lower():
-                score += 1
-        scores.append((score, name, text))
-
-    scores.sort(reverse=True)
-    picked = [(n, t) for s, n, t in scores[:MAX_FILES]]
-
-    total = 0
-    cut: List[Tuple[str, str]] = []
-    for n, t in picked:
-        if total + len(t) > MAX_TOTAL_CHARS:
-            cut.append((n, t[: max(0, MAX_TOTAL_CHARS - total)]))
-            break
-        cut.append((n, t))
-        total += len(t)
-    return cut
-
-
-# ---------- prompt ----------
-def make_prompt(snips: List[Tuple[str, str]], subject: str, email_text: str) -> str:
-    redacted_subject = redact_sensitive(subject)
-    redacted_email_text = redact_sensitive(email_text)
-
-    redacted_snips = [(n, redact_sensitive(t)) for n, t in snips]
-    block = "\n\n---\n\n".join([f"[{n}]\n{t}" for n, t in redacted_snips]) if redacted_snips else "(no snippets)"
-
-    return f"""You MUST answer using ONLY the SNIPPETS below.
-
-Rules:
-- Use only the snippets as grounding. Do not invent facts.
-- If snippets are insufficient for a complete answer, write what you can supported by snippets,
-  then ask 1–2 short clarifying questions.
-- Keep it professional and concise (max ~160 words).
-- Use paragraphs (blank line) when the topic changes.
-- If there are multiple steps/items, use bullet points prefixed exactly with "=> ".
-- Do NOT include personal data, email addresses, phone numbers, company/supplier names, IDs, or money amounts.
-- Paraphrase; do not copy long phrases from snippets.
-
-Return ONLY the email body text.
-
-SNIPPETS:
-{block}
-
-EMAIL SUBJECT:
-{redacted_subject}
-
-EMAIL QUESTION (plain text):
-{redacted_email_text}
-"""
-
-
-def call_azure_openai(client: AzureOpenAI, prompt: str) -> str:
-    r = client.chat.completions.create(
-        model=AZURE_DEPLOYMENT_NAME,
-        temperature=0.1,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Use only snippets. Do not invent facts. "
-                    "Format as a ready-to-send email body with paragraphs and => bullets if needed. "
-                    "Never include personal data, emails, phone numbers, company/supplier names, IDs, or money amounts."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-    )
-    return r.choices[0].message.content or ""
-
-
-# ---------- Outlook helpers ----------
-def clean_html_to_text(html: str) -> str:
-    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
-    return clean_ws(txt)
-
-
-def get_sender_smtp(mail) -> str:
-    try:
-        addr = (mail.SenderEmailAddress or "").lower()
-        if addr.startswith("/o="):
-            ex = mail.Sender.GetExchangeUser()
-            if ex:
-                return (ex.PrimarySmtpAddress or "").lower()
-        return addr
-    except Exception:
-        return (mail.SenderEmailAddress or "").lower()
-
-
-def add_processed_category(mail):
-    try:
-        cats = mail.Categories or ""
-        if PROCESSED_CATEGORY.lower() not in cats.lower():
-            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
-            mail.Save()
-    except Exception:
-        pass
-
-
-def get_target_folder():
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-
-    target_store = None
-    for st in ns.Stores:
-        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
-            target_store = st
-            break
-
-    if not target_store:
-        print("Available stores (use one of these in TARGET_MAILBOX):")
-        for st in ns.Stores:
-            print(" -", st.DisplayName)
-        raise SystemExit("Target mailbox not found.")
-
-    inbox = target_store.GetDefaultFolder(6)  # Inbox
-
-    if WATCH_FOLDER_NAME.lower() == "inbox":
-        return inbox, target_store.DisplayName, "Inbox"
-
-    for f in inbox.Folders:
-        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
-            return f, target_store.DisplayName, f.Name
-
-    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
-
-
-# ---------- Self notification ----------
-def get_account_for_mailbox(ns, mailbox_substring: str):
-    try:
-        for acc in ns.Session.Accounts:
-            smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
-            if mailbox_substring.lower() in smtp or smtp in mailbox_substring.lower():
-                return acc
-    except Exception:
-        pass
-    return None
-
-
-def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
-    requester_name = first_name_from_email(requester_email)
-
-    msg = ns.Application.CreateItem(0)  # MailItem
-    msg.To = to_addr
-    msg.Subject = f"Draft created (review needed): {orig_subject}"
-    msg.HTMLBody = (
-        f"<p>A draft reply has been created.</p>"
-        f"<ul>"
-        f"<li><b>Original subject:</b> {orig_subject}</li>"
-        f"<li><b>Requester:</b> {requester_email}</li>"
-        f"</ul>"
-        f"<p>Please review the draft before sending it to <b>{requester_name}</b>.</p>"
-    )
-
-    acc = get_account_for_mailbox(ns, from_mailbox)
-    if acc:
-        try:
-            msg.SendUsingAccount = acc
-        except Exception:
-            pass
-
-    msg.Send()
-
-
-def html_escape(s: str) -> str:
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-# =========================
-# MAIN (RUN ONCE)
-# =========================
-def main():
-    time.sleep(STARTUP_DELAY_SEC)
-
-    print("=== CONFIG CHECK ===")
-    k = (os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
-    print("OPENAI/AZURE key present:", bool(k), "len:", len(k) if k else 0)
-    print("Azure API version:", AZURE_API_VERSION)
-    print("Deployment name:", AZURE_DEPLOYMENT_NAME)
-    print("Endpoint base:", AZURE_OPENAI_ENDPOINT)
-    print("====================")
-
-    print("Loading KB from:", KB_DIR)
-    kb_files = load_kb(KB_DIR)
-    print("KB loaded:", len(kb_files), "documents")
-
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-    folder, store_name, folder_name = get_target_folder()
-    print(f"Mailbox={store_name} | Folder={folder_name}")
-
-    client = build_azure_client()
-    allowed = {a.lower() for a in ALLOWED_SENDERS}
-
-    items = folder.Items
-    items.Sort("[ReceivedTime]", True)
-
-    drafted = 0
-    checked = 0
-
-    your_first_name = first_name_from_email(TARGET_MAILBOX)
-
-    for mail in items:
-        checked += 1
-        if checked > SCAN_LIMIT:
-            break
-        if drafted >= PROCESS_PER_RUN:
-            break
-
-        try:
-            if getattr(mail, "Class", None) != 43:
+            url = link_el.get_attribute("href") or ""
+            title = link_el.text.strip()
+            if not url or "duckduckgo.com" in url:
                 continue
 
-            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
-                continue
+            # Snippet
+            snippet = ""
+            try:
+                sn_el = art.find_element(By.CSS_SELECTOR, "div[data-testid='result-snippet']")
+                snippet = sn_el.text.strip()
+            except Exception:
+                pass
 
-            if REQUIRE_UNREAD and not mail.UnRead:
-                continue
+            # Datum (falls vorhanden)
+            date_txt = ""
+            try:
+                date_el = art.find_element(By.CSS_SELECTOR, "span.MILR5XIVy9h75WrLvKiq")
+                date_txt = date_el.text.strip()
+            except Exception:
+                pass
 
-            sender = get_sender_smtp(mail)
-            if allowed and sender not in allowed:
-                continue
-
-            subject = mail.Subject or ""
-
-            # STRICT subject gating: ONLY "bot" (case-insensitive), no "RE:" / "AW:"
-            if not is_strict_subject(subject):
-                continue
-
-            body_text = clean_html_to_text(mail.HTMLBody or "")
-
-            # Retrieve locally using original text
-            snips = pick_relevant(kb_files, subject, body_text)
-
-            prompt = make_prompt(snips, subject, body_text)
-            answer = call_azure_openai(client, prompt)
-
-            # Ensure output contains no sensitive remnants
-            answer = redact_sensitive(answer)
-            answer = strip_redaction_tokens(answer)
-
-            # Add greeting + signature
-            sender_first = first_name_from_email(sender)
-            final_body = (
-                f"Hello {sender_first},\n\n"
-                f"{answer}\n\n"
-                f"Best regards,\n"
-                f"{your_first_name}"
+            items.append(
+                {
+                    "url": url,
+                    "title": title,
+                    "snippet": snippet,
+                    "date_txt": date_txt,
+                }
             )
 
-            # Draft reply with line breaks preserved
-            reply = mail.Reply()
-            html_body = "<br>".join(html_escape(line) for line in final_body.split("\n"))
-            reply.HTMLBody = f"<p>{html_body}</p><hr>" + reply.HTMLBody
+        # "Mehr Ergebnisse"?
+        try:
+            more_btn = WebDriverWait(driver, 3).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "#more-results"))
+            )
+            driver.execute_script("arguments[0].scrollIntoView(true);", more_btn)
+            time.sleep(1)
+            more_btn.click()
+            pages_seen += 1
+            time.sleep(1)
+        except Exception:
+            break
 
-            if AUTO_SEND:
-                reply.Send()
-                print("Sent:", subject)
-            else:
-                reply.Save()
-                print("Draft created:", subject)
+    return items
 
-                if SELF_NOTIFY:
-                    try:
-                        send_self_notification(
-                            ns=ns,
-                            from_mailbox=TARGET_MAILBOX,
-                            to_addr=SELF_NOTIFY_TO,
-                            orig_subject=subject,
-                            requester_email=sender,
-                        )
-                        print("Self-notification sent for:", subject)
-                    except Exception as e:
-                        print("Self-notification error:", e)
 
-            add_processed_category(mail)
-            drafted += 1
+# =========================================================
+# 8) Vorfilter: lokale Risiko-Schlagwörter
+# =========================================================
 
-        except Exception as e:
-            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", e)
+def contains_risk_terms(text: str, extra_terms: list[str]) -> bool:
+    """
+    Prüft, ob einer der Risiko-Begriffe im Text vorkommt.
+    extra_terms: aus Schlagwörter.csv (mit + schon bereinigt).
+    """
+    text_lower = text.lower()
+    for kw in RISK_TERMS_BASE:
+        if kw.lower() in text_lower:
+            return True
+    for sw in extra_terms:
+        if not sw:
+            continue
+        sw_clean = sw.replace("+", " ").lower()
+        # split in Wörter, prüfe eines davon
+        for w in sw_clean.split():
+            if w and w in text_lower:
+                return True
+    return False
 
-    print(f"Done. Checked={checked}, Drafted={drafted}")
 
+# =========================================================
+# 9) GPT-basierte Klassifikation
+# =========================================================
+
+def gpt_link_relevance(rohstoff: str, url: str, title: str, snippet: str) -> str:
+    """
+    GPT-Filter:
+      - 1 = Artikel ist direkt zu HR/Umwelt-Konflikten beim Rohstoff
+      - 0 = irrelevant
+    """
+    text_for_model = f"URL: {url}\nTitle: {title}\nSnippet: {snippet}"
+
+    prompt = f"""
+Du bist Menschenrechts- und Nachhaltigkeitsexperte.
+
+Entscheide, ob dieser Artikel direkt von konfliktbehafteten Nachhaltigkeits-Themen
+bezüglich Umwelt oder Menschenrecht handelt, die im Zusammenhang mit der Gewinnung
+oder Weiterverarbeitung des Rohstoffs "{rohstoff}" stehen.
+
+Relevant (1) sind nur Artikel mit klaren negativen Vorkommnissen für Menschen
+und/oder Umwelt, z.B.:
+- Kinderarbeit, Zwangsarbeit, moderne Sklaverei
+- gefährliche Arbeitsbedingungen, schwere Arbeitsunfälle
+- Landkonflikte, Vertreibungen, Gewalt gegen Communities
+- Umweltverschmutzung (Luft, Wasser, Boden), giftige Abfälle, Dämmeinstürze,
+  Entwaldung etc.
+
+Nicht relevant (0) sind:
+- rein finanzielle oder wirtschaftliche Meldungen
+- neutrale technische Berichte ohne klare Verletzungen
+- allgemeine Klimaberichte ohne konkreten Bezug zu dieser Rohstoffaktivität
+
+Antwort NUR mit:
+1  → relevant
+0  → nicht relevant
+
+Hier ist der Treffer:
+{text_for_model}
+"""
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Du bist ein sehr strenger Filter für Menschenrechts- und Umwelt-Risiken.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+        )
+        ans = resp.choices[0].message.content.strip()
+        return "1" if ans.startswith("1") else "0"
+    except Exception as e:
+        print(f"   ⚠️ GPT-Fehler: {e}")
+        return "0"
+
+
+# =========================================================
+# 10) Datum prüfen
+# =========================================================
+
+def is_date_ok(date_txt: str, max_date: datetime.date | None, url: str) -> bool:
+    """
+    date_txt: Datum/Snippet von DuckDuckGo (z.B. '2 days ago', '20.11.2024')
+    max_date: frühestes erlaubtes Datum (aus Einstellungen), oder None, wenn keine Filterung.
+    """
+    if max_date is None:
+        return True
+
+    if not date_txt:
+        # kein Datum → zur Sicherheit trotzdem zulassen
+        return True
+
+    parsed = dateparser.parse(date_txt, languages=["de", "en"])
+    if not parsed:
+        # nicht interpretierbar → zulassen
+        return True
+
+    return parsed.date() >= max_date
+
+
+# =========================================================
+# 11) Main
+# =========================================================
 
 if __name__ == "__main__":
-    main()
+    max_date = lese_einstellungen()
+
+    # bekannte Seiten + Schlagwörter laden
+    seiten = lese_einfache_liste(BEKANNTE_SEITEN_CSV, delimiter=",")
+    schlagwoerter = lese_einfache_liste(SCHLAGWORT_CSV, delimiter=",")
+
+    print("\nBekannte Seiten:", seiten)
+    print("Schlagwörter   :", schlagwoerter)
+
+    out_path = SCRAPED_DIR / f"gescrapte_links_{rohst}.csv"
+
+    # CSV vorbereiten
+    with out_path.open("w", newline="", encoding="utf-8-sig") as f_out:
+        writer = csv.writer(f_out, delimiter=";")
+        writer.writerow(["gefundener link", "datum", "seite", "suche", "titel", "snippet"])
+
+    driver = make_driver()
+
+    try:
+        for idx_site, domain in enumerate(seiten, start=1):
+            print(f"\n🌐 Seite {idx_site}/{len(seiten)}: {domain}")
+
+            queries = build_queries_for_site(domain, rawm, schlagwoerter)
+            print(f"   → {len(queries)} Queries für diese Seite.")
+
+            accepted_for_site = 0
+            seen_urls_for_site: set[str] = set()
+
+            for q_idx, q in enumerate(queries, start=1):
+                if accepted_for_site >= MAX_ARTICLES_PER_SITE:
+                    print(f"   ✅ Limit von {MAX_ARTICLES_PER_SITE} Artikeln für {domain} erreicht.")
+                    break
+
+                url_search = ddg_search_url(q)
+                print(f"   🔎 Query {q_idx}/{len(queries)}")
+                print(f"      {url_search}")
+
+                results = scrape_ddg_results(driver, url_search, max_pages=MAX_DDG_PAGES)
+                print(f"      → {len(results)} Roh-Ergebnisse")
+
+                for res in results:
+                    if accepted_for_site >= MAX_ARTICLES_PER_SITE:
+                        break
+
+                    url_hit = res["url"]
+                    title = res["title"]
+                    snippet = res["snippet"]
+                    date_txt = res["date_txt"]
+
+                    if url_hit in seen_urls_for_site:
+                        continue
+                    seen_urls_for_site.add(url_hit)
+
+                    # Datum prüfen
+                    if not is_date_ok(date_txt, max_date, url_hit):
+                        # optional debug:
+                        # print(f"      ✂️ veraltet: {date_txt} → {url_hit}")
+                        continue
+
+                    # lokaler Risiko-Filter
+                    combined_text = (title + " " + snippet).strip()
+                    if not contains_risk_terms(combined_text, schlagwoerter):
+                        # optional debug:
+                        # print(f"      ✂️ keine Risiko-Schlagwörter: {title}")
+                        continue
+
+                    # GPT-Filter
+                    rel = gpt_link_relevance(rawm, url_hit, title, snippet)
+                    if rel == "1":
+                        accepted_for_site += 1
+                        print(f"      ✅ akzeptiert #{accepted_for_site} für {domain}")
+                        print(f"         Titel: {title}")
+                        print(f"         URL  : {url_hit}")
+
+                        # direkt anhängen
+                        with out_path.open("a", newline="", encoding="utf-8-sig") as f_out:
+                            writer = csv.writer(f_out, delimiter=";")
+                            writer.writerow([url_hit, date_txt, domain, q, title, snippet])
+
+                time.sleep(2)  # kleine Pause zwischen Queries
+
+            if accepted_for_site == 0:
+                print(f"   → Keine relevanten Artikel für {domain} gefunden.")
+            else:
+                print(f"   → Insgesamt {accepted_for_site} relevante Artikel für {domain}.")
+
+            time.sleep(2)  # Pause zwischen Seiten
+
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+    print(f"\n✅ Fertig. Ergebnisse in: {out_path}")
