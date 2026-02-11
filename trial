@@ -1,3 +1,601 @@
-import sys, openai
-print(sys.executable)
-print(getattr(openai, "__version__", "unknown"))
+# -*- coding: utf-8 -*-
+"""
+Deterministic Outlook Bot (NO LLM):
+Outlook -> Local Retrieval (BM25-ish) -> Template-based draft reply + sources
+
+Key behavior:
+- Process ONLY if subject is exactly "bot" (case-insensitive). No RE:/AW: allowed.
+- Uses a KB folder (txt/docx/pdf/xlsx) and builds a lightweight BM25-like index.
+- Rule-based intent detection + templates.
+- Creates a reply draft in Outlook with readable formatting.
+- Adds "Sources (internal)" line listing KB files used.
+
+Requirements:
+- Windows + Outlook installed
+- pywin32
+- python-docx (optional for .docx KB)
+- pypdf or pdfplumber (optional for PDF KB)
+- openpyxl (optional for .xlsx KB)
+
+Install (if needed):
+  py -m pip install pywin32 python-docx pypdf openpyxl
+  # pdfplumber optional: py -m pip install pdfplumber
+"""
+
+import re
+import os
+import math
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Tuple, Dict, Optional
+
+import win32com.client as win32
+
+# -------------------------
+# CONFIG (EDIT)
+# -------------------------
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"  # substring match against Outlook Store.DisplayName
+WATCH_FOLDER_NAME = "Inbox"                          # "Inbox" or a subfolder under Inbox
+STRICT_SUBJECT = "bot"                               # must match exactly, case-insensitive
+
+REQUIRE_UNREAD = True
+PROCESS_PER_RUN = 3
+SCAN_LIMIT = 250
+STARTUP_DELAY_SEC = 2
+
+# KB folder with PDFs/DOCX/TXT/XLSX
+KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
+
+SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
+
+# Chunking / retrieval
+CHUNK_MAX_CHARS = 900
+CHUNK_MIN_CHARS = 180
+TOP_K_CHUNKS = 8
+
+# Draft bookkeeping
+PROCESSED_CATEGORY = "AI-Drafted-Deterministic"
+
+# Signature formatting
+SIGN_FIRSTNAME_FROM_MAILBOX = True
+FALLBACK_SIGN_NAME = "Shubham"
+
+# -------------------------
+# Helpers
+# -------------------------
+
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def is_strict_subject(subject: str) -> bool:
+    s = (subject or "").strip()
+    return s.casefold() == STRICT_SUBJECT.casefold()
+
+def first_name_from_email(email: str) -> str:
+    e = (email or "").strip().lower()
+    if "@" not in e:
+        return "there"
+    local = e.split("@", 1)[0]
+    first = local.split(".", 1)[0].strip()
+    if not first:
+        return "there"
+    return first[:1].upper() + first[1:]
+
+def html_escape(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def clean_html_to_text(html: str) -> str:
+    # remove tags + condense
+    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
+    return clean_ws(txt)
+
+def get_sender_smtp(mail) -> str:
+    try:
+        addr = (mail.SenderEmailAddress or "").lower()
+        if addr.startswith("/o="):
+            ex = mail.Sender.GetExchangeUser()
+            if ex:
+                return (ex.PrimarySmtpAddress or "").lower()
+        return addr
+    except Exception:
+        return (mail.SenderEmailAddress or "").lower()
+
+def add_processed_category(mail):
+    try:
+        cats = mail.Categories or ""
+        if PROCESSED_CATEGORY.lower() not in cats.lower():
+            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
+            mail.Save()
+    except Exception:
+        pass
+
+def get_target_folder():
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+    target_store = None
+    for st in ns.Stores:
+        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
+            target_store = st
+            break
+
+    if not target_store:
+        print("Available Outlook stores:")
+        for st in ns.Stores:
+            print(" -", st.DisplayName)
+        raise SystemExit("Target mailbox not found. Set TARGET_MAILBOX to match Store.DisplayName.")
+
+    inbox = target_store.GetDefaultFolder(6)  # Inbox
+
+    if WATCH_FOLDER_NAME.lower() == "inbox":
+        return inbox, target_store.DisplayName, "Inbox"
+
+    for f in inbox.Folders:
+        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
+            return f, target_store.DisplayName, f.Name
+
+    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
+
+# -------------------------
+# KB Readers (graceful fallback)
+# -------------------------
+
+def read_txt(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="ignore")
+
+def read_docx(p: Path) -> str:
+    try:
+        from docx import Document as DocxDocument
+    except Exception:
+        return ""
+    try:
+        doc = DocxDocument(str(p))
+        paras = [clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text)]
+        # tables
+        tables = []
+        for t in doc.tables:
+            for row in t.rows:
+                cells = [clean_ws(c.text) for c in row.cells]
+                if any(cells):
+                    tables.append(" | ".join(cells))
+        return clean_ws("\n".join(paras + tables))
+    except Exception:
+        return ""
+
+def read_pdf(p: Path) -> str:
+    # Try pdfplumber first (often better), then pypdf
+    try:
+        import pdfplumber
+        out = []
+        with pdfplumber.open(str(p)) as pdf:
+            for page in pdf.pages:
+                txt = page.extract_text() or ""
+                if txt.strip():
+                    out.append(txt)
+        return clean_ws("\n".join(out))
+    except Exception:
+        pass
+
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return ""
+    try:
+        r = PdfReader(str(p))
+        out = []
+        for pg in r.pages:
+            try:
+                out.append(pg.extract_text() or "")
+            except Exception:
+                pass
+        return clean_ws("\n".join(out))
+    except Exception:
+        return ""
+
+def read_xlsx(p: Path) -> str:
+    try:
+        import openpyxl
+    except Exception:
+        return ""
+    try:
+        wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+        out = []
+        for ws in wb.worksheets:
+            out.append(f"Sheet: {ws.title}")
+            max_rows = min(ws.max_row or 0, 200)
+            max_cols = min(ws.max_column or 0, 25)
+            for r in range(1, max_rows + 1):
+                row_vals = []
+                for c in range(1, max_cols + 1):
+                    v = ws.cell(row=r, column=c).value
+                    row_vals.append("" if v is None else str(v))
+                if any(cell.strip() for cell in row_vals):
+                    out.append(" | ".join(clean_ws(x) for x in row_vals))
+        return clean_ws("\n".join(out))
+    except Exception:
+        return ""
+
+def extract_text_from_file(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext == ".txt":
+        return clean_ws(read_txt(p))
+    if ext == ".docx":
+        return clean_ws(read_docx(p))
+    if ext == ".pdf":
+        return clean_ws(read_pdf(p))
+    if ext == ".xlsx":
+        return clean_ws(read_xlsx(p))
+    return ""
+
+# -------------------------
+# Chunk + BM25-ish index
+# -------------------------
+
+TOKEN_RE = re.compile(r"[a-z0-9äöüß]+", re.I)
+
+def tokenize(text: str) -> List[str]:
+    return [t.lower() for t in TOKEN_RE.findall(text or "")]
+
+def split_into_chunks(text: str) -> List[str]:
+    """
+    Chunk on blank lines / sentences but keep chunks ~CHUNK_MAX_CHARS
+    """
+    text = (text or "").replace("\r\n", "\n")
+    # first split on blank lines
+    parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    chunks = []
+    buf = ""
+    for p in parts:
+        if len(buf) + len(p) + 2 <= CHUNK_MAX_CHARS:
+            buf = (buf + "\n\n" + p).strip() if buf else p
+        else:
+            if len(buf) >= CHUNK_MIN_CHARS:
+                chunks.append(buf.strip())
+                buf = p
+            else:
+                # buf too small: append anyway
+                buf = (buf + "\n\n" + p).strip() if buf else p
+                if len(buf) >= CHUNK_MAX_CHARS:
+                    chunks.append(buf.strip())
+                    buf = ""
+    if buf.strip():
+        chunks.append(buf.strip())
+
+    # drop extremely tiny chunks
+    return [c for c in chunks if len(c) >= CHUNK_MIN_CHARS or len(chunks) == 1]
+
+@dataclass
+class Chunk:
+    file_name: str
+    chunk_id: int
+    text: str
+    tokens: List[str]
+    tf: Dict[str, int]
+    length: int
+
+class BM25Index:
+    def __init__(self, chunks: List[Chunk]):
+        self.chunks = chunks
+        self.N = len(chunks)
+        self.avgdl = (sum(c.length for c in chunks) / self.N) if self.N else 1.0
+        self.df: Dict[str, int] = {}
+        for c in chunks:
+            for term in set(c.tokens):
+                self.df[term] = self.df.get(term, 0) + 1
+
+    def idf(self, term: str) -> float:
+        # BM25 IDF variant
+        n = self.df.get(term, 0)
+        return math.log(1 + (self.N - n + 0.5) / (n + 0.5)) if self.N else 0.0
+
+    def score(self, query_tokens: List[str], chunk: Chunk, k1: float = 1.4, b: float = 0.75) -> float:
+        score = 0.0
+        dl = chunk.length
+        for t in query_tokens:
+            if t not in chunk.tf:
+                continue
+            f = chunk.tf[t]
+            denom = f + k1 * (1 - b + b * dl / self.avgdl)
+            score += self.idf(t) * (f * (k1 + 1) / (denom + 1e-9))
+        return score
+
+    def search(self, query: str, top_k: int = 8) -> List[Chunk]:
+        qt = tokenize(query)
+        if not qt:
+            return []
+        scored = []
+        for c in self.chunks:
+            s = self.score(qt, c)
+            if s > 0:
+                scored.append((s, c))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [c for _, c in scored[:top_k]]
+
+def load_kb_build_index(kb_dir: str) -> BM25Index:
+    base = Path(kb_dir)
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"KB_DIR not found or not a folder: {kb_dir}")
+
+    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    if not files:
+        raise SystemExit(f"No supported KB files found in: {kb_dir}")
+
+    chunks: List[Chunk] = []
+    for p in sorted(files):
+        try:
+            txt = extract_text_from_file(p)
+            if not txt:
+                continue
+            for i, ch in enumerate(split_into_chunks(txt)):
+                toks = tokenize(ch)
+                tf: Dict[str, int] = {}
+                for t in toks:
+                    tf[t] = tf.get(t, 0) + 1
+                chunks.append(
+                    Chunk(
+                        file_name=p.name,
+                        chunk_id=i,
+                        text=ch,
+                        tokens=toks,
+                        tf=tf,
+                        length=len(toks),
+                    )
+                )
+        except Exception:
+            continue
+
+    if not chunks:
+        raise SystemExit("KB files found, but no extractable text. Install readers or use text-based PDFs/DOCX.")
+    return BM25Index(chunks)
+
+# -------------------------
+# Intent detection + templates
+# -------------------------
+
+INTENT_RULES = [
+    ("saq", re.compile(r"\bSAQ\b|\bSupplierAssurance\b|\bDrive\s+Sustainability\b", re.I)),
+    ("green_electricity", re.compile(r"\bgreen\s+electricity\b|\berenewable\s+electricity\b|\brenewable\s+energies\b|\bGr[üu]nstrom\b", re.I)),
+    ("co2_2039", re.compile(r"\b2039\b|\bCO2\b|\bCO-?neutral\b|\bnet\s*zero\b|\bAmbition\s*2039\b", re.I)),
+    ("premises_sheet", re.compile(r"\bPr[äa]missenblatt\b|\bPremises\b|\bPremises\s+sheet\b|\bunterschrieben\b|\bsigned\b", re.I)),
+    ("contract_attachment", re.compile(r"\bvertrag\b|\bcontract\b|\banh[aä]ng(en|t)\b|\bappend\b|\bwirksam\b|\bbinding\b", re.I)),
+]
+
+def detect_intents(text: str) -> List[str]:
+    hits = []
+    for name, rx in INTENT_RULES:
+        if rx.search(text or ""):
+            hits.append(name)
+    return hits or ["general"]
+
+def build_reply(intent_list: List[str], sender_first: str, user_first: str,
+                question_text: str, retrieved_chunks: List[Chunk]) -> Tuple[str, List[str]]:
+    """
+    Deterministic reply assembly.
+    Returns (plain_text_reply, sources_used)
+    """
+    sources = []
+    # pick unique sources in ranking order
+    for c in retrieved_chunks:
+        if c.file_name not in sources:
+            sources.append(c.file_name)
+    sources_used = sources[:6]
+
+    # Pull a small set of “support bullets” extractively
+    # (keep it short and presentable; not dumping entire paragraphs)
+    support_lines = []
+    for c in retrieved_chunks[:5]:
+        # take first 1–2 sentences-ish
+        t = clean_ws(c.text)
+        # rough sentence split
+        sents = re.split(r"(?<=[.!?])\s+", t)
+        snippet = " ".join(sents[:2]).strip()
+        if snippet and snippet not in support_lines:
+            support_lines.append(snippet)
+
+    def bullets(lines: List[str]) -> str:
+        return "\n".join([f"- {ln}" for ln in lines if ln.strip()])
+
+    # Templates per intent (can be expanded)
+    parts = [f"Hello {sender_first},", ""]
+
+    # If multiple intents, we do section headings
+    multi = len([i for i in intent_list if i != "general"]) > 1
+
+    def add_section(title: str, body_lines: List[str]):
+        if multi:
+            parts.append(f"{title}")
+        parts.append(bullets(body_lines))
+        parts.append("")
+
+    if "saq" in intent_list:
+        add_section(
+            "SAQ / Sustainability assessment",
+            [
+                "Please complete the latest Sustainability Assessment Questionnaire (SAQ) on the relevant platform for the planned production site before awarding.",
+                "If you have already completed it, please share the completion status (or confirm the site used).",
+            ],
+        )
+
+    if "green_electricity" in intent_list:
+        add_section(
+            "Green electricity",
+            [
+                "Please ensure electricity from renewable sources is used for the relevant production processes (Tier 1) in line with the applicable internal standard referenced in our documents.",
+                "If the production site changes, please inform the responsible purchaser immediately.",
+            ],
+        )
+
+    if "co2_2039" in intent_list:
+        add_section(
+            "CO2-neutral / 2039 target",
+            [
+                "The expectation is CO2-neutral production across the value creation stages by the target date, including upstream supply chain where applicable.",
+                "If you foresee deviations or additional cost drivers, please make them transparent and describe the underlying assumptions.",
+            ],
+        )
+
+    if "premises_sheet" in intent_list:
+        add_section(
+            "Premises sheet / signature",
+            [
+                "Please send the signed sustainability premises/premises sheet(s) for the relevant scope so we can proceed with the next steps.",
+                "If multiple projects/scopes are involved, please clarify which document corresponds to which scope.",
+            ],
+        )
+
+    if "contract_attachment" in intent_list:
+        add_section(
+            "Contract attachment / enforceability",
+            [
+                "To ensure contractual enforceability, please confirm which documents are intended to be attached to the supplier contract (not only to inquiry documents).",
+                "If you want, we can align on the clean process for where requirements should live (technical requirements vs premises sheets) to avoid information gaps.",
+            ],
+        )
+
+    if intent_list == ["general"]:
+        parts.append("Thanks for your message. Based on our internal documents, the relevant points are:")
+        parts.append("")
+        if support_lines:
+            parts.append(bullets(support_lines[:5]))
+            parts.append("")
+        else:
+            parts.append("At the moment I cannot find a matching passage in the available internal documents.")
+            parts.append("")
+
+    # Add a short extractive support block (optional, but usually helps)
+    if support_lines:
+        parts.append("Relevant references (extracts):")
+        parts.append(bullets(support_lines[:4]))
+        parts.append("")
+
+    # Clarifying questions if we have weak match
+    if not retrieved_chunks:
+        parts.append("To proceed, could you confirm:")
+        parts.append(bullets(["Which exact scope/project this refers to?", "Which production site is planned?"]))
+        parts.append("")
+
+    # Sources
+    if sources_used:
+        parts.append("Sources (internal): " + "; ".join(sources_used))
+        parts.append("")
+    else:
+        parts.append("Sources (internal): (no matching KB source found)")
+        parts.append("")
+
+    parts.append("Best regards,")
+    parts.append(user_first)
+
+    return "\n".join(parts).strip(), sources_used
+
+def format_text_to_outlook_html(text: str) -> str:
+    """
+    Turn plain text into Outlook-friendly HTML:
+    - blank lines -> paragraphs
+    - lines starting with "- " -> UL list
+    """
+    text = (text or "").replace("\r\n", "\n").strip()
+    if not text:
+        return "<p></p>"
+
+    blocks = re.split(r"\n\s*\n", text)
+    html_parts = []
+
+    for block in blocks:
+        lines = [ln.rstrip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
+
+        if all(ln.strip().startswith("- ") for ln in lines):
+            html_parts.append("<ul>")
+            for ln in lines:
+                html_parts.append(f"<li>{html_escape(ln.strip()[2:].strip())}</li>")
+            html_parts.append("</ul>")
+        else:
+            para = "<br>".join(html_escape(ln) for ln in lines)
+            html_parts.append(f"<p>{para}</p>")
+
+    return "\n".join(html_parts)
+
+# -------------------------
+# Main run-once
+# -------------------------
+
+def main():
+    time.sleep(STARTUP_DELAY_SEC)
+
+    print("Loading KB from:", KB_DIR)
+    index = load_kb_build_index(KB_DIR)
+    print("KB loaded:", len(index.chunks), "chunks")
+
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    folder, store_name, folder_name = get_target_folder()
+    print(f"Mailbox={store_name} | Folder={folder_name}")
+
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True)
+
+    drafted = 0
+    checked = 0
+
+    if SIGN_FIRSTNAME_FROM_MAILBOX:
+        user_first = first_name_from_email(TARGET_MAILBOX)
+    else:
+        user_first = FALLBACK_SIGN_NAME
+
+    for mail in items:
+        checked += 1
+        if checked > SCAN_LIMIT:
+            break
+        if drafted >= PROCESS_PER_RUN:
+            break
+
+        try:
+            if getattr(mail, "Class", None) != 43:  # MailItem
+                continue
+
+            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
+                continue
+
+            if REQUIRE_UNREAD and not mail.UnRead:
+                continue
+
+            subject = mail.Subject or ""
+            if not is_strict_subject(subject):
+                continue
+
+            sender = get_sender_smtp(mail)
+            sender_first = first_name_from_email(sender)
+
+            body_text = clean_html_to_text(mail.HTMLBody or "") or clean_ws(getattr(mail, "Body", "") or "")
+
+            # Query for retrieval: subject + body
+            query = f"{subject}\n{body_text}"
+
+            intents = detect_intents(query)
+            top_chunks = index.search(query, top_k=TOP_K_CHUNKS)
+
+            reply_text, sources_used = build_reply(
+                intent_list=intents,
+                sender_first=sender_first,
+                user_first=user_first,
+                question_text=body_text,
+                retrieved_chunks=top_chunks,
+            )
+
+            html_reply = format_text_to_outlook_html(reply_text)
+
+            reply = mail.Reply()
+            reply.HTMLBody = f"<div>{html_reply}</div><hr>" + reply.HTMLBody
+            reply.Save()
+
+            add_processed_category(mail)
+            drafted += 1
+            print("Draft created:", subject, "| intents:", ",".join(intents), "| sources:", len(sources_used))
+
+        except Exception as e:
+            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", e)
+
+    print(f"Done. Checked={checked}, Drafted={drafted}")
+
+if __name__ == "__main__":
+    main()
