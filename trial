@@ -1,69 +1,81 @@
 # -*- coding: utf-8 -*-
 """
-Deterministic Outlook Bot (NO LLM):
-Outlook -> Local Retrieval (BM25-ish) -> Template-based draft reply + sources
+Deterministic Outlook Bot (NO LLM) - Bilingual + Document-only citations
 
-Key behavior:
+Changes vs prior:
+- Reply is bilingual: German first, then English.
+- "Sources (internal)" and "Relevant references (extracts)" use ONLY valid documents,
+  never emails/mail-exports. Email-like files are excluded from citations and extracts.
+
+Behavior:
 - Process ONLY if subject is exactly "bot" (case-insensitive). No RE:/AW: allowed.
-- Uses a KB folder (txt/docx/pdf/xlsx) and builds a lightweight BM25-like index.
+- Uses KB folder (txt/docx/pdf/xlsx) and builds a lightweight BM25-like index.
 - Rule-based intent detection + templates.
 - Creates a reply draft in Outlook with readable formatting.
-- Adds "Sources (internal)" line listing KB files used.
+- Adds "Sources (internal)" line listing KB documents used.
 
 Requirements:
-- Windows + Outlook installed
-- pywin32
-- python-docx (optional for .docx KB)
-- pypdf or pdfplumber (optional for PDF KB)
-- openpyxl (optional for .xlsx KB)
-
-Install (if needed):
   py -m pip install pywin32 python-docx pypdf openpyxl
-  # pdfplumber optional: py -m pip install pdfplumber
+  # optional: py -m pip install pdfplumber
 """
 
 import re
-import os
 import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 
 import win32com.client as win32
 
 # -------------------------
 # CONFIG (EDIT)
 # -------------------------
-TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"  # substring match against Outlook Store.DisplayName
-WATCH_FOLDER_NAME = "Inbox"                          # "Inbox" or a subfolder under Inbox
-STRICT_SUBJECT = "bot"                               # must match exactly, case-insensitive
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"
+WATCH_FOLDER_NAME = "Inbox"
+STRICT_SUBJECT = "bot"
 
 REQUIRE_UNREAD = True
 PROCESS_PER_RUN = 3
 SCAN_LIMIT = 250
 STARTUP_DELAY_SEC = 2
 
-# KB folder with PDFs/DOCX/TXT/XLSX
 KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
-
 SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
 
 # Chunking / retrieval
 CHUNK_MAX_CHARS = 900
 CHUNK_MIN_CHARS = 180
-TOP_K_CHUNKS = 8
+TOP_K_CHUNKS = 10
 
-# Draft bookkeeping
+# Outlook bookkeeping
 PROCESSED_CATEGORY = "AI-Drafted-Deterministic"
 
 # Signature formatting
 SIGN_FIRSTNAME_FROM_MAILBOX = True
 FALLBACK_SIGN_NAME = "Shubham"
 
+# Document-only citations: exclude mail-like KB files from "sources/extracts"
+EXCLUDE_MAIL_SOURCES = True
+
+MAIL_SOURCE_NAME_PATTERNS = [
+    r"\baw[_\-\s:]",          # AW:
+    r"\bre[_\-\s:]",          # RE:
+    r"\bwg[_\-\s:]",          # WG:
+    r"\bfw[_\-\s:]",          # FW:
+    r"\bantwort\b",           # Antwort
+    r"\bmail\b",
+    r"\bemail\b",
+    r"\bmessage\b",
+    r"\bmsg\b",               # exported msg-derived text
+    r"\binbox\b",
+    r"\boutlook\b",
+]
+
 # -------------------------
 # Helpers
 # -------------------------
+TOKEN_RE = re.compile(r"[a-z0-9äöüß]+", re.I)
 
 def clean_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
@@ -86,7 +98,6 @@ def html_escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def clean_html_to_text(html: str) -> str:
-    # remove tags + condense
     txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
     return clean_ws(txt)
 
@@ -136,10 +147,45 @@ def get_target_folder():
 
     raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
 
-# -------------------------
-# KB Readers (graceful fallback)
-# -------------------------
+def tokenize(text: str) -> List[str]:
+    return [t.lower() for t in TOKEN_RE.findall(text or "")]
 
+def split_into_chunks(text: str) -> List[str]:
+    text = (text or "").replace("\r\n", "\n")
+    parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    chunks = []
+    buf = ""
+    for p in parts:
+        if len(buf) + len(p) + 2 <= CHUNK_MAX_CHARS:
+            buf = (buf + "\n\n" + p).strip() if buf else p
+        else:
+            if len(buf) >= CHUNK_MIN_CHARS:
+                chunks.append(buf.strip())
+                buf = p
+            else:
+                buf = (buf + "\n\n" + p).strip() if buf else p
+                if len(buf) >= CHUNK_MAX_CHARS:
+                    chunks.append(buf.strip())
+                    buf = ""
+    if buf.strip():
+        chunks.append(buf.strip())
+    return [c for c in chunks if len(c) >= CHUNK_MIN_CHARS or len(chunks) == 1]
+
+def is_mail_like_source(file_name: str) -> bool:
+    if not file_name:
+        return False
+    n = file_name.lower()
+    if n.endswith(".msg"):
+        return True
+    # cheap heuristics: many corp mail exports begin with AW_/RE_/WG_
+    for pat in MAIL_SOURCE_NAME_PATTERNS:
+        if re.search(pat, n, flags=re.I):
+            return True
+    return False
+
+# -------------------------
+# KB Readers (graceful)
+# -------------------------
 def read_txt(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="ignore")
 
@@ -151,7 +197,6 @@ def read_docx(p: Path) -> str:
     try:
         doc = DocxDocument(str(p))
         paras = [clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text)]
-        # tables
         tables = []
         for t in doc.tables:
             for row in t.rows:
@@ -163,7 +208,6 @@ def read_docx(p: Path) -> str:
         return ""
 
 def read_pdf(p: Path) -> str:
-    # Try pdfplumber first (often better), then pypdf
     try:
         import pdfplumber
         out = []
@@ -228,42 +272,8 @@ def extract_text_from_file(p: Path) -> str:
     return ""
 
 # -------------------------
-# Chunk + BM25-ish index
+# BM25-ish index
 # -------------------------
-
-TOKEN_RE = re.compile(r"[a-z0-9äöüß]+", re.I)
-
-def tokenize(text: str) -> List[str]:
-    return [t.lower() for t in TOKEN_RE.findall(text or "")]
-
-def split_into_chunks(text: str) -> List[str]:
-    """
-    Chunk on blank lines / sentences but keep chunks ~CHUNK_MAX_CHARS
-    """
-    text = (text or "").replace("\r\n", "\n")
-    # first split on blank lines
-    parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-    chunks = []
-    buf = ""
-    for p in parts:
-        if len(buf) + len(p) + 2 <= CHUNK_MAX_CHARS:
-            buf = (buf + "\n\n" + p).strip() if buf else p
-        else:
-            if len(buf) >= CHUNK_MIN_CHARS:
-                chunks.append(buf.strip())
-                buf = p
-            else:
-                # buf too small: append anyway
-                buf = (buf + "\n\n" + p).strip() if buf else p
-                if len(buf) >= CHUNK_MAX_CHARS:
-                    chunks.append(buf.strip())
-                    buf = ""
-    if buf.strip():
-        chunks.append(buf.strip())
-
-    # drop extremely tiny chunks
-    return [c for c in chunks if len(c) >= CHUNK_MIN_CHARS or len(chunks) == 1]
-
 @dataclass
 class Chunk:
     file_name: str
@@ -284,7 +294,6 @@ class BM25Index:
                 self.df[term] = self.df.get(term, 0) + 1
 
     def idf(self, term: str) -> float:
-        # BM25 IDF variant
         n = self.df.get(term, 0)
         return math.log(1 + (self.N - n + 0.5) / (n + 0.5)) if self.N else 0.0
 
@@ -345,13 +354,12 @@ def load_kb_build_index(kb_dir: str) -> BM25Index:
             continue
 
     if not chunks:
-        raise SystemExit("KB files found, but no extractable text. Install readers or use text-based PDFs/DOCX.")
+        raise SystemExit("KB files found, but no extractable text (missing readers or scanned PDFs).")
     return BM25Index(chunks)
 
 # -------------------------
-# Intent detection + templates
+# Intent detection (bilingual templates)
 # -------------------------
-
 INTENT_RULES = [
     ("saq", re.compile(r"\bSAQ\b|\bSupplierAssurance\b|\bDrive\s+Sustainability\b", re.I)),
     ("green_electricity", re.compile(r"\bgreen\s+electricity\b|\berenewable\s+electricity\b|\brenewable\s+energies\b|\bGr[üu]nstrom\b", re.I)),
@@ -367,132 +375,176 @@ def detect_intents(text: str) -> List[str]:
             hits.append(name)
     return hits or ["general"]
 
-def build_reply(intent_list: List[str], sender_first: str, user_first: str,
-                question_text: str, retrieved_chunks: List[Chunk]) -> Tuple[str, List[str]]:
+def _bullets(lines: List[str], lang: str) -> str:
+    # same bullet style for both
+    return "\n".join([f"- {ln}" for ln in lines if ln.strip()])
+
+def build_bilingual_reply(sender_first: str, user_first: str, intent_list: List[str],
+                         retrieved_chunks: List[Chunk]) -> Tuple[str, List[str]]:
     """
-    Deterministic reply assembly.
     Returns (plain_text_reply, sources_used)
+    - Sources and extracts: document-only (no mail-like files)
     """
+    # Filter chunks for citations/extracts
+    chunks_for_citation = retrieved_chunks
+    if EXCLUDE_MAIL_SOURCES:
+        chunks_for_citation = [c for c in retrieved_chunks if not is_mail_like_source(c.file_name)]
+
+    # sources used
     sources = []
-    # pick unique sources in ranking order
-    for c in retrieved_chunks:
+    for c in chunks_for_citation:
         if c.file_name not in sources:
             sources.append(c.file_name)
     sources_used = sources[:6]
 
-    # Pull a small set of “support bullets” extractively
-    # (keep it short and presentable; not dumping entire paragraphs)
+    # short extracts (document-only)
     support_lines = []
-    for c in retrieved_chunks[:5]:
-        # take first 1–2 sentences-ish
+    for c in chunks_for_citation[:5]:
         t = clean_ws(c.text)
-        # rough sentence split
         sents = re.split(r"(?<=[.!?])\s+", t)
         snippet = " ".join(sents[:2]).strip()
         if snippet and snippet not in support_lines:
             support_lines.append(snippet)
 
-    def bullets(lines: List[str]) -> str:
-        return "\n".join([f"- {ln}" for ln in lines if ln.strip()])
-
-    # Templates per intent (can be expanded)
-    parts = [f"Hello {sender_first},", ""]
-
-    # If multiple intents, we do section headings
     multi = len([i for i in intent_list if i != "general"]) > 1
 
-    def add_section(title: str, body_lines: List[str]):
+    # -------- German section
+    de = []
+    de.append(f"Hallo {sender_first},")
+    de.append("")
+
+    def add_de_section(title: str, lines: List[str]):
         if multi:
-            parts.append(f"{title}")
-        parts.append(bullets(body_lines))
-        parts.append("")
+            de.append(title)
+        de.append(_bullets(lines, "de"))
+        de.append("")
 
     if "saq" in intent_list:
-        add_section(
-            "SAQ / Sustainability assessment",
-            [
-                "Please complete the latest Sustainability Assessment Questionnaire (SAQ) on the relevant platform for the planned production site before awarding.",
-                "If you have already completed it, please share the completion status (or confirm the site used).",
-            ],
-        )
-
+        add_de_section("SAQ / Nachhaltigkeitsbewertung", [
+            "Bitte füllen Sie den aktuellen Sustainability Assessment Questionnaire (SAQ) auf der relevanten Plattform für den geplanten Produktionsstandort vor der Vergabe aus.",
+            "Falls bereits erfolgt: Bitte bestätigen Sie den Standort und den Abschlussstatus."
+        ])
     if "green_electricity" in intent_list:
-        add_section(
-            "Green electricity",
-            [
-                "Please ensure electricity from renewable sources is used for the relevant production processes (Tier 1) in line with the applicable internal standard referenced in our documents.",
-                "If the production site changes, please inform the responsible purchaser immediately.",
-            ],
-        )
-
+        add_de_section("Grüner Strom", [
+            "Bitte stellen Sie sicher, dass für die relevanten Produktionsprozesse (Tier 1) Strom aus erneuerbaren Energien eingesetzt wird – gemäß dem in den internen Dokumenten referenzierten Standard.",
+            "Bei Standortwechsel oder fehlendem Ergebnis für den geplanten Standort bitte den verantwortlichen Einkauf umgehend informieren."
+        ])
     if "co2_2039" in intent_list:
-        add_section(
-            "CO2-neutral / 2039 target",
-            [
-                "The expectation is CO2-neutral production across the value creation stages by the target date, including upstream supply chain where applicable.",
-                "If you foresee deviations or additional cost drivers, please make them transparent and describe the underlying assumptions.",
-            ],
-        )
-
+        add_de_section("CO2-Neutralität / Zieljahr 2039", [
+            "Erwartet wird CO2-neutrale Produktion entlang der Wertschöpfungsstufen bis zum Zieltermin – einschließlich vorgelagerter Lieferkette, sofern anwendbar.",
+            "Sollten Abweichungen oder zusätzliche Kostentreiber erwartet werden, bitte transparent machen und die Annahmen erläutern."
+        ])
     if "premises_sheet" in intent_list:
-        add_section(
-            "Premises sheet / signature",
-            [
-                "Please send the signed sustainability premises/premises sheet(s) for the relevant scope so we can proceed with the next steps.",
-                "If multiple projects/scopes are involved, please clarify which document corresponds to which scope.",
-            ],
-        )
-
+        add_de_section("Prämissenblatt / Unterschrift", [
+            "Bitte senden Sie die unterschriebenen Nachhaltigkeitsprämissen/Prämissenblätter für den relevanten Umfang, damit wir die nächsten Schritte einleiten können.",
+            "Bei mehreren Umfängen bitte kurz zuordnen, welches Dokument zu welchem Umfang gehört."
+        ])
     if "contract_attachment" in intent_list:
-        add_section(
-            "Contract attachment / enforceability",
-            [
-                "To ensure contractual enforceability, please confirm which documents are intended to be attached to the supplier contract (not only to inquiry documents).",
-                "If you want, we can align on the clean process for where requirements should live (technical requirements vs premises sheets) to avoid information gaps.",
-            ],
-        )
+        add_de_section("Vertragliche Wirksamkeit / Anhänge", [
+            "Bitte bestätigen Sie, welche Dokumente dem Liefervertrag tatsächlich angehängt werden sollen (nicht nur den Anfrageunterlagen), um die Wirksamkeit sicherzustellen.",
+            "Gerne können wir den Zielprozess abstimmen (technische Anforderungen vs. Prämissen), um Informationslücken zu vermeiden."
+        ])
 
     if intent_list == ["general"]:
-        parts.append("Thanks for your message. Based on our internal documents, the relevant points are:")
-        parts.append("")
+        de.append("Danke für Ihre Nachricht. Basierend auf den internen Dokumenten sind die relevanten Punkte:")
+        de.append("")
         if support_lines:
-            parts.append(bullets(support_lines[:5]))
-            parts.append("")
+            de.append(_bullets(support_lines[:5], "de"))
+            de.append("")
         else:
-            parts.append("At the moment I cannot find a matching passage in the available internal documents.")
-            parts.append("")
+            de.append("Aktuell finde ich dazu keine passende Passage in den verfügbaren internen Dokumenten.")
+            de.append("")
 
-    # Add a short extractive support block (optional, but usually helps)
     if support_lines:
-        parts.append("Relevant references (extracts):")
-        parts.append(bullets(support_lines[:4]))
-        parts.append("")
+        de.append("Relevante Referenzen (Auszüge):")
+        de.append(_bullets(support_lines[:4], "de"))
+        de.append("")
 
-    # Clarifying questions if we have weak match
-    if not retrieved_chunks:
-        parts.append("To proceed, could you confirm:")
-        parts.append(bullets(["Which exact scope/project this refers to?", "Which production site is planned?"]))
-        parts.append("")
+    if not chunks_for_citation:
+        de.append("Damit ich korrekt zuordnen kann, kurze Rückfragen:")
+        de.append(_bullets(["Um welchen konkreten Umfang/Projekt geht es?", "Welcher Produktionsstandort ist geplant?"], "de"))
+        de.append("")
 
-    # Sources
     if sources_used:
-        parts.append("Sources (internal): " + "; ".join(sources_used))
-        parts.append("")
+        de.append("Quellen (intern, Dokumente): " + "; ".join(sources_used))
     else:
-        parts.append("Sources (internal): (no matching KB source found)")
-        parts.append("")
+        de.append("Quellen (intern, Dokumente): (keine passenden Dokumente gefunden)")
+    de.append("")
+    de.append("Mit freundlichen Grüßen")
+    de.append(user_first)
 
-    parts.append("Best regards,")
-    parts.append(user_first)
+    # -------- English section
+    en = []
+    en.append("")
+    en.append("—")
+    en.append("")
+    en.append(f"Hello {sender_first},")
+    en.append("")
 
-    return "\n".join(parts).strip(), sources_used
+    def add_en_section(title: str, lines: List[str]):
+        if multi:
+            en.append(title)
+        en.append(_bullets(lines, "en"))
+        en.append("")
+
+    if "saq" in intent_list:
+        add_en_section("SAQ / Sustainability assessment", [
+            "Please complete the latest Sustainability Assessment Questionnaire (SAQ) on the relevant platform for the planned production site before awarding.",
+            "If already completed: please confirm the site and completion status."
+        ])
+    if "green_electricity" in intent_list:
+        add_en_section("Green electricity", [
+            "Please ensure electricity from renewable sources is used for the relevant production processes (Tier 1), in line with the internal standard referenced in our documents.",
+            "If the production site changes or there is no result for the planned site, please inform the responsible purchaser immediately."
+        ])
+    if "co2_2039" in intent_list:
+        add_en_section("CO2-neutral / 2039 target", [
+            "The expectation is CO2-neutral production across the value creation stages by the target date, including upstream supply chain where applicable.",
+            "If you foresee deviations or additional cost drivers, please make them transparent and describe the underlying assumptions."
+        ])
+    if "premises_sheet" in intent_list:
+        add_en_section("Premises sheet / signature", [
+            "Please send the signed sustainability premises/premises sheet(s) for the relevant scope so we can proceed with the next steps.",
+            "If multiple scopes are involved, please clarify which document corresponds to which scope."
+        ])
+    if "contract_attachment" in intent_list:
+        add_en_section("Contract attachment / enforceability", [
+            "Please confirm which documents are intended to be attached to the supplier contract (not only to inquiry documents) to ensure enforceability.",
+            "If useful, we can align on the clean process (technical requirements vs premises) to avoid information gaps."
+        ])
+
+    if intent_list == ["general"]:
+        en.append("Thanks for your message. Based on our internal documents, the relevant points are:")
+        en.append("")
+        if support_lines:
+            en.append(_bullets(support_lines[:5], "en"))
+            en.append("")
+        else:
+            en.append("At the moment I cannot find a matching passage in the available internal documents.")
+            en.append("")
+
+    if support_lines:
+        en.append("Relevant references (extracts):")
+        en.append(_bullets(support_lines[:4], "en"))
+        en.append("")
+
+    if not chunks_for_citation:
+        en.append("To proceed, could you confirm:")
+        en.append(_bullets(["Which exact scope/project this refers to?", "Which production site is planned?"], "en"))
+        en.append("")
+
+    if sources_used:
+        en.append("Sources (internal, documents): " + "; ".join(sources_used))
+    else:
+        en.append("Sources (internal, documents): (no matching documents found)")
+    en.append("")
+    en.append("Best regards,")
+    en.append(user_first)
+
+    full = "\n".join(de + en).strip()
+    return full, sources_used
 
 def format_text_to_outlook_html(text: str) -> str:
-    """
-    Turn plain text into Outlook-friendly HTML:
-    - blank lines -> paragraphs
-    - lines starting with "- " -> UL list
-    """
     text = (text or "").replace("\r\n", "\n").strip()
     if not text:
         return "<p></p>"
@@ -517,9 +569,8 @@ def format_text_to_outlook_html(text: str) -> str:
     return "\n".join(html_parts)
 
 # -------------------------
-# Main run-once
+# Main
 # -------------------------
-
 def main():
     time.sleep(STARTUP_DELAY_SEC)
 
@@ -527,7 +578,6 @@ def main():
     index = load_kb_build_index(KB_DIR)
     print("KB loaded:", len(index.chunks), "chunks")
 
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
     folder, store_name, folder_name = get_target_folder()
     print(f"Mailbox={store_name} | Folder={folder_name}")
 
@@ -537,10 +587,7 @@ def main():
     drafted = 0
     checked = 0
 
-    if SIGN_FIRSTNAME_FROM_MAILBOX:
-        user_first = first_name_from_email(TARGET_MAILBOX)
-    else:
-        user_first = FALLBACK_SIGN_NAME
+    user_first = first_name_from_email(TARGET_MAILBOX) if SIGN_FIRSTNAME_FROM_MAILBOX else FALLBACK_SIGN_NAME
 
     for mail in items:
         checked += 1
@@ -550,7 +597,7 @@ def main():
             break
 
         try:
-            if getattr(mail, "Class", None) != 43:  # MailItem
+            if getattr(mail, "Class", None) != 43:
                 continue
 
             if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
@@ -568,17 +615,15 @@ def main():
 
             body_text = clean_html_to_text(mail.HTMLBody or "") or clean_ws(getattr(mail, "Body", "") or "")
 
-            # Query for retrieval: subject + body
             query = f"{subject}\n{body_text}"
-
             intents = detect_intents(query)
+
             top_chunks = index.search(query, top_k=TOP_K_CHUNKS)
 
-            reply_text, sources_used = build_reply(
-                intent_list=intents,
+            reply_text, sources_used = build_bilingual_reply(
                 sender_first=sender_first,
                 user_first=user_first,
-                question_text=body_text,
+                intent_list=intents,
                 retrieved_chunks=top_chunks,
             )
 
@@ -590,7 +635,7 @@ def main():
 
             add_processed_category(mail)
             drafted += 1
-            print("Draft created:", subject, "| intents:", ",".join(intents), "| sources:", len(sources_used))
+            print("Draft created:", subject, "| intents:", ",".join(intents), "| doc-sources:", len(sources_used))
 
         except Exception as e:
             print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", e)
