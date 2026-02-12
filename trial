@@ -1,88 +1,130 @@
 # -*- coding: utf-8 -*-
 """
-Outlook -> Deterministic KB-based draft reply (NO LLM), improved retrieval + bilingual output.
+Deterministic Outlook draft generator (NO LLM)
+- Answers using KB documents only (avoids citing mail chains)
+- Produces German + English sections
+- Adds greeting + sign-off
+- Removes person names + supplier names from evidence before composing answer
+- Marks mail as read + tags category to prevent duplicates
+- Notifies the user running the script that draft was created
+- Optional: reminder email in 2 days (best-effort)
 
-Key improvements vs previous:
-- Prefers "best" answer by exact/near-exact phrase matches before fallback retrieval.
-- Excludes mail-chain-like KB docs by default (AW_/WG_/RE_ and/or .html/.htm).
-- Always outputs German + English. Real translation uses Argos Translate if installed.
-- Better greeting + closing.
-- Marks original as read + sets category to prevent duplicates.
-- Self-notification + 2-day Outlook Task reminder.
+Requires:
+  pip install pywin32 python-docx pypdf python-dotenv
+Optional for better PDF extraction:
+  pip install pdfplumber
+Optional for translation:
+  pip install argostranslate
 
-Python 3.14 compatible. No Azure/OpenAI calls.
+Argos language packages must be installed once (offline):
+  See function ensure_argos_langpacks() below.
 """
 
 import os
 import re
 import time
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Optional
 from datetime import datetime, timedelta
 
 import win32com.client as win32
+from docx import Document as DocxDocument
+from pypdf import PdfReader
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # =========================
 # EDIT THESE
 # =========================
-TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"
-WATCH_FOLDER_NAME = "Inbox"
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"   # Outlook store DisplayName substring match
+WATCH_FOLDER_NAME = "Inbox"                           # "Inbox" or subfolder under Inbox
+STRICT_SUBJECT = "bot"                                # only process mails with subject exactly "bot" (case-insensitive)
 
 KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
 
-STRICT_SUBJECT = "bot"          # subject must be exactly this (case-insensitive)
 REQUIRE_UNREAD = True
 PROCESS_PER_RUN = 3
 SCAN_LIMIT = 250
 STARTUP_DELAY_SEC = 2
 
-ALLOWED_SENDERS = set()         # empty = allow anyone
+AUTO_SEND = False   # keep False (draft only)
+MARK_AS_READ = True
+ADD_CATEGORY = True
 PROCESSED_CATEGORY = "AI-Drafted"
 
 SELF_NOTIFY = True
 SELF_NOTIFY_TO = TARGET_MAILBOX
 
-CREATE_2DAY_TASK_REMINDER = True
+# Reminder: sends yourself an email 2 days later to check unsent drafts (best-effort)
+REMINDER_EMAIL = True
+REMINDER_AFTER_DAYS = 2
 
-# IMPORTANT: exclude mail-chain "documents" from KB retrieval
-EXCLUDE_MAIL_CHAIN_DOCS = True
+SUPPORTED_EXTS = {".txt", ".docx", ".pdf"}  # KB types
+MAX_FILES = 10
+MAX_CHARS_PER_FILE = 12000
 
-# If True, excludes .html/.htm from KB by default (recommended for your case)
-EXCLUDE_HTML_FROM_KB = True
+# Mail chains are excluded as sources (doc titles / filenames containing these patterns)
+MAILCHAIN_HINTS = ("aw_", "wg_", "re_", "fw_", "fwd_", "betreff", "subject")
+
+# =========================
+# Text hygiene settings
 # =========================
 
-SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"} | (set() if EXCLUDE_HTML_FROM_KB else {".html", ".htm"})
+# Remove typical header lines from mail bodies
+HEADER_LINE_PATTERNS = [
+    r"^\s*von\s*:\s*.*$",
+    r"^\s*from\s*:\s*.*$",
+    r"^\s*an\s*:\s*.*$",
+    r"^\s*to\s*:\s*.*$",
+    r"^\s*cc\s*:\s*.*$",
+    r"^\s*bcc\s*:\s*.*$",
+    r"^\s*gesendet\s*:\s*.*$",
+    r"^\s*sent\s*:\s*.*$",
+    r"^\s*betreff\s*:\s*.*$",
+    r"^\s*subject\s*:\s*.*$",
+    r"^\s*priorität\s*:\s*.*$",
+]
 
-MAX_DOC_CHARS = 40000
-CHUNK_SIZE = 1600
-CHUNK_OVERLAP = 250
+# Greeting/signature cues (we REMOVE these lines when extracting evidence from KB)
+GREET_CUES = r"(hallo|hi|hello|guten\s+morgen|guten\s+tag|good\s+morning|dear)\b"
+SIGNOFF_CUES = r"\b(vg|lg|br|mfg|mit\s+freundlichen\s+grüßen|best\s+regards|kind\s+regards|regards|sincerely)\b"
 
-TOP_K_CHUNKS = 6
-TOP_K_SENTENCES = 8
+# Person name heuristics (remove)
+PERSON_PATTERNS = [
+    # "Lastname, Firstname" (common in Outlook)
+    r"\b[A-ZÄÖÜ][a-zäöüß]+,\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b",
+    # "Dr. First Last"
+    r"\b(?:Dr|Prof)\.?\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){1,2}\b",
+    # "First Last" (cautious: require both words length>=2)
+    r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b",
+]
 
-# -------------------------
-# Sensitive scrubbing for outbound replies
-# -------------------------
-EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
-URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
-WWW_RE = re.compile(r"\bwww\.[^\s<>()]+\b", re.I)
-PHONE_RE = re.compile(r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d")
-ADDRESS_RE = re.compile(
-    r"\b([A-ZÄÖÜ][a-zäöüß]+(?:\s[A-ZÄÖÜ][a-zäöüß]+){0,3})\s"
-    r"(Straße|Strasse|Str\.|Weg|Allee|Platz|Ring|Gasse|Damm|Ufer)\s"
-    r"\d{1,5}[a-zA-Z]?\b"
-)
-IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b")
-MONEY_RE = re.compile(r"(?i)\b(?:€|EUR|USD|GBP|CHF)\s*\d[\d\.,\s]*\b|\b\d[\d\.,\s]*\s*(?:€|EUR|USD|GBP|CHF)\b")
-REF_RE = re.compile(r"\b(?:PO|PR|NCR|Ticket|Case|Req|Request|Material|Part|VU|SP|ID|Ref)\s*[:#]?\s*[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b", re.I)
+# Supplier/company patterns (remove only when it looks like an external company reference)
+COMPANY_SUFFIXES = r"(GmbH|AG|SE|KG|UG|Ltd|Limited|Inc|S\.?A\.?|S\.?r\.?l\.?|LLC|Co\.?|Company|Corporation)"
+COMPANY_PATTERNS = [
+    rf"\b[A-Z0-9ÄÖÜ][A-Za-z0-9ÄÖÜäöüß&\-\.\s]{{2,60}}\s+{COMPANY_SUFFIXES}\b",
+    r"\b(Lieferant|Supplier|Vendor)\s*[:\-]\s*[A-Z0-9ÄÖÜ][A-Za-z0-9ÄÖÜäöüß&\-\.\s]{2,60}\b",
+]
 
-NAME_COMMA_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]+,\s*[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b")
-NAME_SPACE_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b")
+# Sensitive tokens to remove from evidence
+SENSITIVE_PATTERNS = [
+    (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", ""),  # emails
+    (r"\bhttps?://[^\s<>()]+\b", ""),                               # urls
+    (r"\bwww\.[^\s<>()]+\b", ""),                                   # urls
+    (r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d", ""),  # phones
+    # postal-ish address cues
+    (r"\b(Straße|Strasse|Str\.|Weg|Allee|Platz|Ring|Gasse|Damm|Ufer)\b.*", ""),       # remove address lines
+]
 
-HEADER_LINE_RE = re.compile(r"(?im)^\s*(von|from|an|to|cc|gesendet|sent|betreff|subject)\s*:.*$")
 
 def clean_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def is_strict_subject(subject: str) -> bool:
+    return (subject or "").strip().casefold() == STRICT_SUBJECT.casefold()
+
 
 def first_name_from_email(email: str) -> str:
     e = (email or "").strip().lower()
@@ -90,464 +132,341 @@ def first_name_from_email(email: str) -> str:
         return "there"
     local = e.split("@", 1)[0]
     first = local.split(".", 1)[0].strip()
-    return (first[:1].upper() + first[1:]) if first else "there"
+    if not first:
+        return "there"
+    return first[:1].upper() + first[1:]
 
-def is_strict_subject(subject: str) -> bool:
-    return (subject or "").strip().casefold() == STRICT_SUBJECT.casefold()
 
-def sanitize_outbound(s: str) -> str:
-    if not s:
+def html_to_text(html: str) -> str:
+    # quick+safe stripper
+    txt = re.sub(r"<style.*?>.*?</style>", " ", html or "", flags=re.S | re.I)
+    txt = re.sub(r"<script.*?>.*?</script>", " ", txt, flags=re.S | re.I)
+    txt = re.sub(r"<[^>]+>", " ", txt, flags=re.S)
+    txt = txt.replace("&nbsp;", " ")
+    return clean_ws(txt)
+
+
+def remove_headers_and_signatures(text: str) -> str:
+    """
+    Remove From/To/Cc headers, and signature blocks to avoid learning names.
+    """
+    if not text:
         return ""
-    t = s
-    t = HEADER_LINE_RE.sub("", t)
-    t = EMAIL_RE.sub("", t)
-    t = URL_RE.sub("", t)
-    t = WWW_RE.sub("", t)
-    t = PHONE_RE.sub("", t)
-    t = ADDRESS_RE.sub("", t)
-    t = IBAN_RE.sub("", t)
-    t = MONEY_RE.sub("an amount", t)
-    t = REF_RE.sub("the relevant reference", t)
-    t = NAME_COMMA_RE.sub("", t)
-    t = NAME_SPACE_RE.sub("", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    t = re.sub(r"[ \t]{2,}", " ", t)
+
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    out = []
+    for ln in lines:
+        raw = ln.strip()
+        if not raw:
+            out.append("")
+            continue
+
+        # drop obvious email header lines
+        drop = False
+        for pat in HEADER_LINE_PATTERNS:
+            if re.search(pat, raw, flags=re.I):
+                drop = True
+                break
+        if drop:
+            continue
+
+        # drop greeting lines: "Hallo Max," etc (these carry names)
+        if re.search(rf"^\s*{GREET_CUES}\b", raw, flags=re.I):
+            continue
+
+        out.append(raw)
+
+    # cut off at first sign-off cue if present (signature)
+    joined = "\n".join(out)
+    m = re.search(rf"(\n|\r)\s*{SIGNOFF_CUES}\b", joined, flags=re.I)
+    if m:
+        joined = joined[: m.start()]
+
+    return clean_ws(joined)
+
+
+def redact_person_and_supplier_names(text: str) -> str:
+    """
+    Remove person names + supplier/company names from evidence text ONLY.
+    """
+    if not text:
+        return ""
+
+    t = text
+
+    # remove sensitive tokens first
+    for pat, repl in SENSITIVE_PATTERNS:
+        t = re.sub(pat, repl, t, flags=re.I)
+
+    # remove person names
+    for pat in PERSON_PATTERNS:
+        t = re.sub(pat, "", t)
+
+    # remove supplier/company patterns
+    for pat in COMPANY_PATTERNS:
+        t = re.sub(pat, "", t, flags=re.I)
+
+    # cleanup
+    t = re.sub(r"\s+", " ", t).strip()
     t = re.sub(r"\s+([,.;:])", r"\1", t)
+    t = re.sub(r"([,.;:]){2,}", r"\1", t)
     return t.strip()
 
-# -------------------------
-# Optional translation (Argos)
-# -------------------------
-def try_get_translator():
-    """
-    Returns a function translate(text, src, tgt) or None if unavailable.
-    Recommended:
-      pip install argostranslate
-    Then install language packages once (DE<->EN), e.g.:
-      python -c "from argostranslate import package, translate; \
-                package.install_from_path(package.download_package('en','de'))"
-    (Exact install method depends on your corporate network policies.)
-    """
-    try:
-        from argostranslate import translate as argos_translate
-    except Exception:
-        return None
 
-    def _translate(text: str, src: str, tgt: str) -> str:
-        if not text.strip():
-            return text
-        # argos expects language codes like "en", "de"
-        return argos_translate.translate(text, src, tgt)
-
-    return _translate
-
-TRANSLATE = try_get_translator()
-
-# -------------------------
-# KB readers (skip gracefully if libs missing)
-# -------------------------
+# ---------- KB readers ----------
 def read_txt(p: Path) -> str:
-    return p.read_text(encoding="utf-8", errors="ignore")[:MAX_DOC_CHARS]
+    return p.read_text(encoding="utf-8", errors="ignore")
+
 
 def read_docx(p: Path) -> str:
-    try:
-        from docx import Document
-    except Exception:
-        return ""
-    try:
-        doc = Document(str(p))
-        parts = []
-        for par in doc.paragraphs:
-            txt = clean_ws(par.text)
-            if txt:
-                parts.append(txt)
-        for table in doc.tables:
-            for row in table.rows:
-                cells = [clean_ws(c.text) for c in row.cells]
-                if any(cells):
-                    parts.append(" | ".join(cells))
-        return ("\n".join(parts))[:MAX_DOC_CHARS]
-    except Exception:
-        return ""
+    doc = DocxDocument(str(p))
+    parts = []
+    for par in doc.paragraphs:
+        tx = clean_ws(par.text)
+        if tx:
+            parts.append(tx)
+    # tables
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [clean_ws(c.text) for c in row.cells]
+            if any(cells):
+                parts.append(" | ".join(cells))
+    return "\n".join(parts)
+
 
 def read_pdf(p: Path) -> str:
-    # prefer pdfplumber if present
+    # Prefer pdfplumber if installed
     try:
-        import pdfplumber
+        import pdfplumber  # type: ignore
         out = []
         with pdfplumber.open(str(p)) as pdf:
             for page in pdf.pages:
-                txt = page.extract_text() or ""
-                if txt.strip():
-                    out.append(txt)
-        return ("\n".join(out))[:MAX_DOC_CHARS]
+                try:
+                    out.append(page.extract_text() or "")
+                except Exception:
+                    pass
+        return "\n".join(out)
     except Exception:
-        pass
-
-    try:
-        from pypdf import PdfReader
-        r = PdfReader(str(p))
+        # fallback to pypdf
         out = []
+        r = PdfReader(str(p))
         for pg in r.pages:
             try:
                 out.append(pg.extract_text() or "")
             except Exception:
                 pass
-        return ("\n".join(out))[:MAX_DOC_CHARS]
-    except Exception:
-        return ""
+        return "\n".join(out)
 
-def read_xlsx(p: Path) -> str:
-    try:
-        import openpyxl
-    except Exception:
-        return ""
-    try:
-        wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
-        out = []
-        for ws in wb.worksheets:
-            out.append(f"Sheet: {ws.title}")
-            max_rows = min(ws.max_row or 0, 250)
-            max_cols = min(ws.max_column or 0, 40)
-            for r in range(1, max_rows + 1):
-                row_vals = []
-                for c in range(1, max_cols + 1):
-                    v = ws.cell(row=r, column=c).value
-                    row_vals.append("" if v is None else str(v))
-                if any(x.strip() for x in row_vals):
-                    out.append(" | ".join(clean_ws(x) for x in row_vals))
-        return ("\n".join(out))[:MAX_DOC_CHARS]
-    except Exception:
-        return ""
 
-def read_html(p: Path) -> str:
-    # only used if EXCLUDE_HTML_FROM_KB=False
-    try:
-        raw = p.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return ""
-    # strip tags
-    txt = re.sub(r"<[^>]+>", " ", raw, flags=re.S)
-    return clean_ws(txt)[:MAX_DOC_CHARS]
-
-def extract_text_from_file(p: Path) -> str:
-    ext = p.suffix.lower()
-    if ext == ".txt":
-        return read_txt(p)
-    if ext == ".docx":
-        return read_docx(p)
-    if ext == ".pdf":
-        return read_pdf(p)
-    if ext == ".xlsx":
-        return read_xlsx(p)
-    if ext in {".html", ".htm"}:
-        return read_html(p)
-    return ""
-
-# -------------------------
-# Excluding mail-chain KB files
-# -------------------------
-MAILCHAIN_PREFIXES = ("aw_", "wg_", "re_", "fw_", "fwd_", "antwort", "reply", "forward")
-def is_mail_chain_filename(name: str) -> bool:
+def is_mailchain_filename(name: str) -> bool:
     n = (name or "").strip().lower()
-    if n.startswith(MAILCHAIN_PREFIXES):
-        return True
-    # common patterns
-    if " mail" in n or "mail_" in n or "email" in n:
-        return True
-    return False
+    return any(h in n for h in MAILCHAIN_HINTS)
 
-# -------------------------
-# Retrieval utilities
-# -------------------------
-WORD_RE = re.compile(r"[a-zA-ZÄÖÜäöüß0-9]+")
-SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 
-def tokenize(text: str) -> List[str]:
-    return [w.lower() for w in WORD_RE.findall(text or "") if len(w) >= 2]
-
-def chunk_text(text: str, size: int, overlap: int) -> List[str]:
-    t = (text or "").strip()
-    if not t:
-        return []
-    chunks = []
-    i = 0
-    n = len(t)
-    while i < n:
-        chunks.append(t[i:i+size])
-        i += max(1, size - overlap)
-    return chunks
-
-def _term_freq(tokens: List[str]) -> Dict[str, int]:
-    tf = {}
-    for t in tokens:
-        tf[t] = tf.get(t, 0) + 1
-    return tf
-
-def _safe_log(x: float) -> float:
-    import math
-    return math.log(max(x, 1.0000001))
-
-def load_kb_chunks(kb_dir: str) -> List[Dict]:
-    base = Path(kb_dir)
+def load_kb(dirpath: str) -> List[Tuple[str, str]]:
+    base = Path(dirpath)
     if not base.exists() or not base.is_dir():
-        raise SystemExit(f"KB_DIR not found or not a folder: {kb_dir}")
+        raise SystemExit(f"KB_DIR not found or not a folder: {dirpath}")
 
     files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
     if not files:
-        raise SystemExit(f"No supported KB files found in: {kb_dir}")
+        raise SystemExit(f"No KB files found in: {dirpath}")
 
-    chunks = []
+    out: List[Tuple[str, str]] = []
     for p in sorted(files):
-        if EXCLUDE_MAIL_CHAIN_DOCS and is_mail_chain_filename(p.name):
-            continue
-
-        txt = extract_text_from_file(p)
-        txt = (txt or "").strip()
-        if not txt:
-            continue
-
-        for idx, ch in enumerate(chunk_text(txt, CHUNK_SIZE, CHUNK_OVERLAP)):
-            toks = tokenize(ch)
-            if not toks:
+        try:
+            # skip mailchains entirely as sources
+            if is_mailchain_filename(p.name):
                 continue
-            chunks.append({
-                "doc_name": p.name,
-                "chunk_id": idx,
-                "text": ch,
-                "tf": _term_freq(toks),
-            })
 
-    if not chunks:
-        raise SystemExit("KB loaded but produced 0 text chunks. (Missing libs or all docs excluded?)")
+            ext = p.suffix.lower()
+            if ext == ".txt":
+                txt = read_txt(p)
+            elif ext == ".docx":
+                txt = read_docx(p)
+            else:
+                txt = read_pdf(p)
 
-    # IDF
-    df = {}
-    for c in chunks:
-        for term in set(c["tf"].keys()):
-            df[term] = df.get(term, 0) + 1
-    N = len(chunks)
-    idf = {t: _safe_log((N + 1) / (df_t + 0.5)) for t, df_t in df.items()}
+            txt = remove_headers_and_signatures(txt)
+            txt = clean_ws(txt)
+            if txt:
+                out.append((p.name, txt[:MAX_CHARS_PER_FILE]))
+        except Exception as e:
+            print("Skip KB file:", p.name, "-", e)
 
-    for c in chunks:
-        c["idf"] = idf
+    if not out:
+        raise SystemExit("KB loaded 0 usable documents (maybe all looked like mailchains or had no extractable text).")
+    return out
 
-    return chunks
 
-def score_chunk_bm25ish(query_tokens: List[str], chunk: Dict) -> float:
-    tf = chunk["tf"]
-    idf = chunk["idf"]
-    score = 0.0
-    doc_len = sum(tf.values()) + 1
+# ---------- retrieval ----------
+def tokenize(s: str) -> List[str]:
+    return [t for t in re.split(r"[^A-Za-z0-9ÄÖÜäöüß]+", (s or "").lower()) if len(t) >= 3]
 
-    for qt in query_tokens:
-        if qt in tf:
-            # baseline
-            score += (tf[qt] / (0.6 + doc_len)) * (idf.get(qt, 0.0) + 1.0) * 120.0
 
-    return score
-
-def score_chunk_exactness(query: str, chunk_text: str) -> float:
-    """
-    Boost if:
-    - Long phrases from query appear exactly
-    - Many query tokens appear in same sentence/line
-    """
-    q = clean_ws(query)
-    t = chunk_text
-
-    if not q or not t:
-        return 0.0
-
-    q_lower = q.lower()
-    t_lower = t.lower()
-
-    boost = 0.0
-
-    # exact long substring
-    if len(q_lower) >= 18 and q_lower in t_lower:
-        boost += 500.0
-
-    # exact phrase of 4-6 tokens
-    q_tokens = tokenize(q)
-    if len(q_tokens) >= 5:
-        phrase = " ".join(q_tokens[:6])
-        if phrase and phrase in t_lower:
-            boost += 280.0
-
-    # heading-like lines: short lines that include key tokens
-    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-    keyset = set(q_tokens)
-    for ln in lines[:30]:
-        if 20 <= len(ln) <= 120:
-            toks = set(tokenize(ln))
-            overlap = len(keyset.intersection(toks))
-            if overlap >= 4:
-                boost += 60.0
-
-    return boost
-
-def retrieve_top_chunks(kb_chunks: List[Dict], query: str, k: int) -> List[Dict]:
-    q_tokens = tokenize(query)
+def pick_best_passages(kb: List[Tuple[str, str]], question: str, top_k_docs: int = 5, top_k_passages: int = 6) -> List[Tuple[str, str]]:
+    q_tokens = set(tokenize(question))
     if not q_tokens:
-        return []
+        q_tokens = set(tokenize(question)[:30])
 
-    scored = []
-    for c in kb_chunks:
-        s = score_chunk_bm25ish(q_tokens, c) + score_chunk_exactness(query, c["text"])
-        if s > 0:
-            scored.append((s, c))
+    scored_docs = []
+    for name, text in kb:
+        t_tokens = set(tokenize(text))
+        score = len(q_tokens.intersection(t_tokens))
+        # boost exact phrase hits
+        for qt in list(q_tokens)[:12]:
+            if qt and qt in text.lower():
+                score += 1
+        scored_docs.append((score, name, text))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [c for _, c in scored[:k]]
+    scored_docs.sort(key=lambda x: x[0], reverse=True)
+    top_docs = [(n, t) for s, n, t in scored_docs[:top_k_docs] if s > 0]
 
-def extract_best_sentences(chunks: List[Dict], query: str, max_sents: int) -> List[str]:
-    q_tokens = set(tokenize(query))
-    best = []
-
-    scored = []
-    for c in chunks:
-        for sent in SENT_SPLIT_RE.split(c["text"]):
-            s = clean_ws(sent)
-            if len(s) < 25:
+    # split into passages (paragraph-ish)
+    passages = []
+    for name, text in top_docs:
+        for chunk in re.split(r"\n{2,}", text.replace("\r\n", "\n")):
+            c = clean_ws(chunk)
+            if len(c) < 60:
                 continue
-            toks = set(tokenize(s))
-            if not toks:
+            c_tokens = set(tokenize(c))
+            score = len(q_tokens.intersection(c_tokens))
+            if score <= 0:
                 continue
-            overlap = len(q_tokens.intersection(toks))
-            if overlap <= 0:
+            passages.append((score, name, c))
+
+    passages.sort(key=lambda x: x[0], reverse=True)
+    # return as (source, passage)
+    picked = [(name, redact_person_and_supplier_names(p)) for s, name, p in passages[:top_k_passages]]
+    return picked
+
+
+# ---------- translation ----------
+def translate_de_to_en(text: str) -> str:
+    """
+    Offline translation via argos-translate if available.
+    If not available or not configured, raise (so you see it in console).
+    """
+    try:
+        import argostranslate.package  # type: ignore
+        import argostranslate.translate  # type: ignore
+    except Exception as e:
+        raise RuntimeError("Argos Translate not installed. Run: pip install argostranslate") from e
+
+    installed_languages = argostranslate.translate.get_installed_languages()
+    de = next((l for l in installed_languages if l.code == "de"), None)
+    en = next((l for l in installed_languages if l.code == "en"), None)
+    if not de or not en:
+        raise RuntimeError(
+            "Argos language packs for DE and EN are not installed.\n"
+            "Install once (offline): download argos package files for de<->en and install with argostranslate.package.install_from_path(...)"
+        )
+
+    translation = de.get_translation(en)
+    return translation.translate(text)
+
+
+def translate_en_to_de(text: str) -> str:
+    try:
+        import argostranslate.translate  # type: ignore
+        installed_languages = argostranslate.translate.get_installed_languages()
+        en = next((l for l in installed_languages if l.code == "en"), None)
+        de = next((l for l in installed_languages if l.code == "de"), None)
+        if not de or not en:
+            raise RuntimeError("Argos DE/EN packs missing.")
+        translation = en.get_translation(de)
+        return translation.translate(text)
+    except Exception as e:
+        raise RuntimeError("Argos Translate not ready for EN->DE.") from e
+
+
+# ---------- compose answer (deterministic) ----------
+def build_german_answer(question_text: str, passages: List[Tuple[str, str]]) -> str:
+    """
+    Deterministic: extract key sentences from top passages.
+    No citations to mail chains. No source list in the email body.
+    """
+    if not passages:
+        # still answer politely, but: do not mention "based on docs"
+        return (
+            "ich konnte in den verfügbaren Unterlagen keine eindeutige Stelle finden, "
+            "die Ihre Frage direkt beantwortet.\n\n"
+            "Könnten Sie bitte kurz präzisieren, welche Variante/Anwendung/Projekt gemeint ist "
+            "oder welches Dokument die relevante Stelle enthält?"
+        )
+
+    # Take best passages and compress to bullet-like statements
+    bullets = []
+    for src, p in passages:
+        # split to sentences and keep those with question keywords
+        sents = re.split(r"(?<=[.!?])\s+", p)
+        for s in sents:
+            s = clean_ws(s)
+            if len(s) < 35:
                 continue
+            # keep if overlaps with question tokens
+            if len(set(tokenize(s)).intersection(set(tokenize(question_text)))) >= 2:
+                bullets.append(s)
 
-            # Favor sentences with high overlap, penalize very long sentences
-            score = overlap * 12.0 + (220.0 / max(40, len(s)))
-
-            # Strong bonus if the sentence contains a long exact phrase from query
-            q_clean = clean_ws(query).lower()
-            if len(q_clean) >= 18 and q_clean in s.lower():
-                score += 120.0
-
-            scored.append((score, s))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    seen = set()
-    for _, s in scored:
-        key = s.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        best.append(s)
-        if len(best) >= max_sents:
+        if len(bullets) >= 6:
             break
 
-    return best
+    bullets = bullets[:6] if bullets else [clean_ws(passages[0][1])]
 
-def sentences_to_structure(sentences: List[str]) -> Tuple[List[str], List[str]]:
-    if not sentences:
-        return [], []
-    if len(sentences) >= 4:
-        return sentences, []
-    return [], sentences
+    # Convert to readable paragraphs/bullets
+    if len(bullets) == 1:
+        return bullets[0]
 
-# -------------------------
-# Question vs "where to find" intent
-# -------------------------
-WHERE_FIND_CUES = re.compile(r"(?i)\b(where\s+can\s+i\s+find|where\s+to\s+find|which\s+document|in\s+which\s+document|wo\s+finde|wo\s+kann\s+ich\s+finden|in\s+welchem\s+dokument|wo\s+steht)\b")
+    return "\n".join([f"- {b}" for b in bullets])
 
-# -------------------------
-# Bilingual composition + real translation
-# -------------------------
-def translate_text(text: str, src: str, tgt: str) -> str:
+
+def make_dual_language_body(sender_first: str, your_first: str, de_answer: str) -> str:
+    en_answer = translate_de_to_en(de_answer)
+
+    # Greetings + sign-offs are explicit and not learned from documents
+    body = (
+        f"Hallo {sender_first},\n\n"
+        f"{de_answer}\n\n"
+        f"Mit freundlichen Grüßen\n"
+        f"{your_first}\n\n"
+        f"---\n\n"
+        f"Hello {sender_first},\n\n"
+        f"{en_answer}\n\n"
+        f"Best regards\n"
+        f"{your_first}"
+    )
+    return body
+
+
+def to_outlook_html(plain: str) -> str:
     """
-    If Argos available, translate.
-    Else return original and mark as not translated (so you notice).
+    Convert plain text into Outlook-friendly HTML with paragraphs + bullets.
     """
-    if not text.strip():
-        return text
-    if TRANSLATE is None:
-        return text  # caller will handle labeling
-    try:
-        return TRANSLATE(text, src, tgt)
-    except Exception:
-        return text
+    plain = (plain or "").replace("\r\n", "\n").strip()
+    if not plain:
+        return "<p></p>"
 
-def build_bilingual_email(
-    sender_first: str,
-    your_first: str,
-    question_text: str,
-    top_chunks: List[Dict],
-    kb_doc_names: List[str]
-) -> str:
-    ask_where = bool(WHERE_FIND_CUES.search(question_text or ""))
+    blocks = re.split(r"\n\s*\n", plain)
+    html_parts = []
 
-    # Core content (German as base output from KB, then translate to English if possible)
-    de_core_lines: List[str] = []
+    for block in blocks:
+        lines = [ln.rstrip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
 
-    if ask_where:
-        de_core_lines.append("Ich habe die relevanten Informationen in folgenden Dokumenten gefunden:")
-        for d in kb_doc_names[:6]:
-            de_core_lines.append(f"- {d}")
-        de_core_lines.append("")
-        de_core_lines.append("Wenn du mir sagst, welchen Abschnitt du genau brauchst, kann ich die passende Stelle gezielt heraussuchen.")
-    else:
-        sents = extract_best_sentences(top_chunks, question_text, TOP_K_SENTENCES)
-        bullets, paras = sentences_to_structure(sents)
-
-        if bullets:
-            de_core_lines.append("Hier ist die Antwort basierend auf den verfügbaren Dokumenten:")
-            for b in bullets:
-                de_core_lines.append(f"- {b}")
-        elif paras:
-            de_core_lines.append("Hier ist die Antwort basierend auf den verfügbaren Dokumenten:")
-            de_core_lines.append("")
-            de_core_lines.extend(paras)
+        if all(ln.strip().startswith("- ") for ln in lines):
+            html_parts.append("<ul>")
+            for ln in lines:
+                html_parts.append(f"<li>{ln[2:].strip()}</li>")
+            html_parts.append("</ul>")
         else:
-            de_core_lines.append("Ich finde in den verfügbaren Dokumenten keine eindeutige Antwort auf diese Frage.")
-            de_core_lines.append("Kannst du bitte den Begriff oder die konkrete Stelle nennen, nach der du suchst?")
+            para = "<br>".join(lines)
+            html_parts.append(f"<p>{para}</p>")
 
-        de_core_lines.append("")
-        de_core_lines.append("Quellen (Dokumente):")
-        for d in kb_doc_names[:6]:
-            de_core_lines.append(f"- {d}")
+    return "\n".join(html_parts)
 
-    de_core = "\n".join(de_core_lines).strip()
 
-    # Translate German core -> English core
-    en_core = translate_text(de_core, "de", "en")
-    translated_ok = (TRANSLATE is not None) and (en_core.strip() != de_core.strip())
-
-    # Greeting + closing (both languages)
-    de_mail = "\n".join([
-        f"Hallo {sender_first},",
-        "ich hoffe, es geht dir gut.",
-        "",
-        de_core,
-        "",
-        "Viele Grüße",
-        your_first
-    ]).strip()
-
-    en_mail = "\n".join([
-        f"Hello {sender_first},",
-        "I hope you are doing well.",
-        "",
-        en_core if translated_ok else (en_core + "\n\n[Note: automatic translation is not available on this machine. Install Argos Translate for DE↔EN.]"),
-        "",
-        "Best regards,",
-        your_first
-    ]).strip()
-
-    full = de_mail + "\n\n—\n\n" + en_mail
-    return sanitize_outbound(full)
-
-# -------------------------
-# Outlook utilities
-# -------------------------
-def clean_html_to_text(html: str) -> str:
-    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
-    txt = txt.replace("\xa0", " ")
-    return clean_ws(txt)
-
+# ---------- Outlook helpers ----------
 def get_sender_smtp(mail) -> str:
     try:
         addr = (mail.SenderEmailAddress or "").lower()
@@ -559,6 +478,7 @@ def get_sender_smtp(mail) -> str:
     except Exception:
         return (mail.SenderEmailAddress or "").lower()
 
+
 def add_processed_category(mail):
     try:
         cats = mail.Categories or ""
@@ -568,12 +488,6 @@ def add_processed_category(mail):
     except Exception:
         pass
 
-def mark_as_read(mail):
-    try:
-        mail.UnRead = False
-        mail.Save()
-    except Exception:
-        pass
 
 def get_target_folder():
     ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
@@ -601,121 +515,60 @@ def get_target_folder():
 
     raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
 
-def get_account_for_mailbox(ns, mailbox_substring: str):
+
+def send_self_notification(ns, to_addr: str, orig_subject: str):
+    msg = ns.Application.CreateItem(0)  # MailItem
+    msg.To = to_addr
+    msg.Subject = f"Draft created (review before sending): {orig_subject}"
+    msg.HTMLBody = (
+        "<p>A draft reply has been created in Outlook.</p>"
+        "<p>Please review it before sending.</p>"
+    )
+    msg.Send()
+
+
+def schedule_reminder_email(ns, to_addr: str, orig_subject: str, days: int):
+    """
+    Best-effort reminder: sends an email to yourself after N days by creating a delayed delivery mail.
+    This does NOT guarantee the draft is unsent; it just reminds you to check.
+    """
+    msg = ns.Application.CreateItem(0)
+    msg.To = to_addr
+    msg.Subject = f"Reminder: review/send draft for '{orig_subject}'"
+    msg.HTMLBody = (
+        "<p>Reminder to check the draft reply created earlier and send it if still needed.</p>"
+    )
+    deliver_at = datetime.now() + timedelta(days=days)
     try:
-        for acc in ns.Session.Accounts:
-            smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
-            if mailbox_substring.lower() in smtp or smtp in mailbox_substring.lower():
-                return acc
-    except Exception:
-        pass
-    return None
-
-def send_self_notification(ns, to_addr: str, orig_subject: str, requester_email: str):
-    try:
-        msg = ns.Application.CreateItem(0)
-        msg.To = to_addr
-        msg.Subject = f"Draft created (review needed): {orig_subject}"
-        msg.Body = (
-            "A draft reply was created by the deterministic bot.\n\n"
-            f"Original subject: {orig_subject}\n"
-            f"Requester: {requester_email}\n\n"
-            "Please review the draft before sending."
-        )
-
-        acc = get_account_for_mailbox(ns, TARGET_MAILBOX)
-        if acc:
-            try:
-                msg.SendUsingAccount = acc
-            except Exception:
-                pass
-
+        msg.DeferredDeliveryTime = deliver_at
         msg.Send()
     except Exception:
-        pass
+        # If delayed delivery is blocked by policy, just send immediately with a note
+        msg.Subject = f"(Could not schedule) {msg.Subject}"
+        msg.Send()
 
-def create_2day_task_reminder(ns, subject: str, requester_email: str, store_display_name: str):
-    try:
-        task = ns.Application.CreateItem(3)  # olTaskItem
-        due_dt = datetime.now() + timedelta(days=2)
 
-        task.Subject = f"Send/review draft reply: {subject}"
-        task.Body = (
-            "A draft reply was created by the Outlook bot.\n\n"
-            f"Original subject: {subject}\n"
-            f"Requester: {requester_email}\n"
-            f"Mailbox: {store_display_name}\n\n"
-            "Action: Review the draft in Drafts and send it if correct."
-        )
-
-        task.StartDate = datetime.now().date()
-        task.DueDate = due_dt.date()
-        task.ReminderSet = True
-        task.ReminderTime = due_dt
-        task.Importance = 2
-        task.Save()
-    except Exception:
-        pass
-
-def text_to_outlook_html(text: str) -> str:
-    t = (text or "").replace("\r\n", "\n").strip()
-    if not t:
-        return "<p></p>"
-
-    blocks = re.split(r"\n\s*\n", t)
-    html_parts = []
-
-    for block in blocks:
-        lines = [ln.rstrip() for ln in block.split("\n") if ln.strip()]
-        if not lines:
-            continue
-
-        if all(ln.strip().startswith("- ") for ln in lines):
-            html_parts.append("<ul>")
-            for ln in lines:
-                item = ln.strip()[2:].strip()
-                html_parts.append(f"<li>{_html_escape(item)}</li>")
-            html_parts.append("</ul>")
-        else:
-            para = "<br>".join(_html_escape(ln) for ln in lines)
-            html_parts.append(f"<p>{para}</p>")
-
-    return "\n".join(html_parts)
-
-def _html_escape(s: str) -> str:
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-# -------------------------
-# MAIN
-# -------------------------
+# =========================
+# MAIN (RUN ONCE)
+# =========================
 def main():
     time.sleep(STARTUP_DELAY_SEC)
 
-    print("=== CONFIG CHECK ===")
-    print("Python:", os.sys.version.split()[0])
-    print("KB_DIR:", KB_DIR)
-    print("Subject gate:", STRICT_SUBJECT)
-    print("Exclude mail-chain docs:", EXCLUDE_MAIL_CHAIN_DOCS)
-    print("Exclude HTML from KB:", EXCLUDE_HTML_FROM_KB)
-    print("Translator available (Argos):", bool(TRANSLATE))
-    print("====================")
-
     print("Loading KB from:", KB_DIR)
-    kb_chunks = load_kb_chunks(KB_DIR)
-    print("KB loaded (chunks):", len(kb_chunks))
+    kb = load_kb(KB_DIR)
+    print("KB loaded:", len(kb), "documents (mailchains excluded)")
 
     ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
     folder, store_name, folder_name = get_target_folder()
     print(f"Mailbox={store_name} | Folder={folder_name}")
 
-    allowed = {a.lower() for a in ALLOWED_SENDERS}
-
     items = folder.Items
     items.Sort("[ReceivedTime]", True)
 
+    your_first = first_name_from_email(TARGET_MAILBOX)
+
     drafted = 0
     checked = 0
-    your_first = first_name_from_email(TARGET_MAILBOX)
 
     for mail in items:
         checked += 1
@@ -725,67 +578,75 @@ def main():
             break
 
         try:
-            if getattr(mail, "Class", None) != 43:
+            if getattr(mail, "Class", None) != 43:  # MailItem
                 continue
 
-            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
+            if ADD_CATEGORY and PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
                 continue
 
             if REQUIRE_UNREAD and not mail.UnRead:
-                continue
-
-            sender = get_sender_smtp(mail)
-            if allowed and sender not in allowed:
                 continue
 
             subject = mail.Subject or ""
             if not is_strict_subject(subject):
                 continue
 
-            body_text = clean_html_to_text(getattr(mail, "HTMLBody", "") or "")
-            if not body_text:
-                body_text = clean_ws(getattr(mail, "Body", "") or "")
-
-            query = f"{subject}\n{body_text}".strip()
+            sender = get_sender_smtp(mail)
             sender_first = first_name_from_email(sender)
 
-            top_chunks = retrieve_top_chunks(kb_chunks, query, TOP_K_CHUNKS)
-            kb_doc_names = []
-            for c in top_chunks:
-                if c["doc_name"] not in kb_doc_names:
-                    kb_doc_names.append(c["doc_name"])
+            # question text (strip html + remove headers/signatures)
+            raw_body = ""
+            try:
+                raw_body = html_to_text(mail.HTMLBody or "")
+            except Exception:
+                raw_body = clean_ws(getattr(mail, "Body", "") or "")
 
-            answer_text = build_bilingual_email(
-                sender_first=sender_first,
-                your_first=your_first,
-                question_text=body_text,
-                top_chunks=top_chunks,
-                kb_doc_names=kb_doc_names
-            )
+            question_text = remove_headers_and_signatures(raw_body)
 
-            html_answer = text_to_outlook_html(answer_text)
+            # Retrieval
+            passages = pick_best_passages(kb, question_text)
 
+            # Compose German deterministically
+            de_answer = build_german_answer(question_text, passages)
+
+            # Make bilingual body (requires Argos; fail in console if missing)
+            final_plain = make_dual_language_body(sender_first, your_first, de_answer)
+            final_html = to_outlook_html(final_plain)
+
+            # Draft reply
             reply = mail.Reply()
-            reply.HTMLBody = f"<div>{html_answer}</div><hr>" + reply.HTMLBody
+            reply.HTMLBody = f"<div>{final_html}</div><hr>" + reply.HTMLBody
             reply.Save()
-
-            print("Draft created:", subject)
-
-            add_processed_category(mail)
-            mark_as_read(mail)
-
-            if SELF_NOTIFY:
-                send_self_notification(ns, SELF_NOTIFY_TO, orig_subject=subject, requester_email=sender)
-
-            if CREATE_2DAY_TASK_REMINDER:
-                create_2day_task_reminder(ns, subject=subject, requester_email=sender, store_display_name=store_name)
-
             drafted += 1
 
+            # Mark processed
+            if ADD_CATEGORY:
+                add_processed_category(mail)
+            if MARK_AS_READ:
+                mail.UnRead = False
+                mail.Save()
+
+            # Self notification
+            if SELF_NOTIFY:
+                try:
+                    send_self_notification(ns, SELF_NOTIFY_TO, subject)
+                except Exception as e:
+                    print("Self-notification failed:", e)
+
+            # Reminder in 2 days (best-effort)
+            if REMINDER_EMAIL:
+                try:
+                    schedule_reminder_email(ns, SELF_NOTIFY_TO, subject, REMINDER_AFTER_DAYS)
+                except Exception as e:
+                    print("Reminder scheduling failed:", e)
+
+            print("Draft created for:", subject)
+
         except Exception as e:
-            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", e)
+            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", repr(e))
 
     print(f"Done. Checked={checked}, Drafted={drafted}")
+
 
 if __name__ == "__main__":
     main()
