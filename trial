@@ -650,3 +650,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+import argostranslate.translate
+print([ (l.code, l.name) for l in argostranslate.translate.get_installed_languages() ])
