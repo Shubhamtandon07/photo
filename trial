@@ -1,57 +1,18 @@
-RC: 1
-STDOUT:
- Collecting huggingface-hub==0.35.3
-  Downloading huggingface_hub-0.35.3-py3-none-any.whl.metadata (14 kB)
-Collecting filelock (from huggingface-hub==0.35.3)
-  Downloading filelock-3.21.0-py3-none-any.whl.metadata (2.0 kB)
-Collecting fsspec>=2023.5.0 (from huggingface-hub==0.35.3)
-  Downloading fsspec-2026.2.0-py3-none-any.whl.metadata (10 kB)
-Collecting packaging>=20.9 (from huggingface-hub==0.35.3)
-  Downloading packaging-26.0-py3-none-any.whl.metadata (3.3 kB)
-Collecting pyyaml>=5.1 (from huggingface-hub==0.35.3)
-  Downloading pyyaml-6.0.3-cp314-cp314-win_amd64.whl.metadata (2.4 kB)
-Collecting requests (from huggingface-hub==0.35.3)
-  Downloading requests-2.32.5-py3-none-any.whl.metadata (4.9 kB)
-Collecting tqdm>=4.42.1 (from huggingface-hub==0.35.3)
-  Downloading tqdm-4.67.3-py3-none-any.whl.metadata (57 kB)
-Collecting typing-extensions>=3.7.4.3 (from huggingface-hub==0.35.3)
-  Downloading typing_extensions-4.15.0-py3-none-any.whl.metadata (3.3 kB)
-Collecting colorama (from tqdm>=4.42.1->huggingface-hub==0.35.3)
-  Downloading colorama-0.4.6-py2.py3-none-any.whl.metadata (17 kB)
-Collecting charset_normalizer<4,>=2 (from requests->huggingface-hub==0.35.3)
-  Downloading charset_normalizer-3.4.4-cp314-cp314-win_amd64.whl.metadata (38 kB)
-Collecting idna<4,>=2.5 (from requests->huggingface-hub==0.35.3)
-  Downloading idna-3.11-py3-none-any.whl.metadata (8.4 kB)
-Collecting urllib3<3,>=1.21.1 (from requests->huggingface-hub==0.35.3)
-  Downloading urllib3-2.6.3-py3-none-any.whl.metadata (6.9 kB)
-Collecting certifi>=2017.4.17 (from requests->huggingface-hub==0.35.3)
-  Downloading certifi-2026.1.4-py3-none-any.whl.metadata (2.5 kB)
-Downloading huggingface_hub-0.35.3-py3-none-any.whl (564 kB)
-   ---------------------------------------- 0.0/564.3 kB ? eta -:--:--
-   ------------------ --------------------- 262.1/564.3 kB ? eta -:--:--
-   ---------------------------------------- 564.3/564.3 kB 3.0 MB/s  0:00:00
-Downloading fsspec-2026.2.0-py3-none-any.whl (202 kB)
-Downloading packaging-26.0-py3-none-any.whl (74 kB)
-Downloading pyyaml-6.0.3-cp314-cp314-win_amd64.whl (156 kB)
-Downloading tqdm-4.67.3-py3-none-any.whl (78 kB)
-Downloading typing_extensions-4.15.0-py3-none-any.whl (44 kB)
-Downloading colorama-0.4.6-py2.py3-none-any.whl (25 kB)
-Downloading filelock-3.21.0-py3-none-any.whl (21 kB)
-Downloading requests-2.32.5-py3-none-any.whl (64 kB)
-Downloading charset_normalizer-3.4.4-cp314-cp314-win_amd64.whl (107 kB)
-Downloading idna-3.11-py3-none-any.whl (71 kB)
-Downloading urllib3-2.6.3-py3-none-any.whl (131 kB)
-Downloading certifi-2026.1.4-py3-none-any.whl (152 kB)
-Installing collected packages: urllib3, typing-extensions, pyyaml, packaging, idna, fsspec, filelock, colorama, charset_normalizer, certifi, tqdm, requests, huggingface-hub
+import sys, subprocess
 
-   ----------------------------------------  0/13 [urllib3]
-   ----------------------------------------  0/13 [urllib3]
-   ----------------------------------------  0/13 [urllib3]
-   ----------------------------------------  0/
-STDERR:
- ERROR: Could not install packages due to an OSError: [WinError 5] Zugriff verweigert: 'c:\\Users\\SHTANDO\\AppData\\Local\\Programs\\Python\\Python314\\Lib\\site-packages\\yaml\\_yaml.cp314-win_amd64.pyd'
-Consider using the `--user` option or check the permissions.
+cmd = [
+    sys.executable, "-m", "pip", "install",
+    "--user",
+    "--no-cache-dir",
+    "--ignore-installed",
+    "--force-reinstall",
+    "huggingface-hub==0.35.3"
+]
+p = subprocess.run(cmd, capture_output=True, text=True)
+print("RC:", p.returncode)
+print("STDOUT:\n", p.stdout[:3000])
+print("STDERR:\n", p.stderr[:3000])
 
-
-[notice] A new release of pip is available: 25.3 -> 26.0.1
-[notice] To update, run: python.exe -m pip install --upgrade pip
+import site, importlib.metadata as md
+print("user site:", site.getusersitepackages())
+print("hub version:", md.version("huggingface-hub"))
