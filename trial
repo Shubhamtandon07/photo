@@ -1,14 +1,7 @@
----------------------------------------------------------------------------
-CalledProcessError                        Traceback (most recent call last)
-Cell In[3], line 2
-      1 import sys, subprocess
-----> 2 subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", "huggingface-hub"])
-      3 subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "-U", "huggingface-hub"])
+import sys, subprocess
 
-File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\subprocess.py:419, in check_call(*popenargs, **kwargs)
-    417     if cmd is None:
-    418         cmd = popenargs[0]
---> 419     raise CalledProcessError(retcode, cmd)
-    420 return 0
-
-CalledProcessError: Command '['c:\\Users\\SHTANDO\\AppData\\Local\\Programs\\Python\\Python314\\python.exe', '-m', 'pip', 'uninstall', '-y', 'huggingface-hub']' returned non-zero exit status 1.
+cmd = [sys.executable, "-m", "pip", "uninstall", "-y", "huggingface-hub"]
+p = subprocess.run(cmd, capture_output=True, text=True)
+print("RETURN CODE:", p.returncode)
+print("STDOUT:\n", p.stdout)
+print("STDERR:\n", p.stderr)
