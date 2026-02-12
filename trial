@@ -1,11 +1,9 @@
-RETURN CODE: 1
-STDOUT:
- Found existing installation: huggingface-hub None
+import sys, subprocess
 
-STDERR:
- error: uninstall-no-record-file
-
-Ã— Cannot uninstall huggingface-hub None
-â•°â”€> The package's contents are unknown: no RECORD file was found for huggingface-hub.
-
-hint: You might be able to recover from this via: pip install --force-reinstall --no-deps huggingface-hub==0.35.3
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install",
+    "--no-cache-dir",
+    "--force-reinstall",
+    "--no-deps",
+    "huggingface-hub==0.35.3"
+])
