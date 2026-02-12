@@ -1,656 +1,74 @@
-# -*- coding: utf-8 -*-
-"""
-Deterministic Outlook draft generator (NO LLM)
-- Answers using KB documents only (avoids citing mail chains)
-- Produces German + English sections
-- Adds greeting + sign-off
-- Removes person names + supplier names from evidence before composing answer
-- Marks mail as read + tags category to prevent duplicates
-- Notifies the user running the script that draft was created
-- Optional: reminder email in 2 days (best-effort)
-
-Requires:
-  pip install pywin32 python-docx pypdf python-dotenv
-Optional for better PDF extraction:
-  pip install pdfplumber
-Optional for translation:
-  pip install argostranslate
-
-Argos language packages must be installed once (offline):
-  See function ensure_argos_langpacks() below.
-"""
-
-import os
-import re
-import time
-from pathlib import Path
-from typing import List, Tuple, Optional
-from datetime import datetime, timedelta
-
-import win32com.client as win32
-from docx import Document as DocxDocument
-from pypdf import PdfReader
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# =========================
-# EDIT THESE
-# =========================
-TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"   # Outlook store DisplayName substring match
-WATCH_FOLDER_NAME = "Inbox"                           # "Inbox" or subfolder under Inbox
-STRICT_SUBJECT = "bot"                                # only process mails with subject exactly "bot" (case-insensitive)
-
-KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
-
-REQUIRE_UNREAD = True
-PROCESS_PER_RUN = 3
-SCAN_LIMIT = 250
-STARTUP_DELAY_SEC = 2
-
-AUTO_SEND = False   # keep False (draft only)
-MARK_AS_READ = True
-ADD_CATEGORY = True
-PROCESSED_CATEGORY = "AI-Drafted"
-
-SELF_NOTIFY = True
-SELF_NOTIFY_TO = TARGET_MAILBOX
-
-# Reminder: sends yourself an email 2 days later to check unsent drafts (best-effort)
-REMINDER_EMAIL = True
-REMINDER_AFTER_DAYS = 2
-
-SUPPORTED_EXTS = {".txt", ".docx", ".pdf"}  # KB types
-MAX_FILES = 10
-MAX_CHARS_PER_FILE = 12000
-
-# Mail chains are excluded as sources (doc titles / filenames containing these patterns)
-MAILCHAIN_HINTS = ("aw_", "wg_", "re_", "fw_", "fwd_", "betreff", "subject")
-
-# =========================
-# Text hygiene settings
-# =========================
-
-# Remove typical header lines from mail bodies
-HEADER_LINE_PATTERNS = [
-    r"^\s*von\s*:\s*.*$",
-    r"^\s*from\s*:\s*.*$",
-    r"^\s*an\s*:\s*.*$",
-    r"^\s*to\s*:\s*.*$",
-    r"^\s*cc\s*:\s*.*$",
-    r"^\s*bcc\s*:\s*.*$",
-    r"^\s*gesendet\s*:\s*.*$",
-    r"^\s*sent\s*:\s*.*$",
-    r"^\s*betreff\s*:\s*.*$",
-    r"^\s*subject\s*:\s*.*$",
-    r"^\s*priorität\s*:\s*.*$",
-]
-
-# Greeting/signature cues (we REMOVE these lines when extracting evidence from KB)
-GREET_CUES = r"(hallo|hi|hello|guten\s+morgen|guten\s+tag|good\s+morning|dear)\b"
-SIGNOFF_CUES = r"\b(vg|lg|br|mfg|mit\s+freundlichen\s+grüßen|best\s+regards|kind\s+regards|regards|sincerely)\b"
-
-# Person name heuristics (remove)
-PERSON_PATTERNS = [
-    # "Lastname, Firstname" (common in Outlook)
-    r"\b[A-ZÄÖÜ][a-zäöüß]+,\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b",
-    # "Dr. First Last"
-    r"\b(?:Dr|Prof)\.?\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){1,2}\b",
-    # "First Last" (cautious: require both words length>=2)
-    r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b",
-]
-
-# Supplier/company patterns (remove only when it looks like an external company reference)
-COMPANY_SUFFIXES = r"(GmbH|AG|SE|KG|UG|Ltd|Limited|Inc|S\.?A\.?|S\.?r\.?l\.?|LLC|Co\.?|Company|Corporation)"
-COMPANY_PATTERNS = [
-    rf"\b[A-Z0-9ÄÖÜ][A-Za-z0-9ÄÖÜäöüß&\-\.\s]{{2,60}}\s+{COMPANY_SUFFIXES}\b",
-    r"\b(Lieferant|Supplier|Vendor)\s*[:\-]\s*[A-Z0-9ÄÖÜ][A-Za-z0-9ÄÖÜäöüß&\-\.\s]{2,60}\b",
-]
-
-# Sensitive tokens to remove from evidence
-SENSITIVE_PATTERNS = [
-    (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", ""),  # emails
-    (r"\bhttps?://[^\s<>()]+\b", ""),                               # urls
-    (r"\bwww\.[^\s<>()]+\b", ""),                                   # urls
-    (r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d", ""),  # phones
-    # postal-ish address cues
-    (r"\b(Straße|Strasse|Str\.|Weg|Allee|Platz|Ring|Gasse|Damm|Ufer)\b.*", ""),       # remove address lines
-]
-
-
-def clean_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
-
-
-def is_strict_subject(subject: str) -> bool:
-    return (subject or "").strip().casefold() == STRICT_SUBJECT.casefold()
-
-
-def first_name_from_email(email: str) -> str:
-    e = (email or "").strip().lower()
-    if "@" not in e:
-        return "there"
-    local = e.split("@", 1)[0]
-    first = local.split(".", 1)[0].strip()
-    if not first:
-        return "there"
-    return first[:1].upper() + first[1:]
-
-
-def html_to_text(html: str) -> str:
-    # quick+safe stripper
-    txt = re.sub(r"<style.*?>.*?</style>", " ", html or "", flags=re.S | re.I)
-    txt = re.sub(r"<script.*?>.*?</script>", " ", txt, flags=re.S | re.I)
-    txt = re.sub(r"<[^>]+>", " ", txt, flags=re.S)
-    txt = txt.replace("&nbsp;", " ")
-    return clean_ws(txt)
-
-
-def remove_headers_and_signatures(text: str) -> str:
-    """
-    Remove From/To/Cc headers, and signature blocks to avoid learning names.
-    """
-    if not text:
-        return ""
-
-    lines = (text or "").replace("\r\n", "\n").split("\n")
-    out = []
-    for ln in lines:
-        raw = ln.strip()
-        if not raw:
-            out.append("")
-            continue
-
-        # drop obvious email header lines
-        drop = False
-        for pat in HEADER_LINE_PATTERNS:
-            if re.search(pat, raw, flags=re.I):
-                drop = True
-                break
-        if drop:
-            continue
-
-        # drop greeting lines: "Hallo Max," etc (these carry names)
-        if re.search(rf"^\s*{GREET_CUES}\b", raw, flags=re.I):
-            continue
-
-        out.append(raw)
-
-    # cut off at first sign-off cue if present (signature)
-    joined = "\n".join(out)
-    m = re.search(rf"(\n|\r)\s*{SIGNOFF_CUES}\b", joined, flags=re.I)
-    if m:
-        joined = joined[: m.start()]
-
-    return clean_ws(joined)
-
-
-def redact_person_and_supplier_names(text: str) -> str:
-    """
-    Remove person names + supplier/company names from evidence text ONLY.
-    """
-    if not text:
-        return ""
-
-    t = text
-
-    # remove sensitive tokens first
-    for pat, repl in SENSITIVE_PATTERNS:
-        t = re.sub(pat, repl, t, flags=re.I)
-
-    # remove person names
-    for pat in PERSON_PATTERNS:
-        t = re.sub(pat, "", t)
-
-    # remove supplier/company patterns
-    for pat in COMPANY_PATTERNS:
-        t = re.sub(pat, "", t, flags=re.I)
-
-    # cleanup
-    t = re.sub(r"\s+", " ", t).strip()
-    t = re.sub(r"\s+([,.;:])", r"\1", t)
-    t = re.sub(r"([,.;:]){2,}", r"\1", t)
-    return t.strip()
-
-
-# ---------- KB readers ----------
-def read_txt(p: Path) -> str:
-    return p.read_text(encoding="utf-8", errors="ignore")
-
-
-def read_docx(p: Path) -> str:
-    doc = DocxDocument(str(p))
-    parts = []
-    for par in doc.paragraphs:
-        tx = clean_ws(par.text)
-        if tx:
-            parts.append(tx)
-    # tables
-    for table in doc.tables:
-        for row in table.rows:
-            cells = [clean_ws(c.text) for c in row.cells]
-            if any(cells):
-                parts.append(" | ".join(cells))
-    return "\n".join(parts)
-
-
-def read_pdf(p: Path) -> str:
-    # Prefer pdfplumber if installed
-    try:
-        import pdfplumber  # type: ignore
-        out = []
-        with pdfplumber.open(str(p)) as pdf:
-            for page in pdf.pages:
-                try:
-                    out.append(page.extract_text() or "")
-                except Exception:
-                    pass
-        return "\n".join(out)
-    except Exception:
-        # fallback to pypdf
-        out = []
-        r = PdfReader(str(p))
-        for pg in r.pages:
-            try:
-                out.append(pg.extract_text() or "")
-            except Exception:
-                pass
-        return "\n".join(out)
-
-
-def is_mailchain_filename(name: str) -> bool:
-    n = (name or "").strip().lower()
-    return any(h in n for h in MAILCHAIN_HINTS)
-
-
-def load_kb(dirpath: str) -> List[Tuple[str, str]]:
-    base = Path(dirpath)
-    if not base.exists() or not base.is_dir():
-        raise SystemExit(f"KB_DIR not found or not a folder: {dirpath}")
-
-    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
-    if not files:
-        raise SystemExit(f"No KB files found in: {dirpath}")
-
-    out: List[Tuple[str, str]] = []
-    for p in sorted(files):
-        try:
-            # skip mailchains entirely as sources
-            if is_mailchain_filename(p.name):
-                continue
-
-            ext = p.suffix.lower()
-            if ext == ".txt":
-                txt = read_txt(p)
-            elif ext == ".docx":
-                txt = read_docx(p)
-            else:
-                txt = read_pdf(p)
-
-            txt = remove_headers_and_signatures(txt)
-            txt = clean_ws(txt)
-            if txt:
-                out.append((p.name, txt[:MAX_CHARS_PER_FILE]))
-        except Exception as e:
-            print("Skip KB file:", p.name, "-", e)
-
-    if not out:
-        raise SystemExit("KB loaded 0 usable documents (maybe all looked like mailchains or had no extractable text).")
-    return out
-
-
-# ---------- retrieval ----------
-def tokenize(s: str) -> List[str]:
-    return [t for t in re.split(r"[^A-Za-z0-9ÄÖÜäöüß]+", (s or "").lower()) if len(t) >= 3]
-
-
-def pick_best_passages(kb: List[Tuple[str, str]], question: str, top_k_docs: int = 5, top_k_passages: int = 6) -> List[Tuple[str, str]]:
-    q_tokens = set(tokenize(question))
-    if not q_tokens:
-        q_tokens = set(tokenize(question)[:30])
-
-    scored_docs = []
-    for name, text in kb:
-        t_tokens = set(tokenize(text))
-        score = len(q_tokens.intersection(t_tokens))
-        # boost exact phrase hits
-        for qt in list(q_tokens)[:12]:
-            if qt and qt in text.lower():
-                score += 1
-        scored_docs.append((score, name, text))
-
-    scored_docs.sort(key=lambda x: x[0], reverse=True)
-    top_docs = [(n, t) for s, n, t in scored_docs[:top_k_docs] if s > 0]
-
-    # split into passages (paragraph-ish)
-    passages = []
-    for name, text in top_docs:
-        for chunk in re.split(r"\n{2,}", text.replace("\r\n", "\n")):
-            c = clean_ws(chunk)
-            if len(c) < 60:
-                continue
-            c_tokens = set(tokenize(c))
-            score = len(q_tokens.intersection(c_tokens))
-            if score <= 0:
-                continue
-            passages.append((score, name, c))
-
-    passages.sort(key=lambda x: x[0], reverse=True)
-    # return as (source, passage)
-    picked = [(name, redact_person_and_supplier_names(p)) for s, name, p in passages[:top_k_passages]]
-    return picked
-
-
-# ---------- translation ----------
-def translate_de_to_en(text: str) -> str:
-    """
-    Offline translation via argos-translate if available.
-    If not available or not configured, raise (so you see it in console).
-    """
-    try:
-        import argostranslate.package  # type: ignore
-        import argostranslate.translate  # type: ignore
-    except Exception as e:
-        raise RuntimeError("Argos Translate not installed. Run: pip install argostranslate") from e
-
-    installed_languages = argostranslate.translate.get_installed_languages()
-    de = next((l for l in installed_languages if l.code == "de"), None)
-    en = next((l for l in installed_languages if l.code == "en"), None)
-    if not de or not en:
-        raise RuntimeError(
-            "Argos language packs for DE and EN are not installed.\n"
-            "Install once (offline): download argos package files for de<->en and install with argostranslate.package.install_from_path(...)"
-        )
-
-    translation = de.get_translation(en)
-    return translation.translate(text)
-
-
-def translate_en_to_de(text: str) -> str:
-    try:
-        import argostranslate.translate  # type: ignore
-        installed_languages = argostranslate.translate.get_installed_languages()
-        en = next((l for l in installed_languages if l.code == "en"), None)
-        de = next((l for l in installed_languages if l.code == "de"), None)
-        if not de or not en:
-            raise RuntimeError("Argos DE/EN packs missing.")
-        translation = en.get_translation(de)
-        return translation.translate(text)
-    except Exception as e:
-        raise RuntimeError("Argos Translate not ready for EN->DE.") from e
-
-
-# ---------- compose answer (deterministic) ----------
-def build_german_answer(question_text: str, passages: List[Tuple[str, str]]) -> str:
-    """
-    Deterministic: extract key sentences from top passages.
-    No citations to mail chains. No source list in the email body.
-    """
-    if not passages:
-        # still answer politely, but: do not mention "based on docs"
-        return (
-            "ich konnte in den verfügbaren Unterlagen keine eindeutige Stelle finden, "
-            "die Ihre Frage direkt beantwortet.\n\n"
-            "Könnten Sie bitte kurz präzisieren, welche Variante/Anwendung/Projekt gemeint ist "
-            "oder welches Dokument die relevante Stelle enthält?"
-        )
-
-    # Take best passages and compress to bullet-like statements
-    bullets = []
-    for src, p in passages:
-        # split to sentences and keep those with question keywords
-        sents = re.split(r"(?<=[.!?])\s+", p)
-        for s in sents:
-            s = clean_ws(s)
-            if len(s) < 35:
-                continue
-            # keep if overlaps with question tokens
-            if len(set(tokenize(s)).intersection(set(tokenize(question_text)))) >= 2:
-                bullets.append(s)
-
-        if len(bullets) >= 6:
-            break
-
-    bullets = bullets[:6] if bullets else [clean_ws(passages[0][1])]
-
-    # Convert to readable paragraphs/bullets
-    if len(bullets) == 1:
-        return bullets[0]
-
-    return "\n".join([f"- {b}" for b in bullets])
-
-
-def make_dual_language_body(sender_first: str, your_first: str, de_answer: str) -> str:
-    en_answer = translate_de_to_en(de_answer)
-
-    # Greetings + sign-offs are explicit and not learned from documents
-    body = (
-        f"Hallo {sender_first},\n\n"
-        f"{de_answer}\n\n"
-        f"Mit freundlichen Grüßen\n"
-        f"{your_first}\n\n"
-        f"---\n\n"
-        f"Hello {sender_first},\n\n"
-        f"{en_answer}\n\n"
-        f"Best regards\n"
-        f"{your_first}"
-    )
-    return body
-
-
-def to_outlook_html(plain: str) -> str:
-    """
-    Convert plain text into Outlook-friendly HTML with paragraphs + bullets.
-    """
-    plain = (plain or "").replace("\r\n", "\n").strip()
-    if not plain:
-        return "<p></p>"
-
-    blocks = re.split(r"\n\s*\n", plain)
-    html_parts = []
-
-    for block in blocks:
-        lines = [ln.rstrip() for ln in block.split("\n") if ln.strip()]
-        if not lines:
-            continue
-
-        if all(ln.strip().startswith("- ") for ln in lines):
-            html_parts.append("<ul>")
-            for ln in lines:
-                html_parts.append(f"<li>{ln[2:].strip()}</li>")
-            html_parts.append("</ul>")
-        else:
-            para = "<br>".join(lines)
-            html_parts.append(f"<p>{para}</p>")
-
-    return "\n".join(html_parts)
-
-
-# ---------- Outlook helpers ----------
-def get_sender_smtp(mail) -> str:
-    try:
-        addr = (mail.SenderEmailAddress or "").lower()
-        if addr.startswith("/o="):
-            ex = mail.Sender.GetExchangeUser()
-            if ex:
-                return (ex.PrimarySmtpAddress or "").lower()
-        return addr
-    except Exception:
-        return (mail.SenderEmailAddress or "").lower()
-
-
-def add_processed_category(mail):
-    try:
-        cats = mail.Categories or ""
-        if PROCESSED_CATEGORY.lower() not in cats.lower():
-            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
-            mail.Save()
-    except Exception:
-        pass
-
-
-def get_target_folder():
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-
-    target_store = None
-    for st in ns.Stores:
-        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
-            target_store = st
-            break
-
-    if not target_store:
-        print("Available stores:")
-        for st in ns.Stores:
-            print(" -", st.DisplayName)
-        raise SystemExit("Target mailbox not found.")
-
-    inbox = target_store.GetDefaultFolder(6)  # Inbox
-
-    if WATCH_FOLDER_NAME.lower() == "inbox":
-        return inbox, target_store.DisplayName, "Inbox"
-
-    for f in inbox.Folders:
-        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
-            return f, target_store.DisplayName, f.Name
-
-    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
-
-
-def send_self_notification(ns, to_addr: str, orig_subject: str):
-    msg = ns.Application.CreateItem(0)  # MailItem
-    msg.To = to_addr
-    msg.Subject = f"Draft created (review before sending): {orig_subject}"
-    msg.HTMLBody = (
-        "<p>A draft reply has been created in Outlook.</p>"
-        "<p>Please review it before sending.</p>"
-    )
-    msg.Send()
-
-
-def schedule_reminder_email(ns, to_addr: str, orig_subject: str, days: int):
-    """
-    Best-effort reminder: sends an email to yourself after N days by creating a delayed delivery mail.
-    This does NOT guarantee the draft is unsent; it just reminds you to check.
-    """
-    msg = ns.Application.CreateItem(0)
-    msg.To = to_addr
-    msg.Subject = f"Reminder: review/send draft for '{orig_subject}'"
-    msg.HTMLBody = (
-        "<p>Reminder to check the draft reply created earlier and send it if still needed.</p>"
-    )
-    deliver_at = datetime.now() + timedelta(days=days)
-    try:
-        msg.DeferredDeliveryTime = deliver_at
-        msg.Send()
-    except Exception:
-        # If delayed delivery is blocked by policy, just send immediately with a note
-        msg.Subject = f"(Could not schedule) {msg.Subject}"
-        msg.Send()
-
-
-# =========================
-# MAIN (RUN ONCE)
-# =========================
-def main():
-    time.sleep(STARTUP_DELAY_SEC)
-
-    print("Loading KB from:", KB_DIR)
-    kb = load_kb(KB_DIR)
-    print("KB loaded:", len(kb), "documents (mailchains excluded)")
-
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-    folder, store_name, folder_name = get_target_folder()
-    print(f"Mailbox={store_name} | Folder={folder_name}")
-
-    items = folder.Items
-    items.Sort("[ReceivedTime]", True)
-
-    your_first = first_name_from_email(TARGET_MAILBOX)
-
-    drafted = 0
-    checked = 0
-
-    for mail in items:
-        checked += 1
-        if checked > SCAN_LIMIT:
-            break
-        if drafted >= PROCESS_PER_RUN:
-            break
-
-        try:
-            if getattr(mail, "Class", None) != 43:  # MailItem
-                continue
-
-            if ADD_CATEGORY and PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
-                continue
-
-            if REQUIRE_UNREAD and not mail.UnRead:
-                continue
-
-            subject = mail.Subject or ""
-            if not is_strict_subject(subject):
-                continue
-
-            sender = get_sender_smtp(mail)
-            sender_first = first_name_from_email(sender)
-
-            # question text (strip html + remove headers/signatures)
-            raw_body = ""
-            try:
-                raw_body = html_to_text(mail.HTMLBody or "")
-            except Exception:
-                raw_body = clean_ws(getattr(mail, "Body", "") or "")
-
-            question_text = remove_headers_and_signatures(raw_body)
-
-            # Retrieval
-            passages = pick_best_passages(kb, question_text)
-
-            # Compose German deterministically
-            de_answer = build_german_answer(question_text, passages)
-
-            # Make bilingual body (requires Argos; fail in console if missing)
-            final_plain = make_dual_language_body(sender_first, your_first, de_answer)
-            final_html = to_outlook_html(final_plain)
-
-            # Draft reply
-            reply = mail.Reply()
-            reply.HTMLBody = f"<div>{final_html}</div><hr>" + reply.HTMLBody
-            reply.Save()
-            drafted += 1
-
-            # Mark processed
-            if ADD_CATEGORY:
-                add_processed_category(mail)
-            if MARK_AS_READ:
-                mail.UnRead = False
-                mail.Save()
-
-            # Self notification
-            if SELF_NOTIFY:
-                try:
-                    send_self_notification(ns, SELF_NOTIFY_TO, subject)
-                except Exception as e:
-                    print("Self-notification failed:", e)
-
-            # Reminder in 2 days (best-effort)
-            if REMINDER_EMAIL:
-                try:
-                    schedule_reminder_email(ns, SELF_NOTIFY_TO, subject, REMINDER_AFTER_DAYS)
-                except Exception as e:
-                    print("Reminder scheduling failed:", e)
-
-            print("Draft created for:", subject)
-
-        except Exception as e:
-            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", repr(e))
-
-    print(f"Done. Checked={checked}, Drafted={drafted}")
-
-
-if __name__ == "__main__":
-    main()
-
-
-import argostranslate.translate
-print([ (l.code, l.name) for l in argostranslate.translate.get_installed_languages() ])
+---------------------------------------------------------------------------
+ValueError                                Traceback (most recent call last)
+Cell In[1], line 1
+----> 1 import argostranslate.translate
+      2 print([ (l.code, l.name) for l in argostranslate.translate.get_installed_languages() ])
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\argostranslate\translate.py:6
+      3 import functools
+      4 from typing import List
+----> 6 import ctranslate2
+      7 # import sentencepiece as spm
+      8 from ctranslate2 import Translator
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\ctranslate2\__init__.py:58
+     55     else:
+     56         raise
+---> 58 from ctranslate2 import converters, models, specs
+     59 from ctranslate2.version import __version__
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\ctranslate2\converters\__init__.py:8
+      6 from ctranslate2.converters.opennmt_tf import OpenNMTTFConverter
+      7 from ctranslate2.converters.opus_mt import OpusMTConverter
+----> 8 from ctranslate2.converters.transformers import TransformersConverter
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\ctranslate2\converters\transformers.py:14
+     12     import huggingface_hub
+     13     import torch
+---> 14     import transformers
+     15 except ImportError:
+     16     pass
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\transformers\__init__.py:27
+     24 from typing import TYPE_CHECKING
+     26 # Check the dependencies satisfy the minimal versions required.
+---> 27 from . import dependency_versions_check
+     28 from .utils import (
+     29     OptionalDependencyNotAvailable,
+     30     _LazyModule,
+   (...)     36     is_pretty_midi_available,
+     37 )
+     39 # Note: the following symbols are deliberately exported with `as`
+     40 # so that mypy, pylint or other static linters can recognize them,
+     41 # given that they are not exported using `__all__` in this file.
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\transformers\dependency_versions_check.py:57
+     54         if not is_accelerate_available():
+     55             continue  # not required, check version only if installed
+---> 57     require_version_core(deps[pkg])
+     58 else:
+     59     raise ValueError(f"can't find {pkg} in {deps.keys()}, check dependency_versions_table.py")
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\transformers\utils\versions.py:117, in require_version_core(requirement)
+    115 """require_version wrapper which emits a core-specific hint on failure"""
+    116 hint = "Try: `pip install transformers -U` or `pip install -e '.[dev]'` if you're working with git main"
+--> 117 return require_version(requirement, hint)
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\transformers\utils\versions.py:111, in require_version(requirement, hint)
+    109 if want_ver is not None:
+    110     for op, want_ver in wanted.items():
+--> 111         _compare_versions(op, got_ver, want_ver, requirement, pkg, hint)
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\transformers\utils\versions.py:39, in _compare_versions(op, got_ver, want_ver, requirement, pkg, hint)
+     37 def _compare_versions(op, got_ver, want_ver, requirement, pkg, hint):
+     38     if got_ver is None or want_ver is None:
+---> 39         raise ValueError(
+     40             f"Unable to compare versions for {requirement}: need={want_ver} found={got_ver}. This is unusual. Consider"
+     41             f" reinstalling {pkg}."
+     42         )
+     43     if not ops[op](version.parse(got_ver), version.parse(want_ver)):
+     44         raise ImportError(
+     45             f"{requirement} is required for a normal functioning of this module, but found {pkg}=={got_ver}.{hint}"
+     46         )
+
+ValueError: Unable to compare versions for huggingface-hub>=0.34.0,<1.0: need=0.34.0 found=None. This is unusual. Consider reinstalling huggingface-hub.
