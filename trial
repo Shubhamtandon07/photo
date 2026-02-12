@@ -1,2 +1,2 @@
-user site: C:\Users\SHTANDO\AppData\Roaming\Python\Python314\site-packages
-hub version: 0.35.3
+import argostranslate.translate
+print([ (l.code, l.name) for l in argostranslate.translate.get_installed_languages() ])
