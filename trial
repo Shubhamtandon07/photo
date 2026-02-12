@@ -1,14 +1,23 @@
-import sys, subprocess, textwrap
+RETURN CODE: 1
 
-cmd = [
-    sys.executable, "-m", "pip", "install",
-    "--no-cache-dir",
-    "--force-reinstall",
-    "--no-deps",
-    "huggingface-hub==0.35.3"
-]
+--- STDOUT ---
+ Collecting huggingface-hub==0.35.3
+  Downloading huggingface_hub-0.35.3-py3-none-any.whl.metadata (14 kB)
+Downloading huggingface_hub-0.35.3-py3-none-any.whl (564 kB)
+   ---------------------------------------- 0.0/564.3 kB ? eta -:--:--
+   ---------------------------------------- 564.3/564.3 kB 4.4 MB/s  0:00:00
+Installing collected packages: huggingface-hub
+  Attempting uninstall: huggingface-hub
+    Found existing installation: huggingface-hub None
 
-p = subprocess.run(cmd, capture_output=True, text=True)
-print("RETURN CODE:", p.returncode)
-print("\n--- STDOUT ---\n", p.stdout[:6000])
-print("\n--- STDERR ---\n", p.stderr[:6000])
+
+--- STDERR ---
+ 
+[notice] A new release of pip is available: 25.3 -> 26.0.1
+[notice] To update, run: python.exe -m pip install --upgrade pip
+error: uninstall-no-record-file
+
+Ã— Cannot uninstall huggingface-hub None
+â•°â”€> The package's contents are unknown: no RECORD file was found for huggingface-hub.
+
+hint: You might be able to recover from this via: pip install --force-reinstall --no-deps huggingface-hub==0.35.3
