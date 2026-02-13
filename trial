@@ -1,7 +1,35 @@
-import os, deepl
+---------------------------------------------------------------------------
+AuthorizationException                    Traceback (most recent call last)
+Cell In[12], line 6
+      3 auth = os.getenv("DEEPL_AUTH_KEY")
+      4 tr = deepl.Translator(auth)
+----> 6 res = tr.translate_text("Das ist ein Test. Bitte übersetzen.", target_lang="EN-US")
+      7 print(res.text)
 
-auth = os.getenv("DEEPL_AUTH_KEY")
-tr = deepl.Translator(auth)
+File ~\AppData\Roaming\Python\Python314\site-packages\deepl\translator.py:514, in Translator.translate_text(self, text, source_lang, target_lang, context, split_sentences, preserve_formatting, formality, glossary, tag_handling, tag_handling_version, outline_detection, non_splitting_tags, splitting_tags, ignore_tags, model_type, style_rule, custom_instructions, extra_body_parameters)
+    508         request_data[k] = v
+    510 status, content, json = self._api_call(
+    511     "v2/translate", json=request_data
+    512 )
+--> 514 self._raise_for_status(status, content, json)
+    516 translations = (
+    517     json.get("translations", [])
+    518     if (json and isinstance(json, dict))
+    519     else []
+    520 )
+    521 output = []
 
-res = tr.translate_text("Das ist ein Test. Bitte übersetzen.", target_lang="EN-US")
-print(res.text)
+File ~\AppData\Roaming\Python\Python314\site-packages\deepl\translator.py:186, in Translator._raise_for_status(self, status_code, content, json, glossary, downloading_document)
+    184     return
+    185 elif status_code == http.HTTPStatus.FORBIDDEN:
+--> 186     raise AuthorizationException(
+    187         f"Authorization failure, check auth_key{message}",
+    188         http_status_code=status_code,
+    189     )
+    190 elif status_code == self._HTTP_STATUS_QUOTA_EXCEEDED:
+    191     raise QuotaExceededException(
+    192         f"Quota for this billing period has been exceeded{message}",
+    193         http_status_code=status_code,
+    194     )
+
+AuthorizationException: Authorization failure, check auth_key, message: Forbidden. You can find more info in our docs: https://developers.deepl.com/docs/getting-started/auth
