@@ -1,13 +1,7 @@
-Hallo Sustainable-procurement, 
-ich hoffe, es geht dir gut. 
-Juli 2024 00:29 Betreff: RE: Angebot A02 ermittelte [PERSON] sende ich Ihnen die Unterlagen für die 100% [PERSON], die wie bereits erwähnt, für uns nicht als Vergleichsbasis dient, da wir bereits ein besseres Angebot auf Basis der Allgemeintoleranzen – und somit unter gleichen Voraussetzungen wie für die Mitbewerber – eingereicht haben.
-Kann der Wert nicht erreicht werden, ist dies an dieser Stelle zu erklären. 
-in des Assessement (ASA) Responsible sourcing Self- (SAQ ) Ambition 2039 RFQ unabhängige Anforderungen RFQ Responsible sourcing Responsible sourcing CO2- zu Sekundärmaterial- für den geben Sie zu allen unten genannten Vergabeprämissen unter Berücksichtigung der folgenden Rückmeldung:  Wenn einer Prämisse aus nicht zugestimmt werden kann, wählen Sie bitte als Rückmeldung &quot;Diskussionsbedarf&quot; aus und spezifizieren den Grund in der dafür vorgesehen Kommentarzelle.
---- 
-English version: 
-Hello Sustainable-procurement, 
-I hope you are doing well. 
-I could not find a clear, explicit answer in the available documents. 
-Mit freundlichen Grüßen / Best regards 
-Shubham 
+import os, deepl
 
+auth = os.getenv("DEEPL_AUTH_KEY")
+tr = deepl.Translator(auth)
+
+res = tr.translate_text("Das ist ein Test. Bitte übersetzen.", target_lang="EN-US")
+print(res.text)
