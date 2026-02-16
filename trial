@@ -1,30 +1,25 @@
 import os
 import re
-import sys
 import csv
-import time
+import shutil
 from pathlib import Path
 from datetime import datetime
 
-import pdfplumber
-
-# -----------------------------
+# =========================
 # CONFIG
-# -----------------------------
-PDF_ROOT = Path(r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus")
+# =========================
+ROOT = Path(r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus")
+EXPORT_BASE = ROOT / "_exports"
+RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-EXPORT_DIR = PDF_ROOT / "_exports" / f"pdf_text_extract_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-TXT_OUT_DIR = EXPORT_DIR / "pdf_text"
+RUN_DIR = EXPORT_BASE / f"pdf_collect_{RUN_ID}"
+OUT_PDF_DIR = RUN_DIR / "pdfs"
+MANIFEST_CSV = RUN_DIR / "pdf_manifest.csv"
+ERRORS_LOG = RUN_DIR / "errors.log"
 
-# If True, writes txt even when empty (useful for auditing)
-WRITE_EMPTY_TXT = True
-
-# Optional: skip very large PDFs (pages)
-MAX_PAGES = None  # e.g. 200 or None
-
-# -----------------------------
-# Helpers
-# -----------------------------
+# =========================
+# HELPERS
+# =========================
 def ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
@@ -40,94 +35,60 @@ def sanitize_filename(name: str, max_len: int = 120) -> str:
         name = name[:max_len].rstrip(". ")
     return name
 
-def is_mostly_empty(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
-        return True
-    # if it's mostly whitespace or very short, treat as empty
-    compact = re.sub(r"\s+", "", t)
-    return len(compact) < 40
+def short_hash(s: str) -> str:
+    # lightweight stable hash without importing hashlib (works fine for filenames)
+    h = 0
+    for ch in s:
+        h = (h * 131 + ord(ch)) % 2_000_000_000
+    return f"{h:010d}"
 
-def extract_text_pdfplumber(pdf_path: Path) -> tuple[str, int]:
-    """
-    Returns: (text, pages_processed)
-    """
-    out = []
-    pages_done = 0
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        total = len(pdf.pages)
-        if MAX_PAGES is not None:
-            total = min(total, MAX_PAGES)
-        for i in range(total):
-            page = pdf.pages[i]
-            txt = page.extract_text() or ""
-            txt = txt.strip()
-            if txt:
-                out.append(txt)
-            pages_done += 1
-    return "\n\n".join(out).strip(), pages_done
+def log_err(msg: str):
+    with ERRORS_LOG.open("a", encoding="utf-8", errors="ignore") as f:
+        f.write(msg + "\n")
 
-# -----------------------------
-# Main
-# -----------------------------
-def run_pdf_extraction():
-    ensure_dir(EXPORT_DIR)
-    ensure_dir(TXT_OUT_DIR)
+# =========================
+# MAIN
+# =========================
+def collect_pdfs():
+    ensure_dir(RUN_DIR)
+    ensure_dir(OUT_PDF_DIR)
 
-    pdf_files = sorted(PDF_ROOT.rglob("*.pdf"))
-    print("PDF root:", PDF_ROOT)
-    print("Found PDFs:", len(pdf_files))
-    print("Export dir:", EXPORT_DIR)
+    pdfs = sorted(ROOT.rglob("*.pdf"))
+    print("ROOT:", ROOT)
+    print("Found PDFs:", len(pdfs))
+    print("RUN_DIR:", RUN_DIR)
 
-    summary_path = EXPORT_DIR / "pdf_extract_summary.csv"
-
-    with summary_path.open("w", newline="", encoding="utf-8-sig") as f:
+    with MANIFEST_CSV.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow([
-            "pdf_path",
-            "txt_out",
-            "pages_processed",
-            "chars_extracted",
-            "status"
-        ])
+        w.writerow(["src_pdf", "dst_pdf", "status", "bytes"])
 
         ok = 0
-        empty = 0
-        failed = 0
+        fail = 0
 
-        for idx, pdf_path in enumerate(pdf_files, start=1):
+        for p in pdfs:
             try:
-                text, pages_done = extract_text_pdfplumber(pdf_path)
-                chars = len(text)
+                # make destination filename unique and short (avoid Win path-length issues)
+                rel = str(p.relative_to(ROOT))
+                base = sanitize_filename(p.stem, max_len=80)
+                uniq = short_hash(rel)
+                dst_name = f"{base}__{uniq}.pdf"
+                dst = OUT_PDF_DIR / dst_name
 
-                rel = pdf_path.relative_to(PDF_ROOT)
-                # keep directory structure mirrored, but safe
-                rel_parent = Path(*[sanitize_filename(p) for p in rel.parent.parts])
-                out_dir = ensure_dir(TXT_OUT_DIR / rel_parent)
+                # copy2 keeps timestamps
+                shutil.copy2(p, dst)
 
-                out_name = sanitize_filename(pdf_path.stem) + ".txt"
-                txt_out = out_dir / out_name
-
-                if is_mostly_empty(text):
-                    status = "NO_TEXT_FOUND (likely scanned PDF)"
-                    empty += 1
-                    if WRITE_EMPTY_TXT:
-                        txt_out.write_text("", encoding="utf-8", errors="ignore")
-                else:
-                    status = "OK"
-                    ok += 1
-                    txt_out.write_text(text, encoding="utf-8", errors="ignore")
-
-                w.writerow([str(pdf_path), str(txt_out), pages_done, chars, status])
-
-                if idx % 25 == 0:
-                    print(f"Progress: {idx}/{len(pdf_files)} | ok={ok} empty={empty} failed={failed}")
+                size = dst.stat().st_size if dst.exists() else 0
+                w.writerow([str(p), str(dst), "OK", size])
+                ok += 1
 
             except Exception as e:
-                failed += 1
-                w.writerow([str(pdf_path), "", 0, 0, f"ERROR: {repr(e)}"])
+                fail += 1
+                w.writerow([str(p), "", f"ERROR: {repr(e)}", 0])
+                log_err(f"ERROR copying {p} -> {repr(e)}")
 
-        print(f"Done. OK={ok}, NO_TEXT={empty}, FAILED={failed}")
-        print("Summary CSV:", summary_path)
+    print(f"Done. OK={ok} FAIL={fail}")
+    print("Manifest:", MANIFEST_CSV)
+    print("Errors:", ERRORS_LOG)
+    print("Collected PDFs folder:", OUT_PDF_DIR)
 
-run_pdf_extraction()
+collect_pdfs()
