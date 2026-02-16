@@ -1,28 +1,16 @@
-from pathlib import Path
-import re
-from collections import Counter
+Total error entries: 8
+Unique failing files: 8
 
-log_path = Path(r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports\msg_to_docx_redacted_20260216_190750\errors.log")
+Failing files:
+ - AW_ Bitte um Zusendung der Nachhaltigkeitsprämissenblätter.msg
+ - AW_ Nachhaltigkeitsprämissen Lokal USA Charleston.msg
+ - AW_ Nachhaltigkeitsprämissen Taskforce Zonencontroller _ Rückmeldung Lieferant Vitesco_Schaeffler.msg
+ - AW_ Nachhaltigkeitsprämissen V530 Rohbau-WU-Paket SP2-10741 Kirchhoff.msg
+ - AW_ Nachhaltigkeitsprämissen_VU 2-2024-01727 M177 EVO GT BS Hotend_Coldend.msg
+ - AW_ RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitsprämissen .msg
+ - AW_ SAQ Woco_ _ Ergänzt um weitere Fragen _ Nachhaltigkeitsprämissenblatt.msg
+ - RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitsprämissen .msg
 
-text = log_path.read_text(encoding="utf-8", errors="ignore")
-
-# capture lines like: ERROR: filename.msg -> Exception(...)
-errs = re.findall(r"ERROR:\s+(.*?)\s+->\s+(.+)", text)
-
-print("Total error entries:", len(errs))
-
-# show unique failing files
-files = [e[0] for e in errs]
-uniq_files = sorted(set(files))
-print("Unique failing files:", len(uniq_files))
-print("\nFailing files:")
-for f in uniq_files:
-    print(" -", f)
-
-# show top exception types/messages
-exc_msgs = [e[1] for e in errs]
-top = Counter(exc_msgs).most_common(15)
-
-print("\nTop error messages:")
-for msg, n in top:
-    print(f"{n}x  {msg[:200]}")
+Top error messages:
+4x  FileNotFoundError(2, 'Der Dateiname oder die Erweiterung ist zu lang')
+4x  FileNotFoundError(2, 'Das System kann den angegebenen Pfad nicht finden')
