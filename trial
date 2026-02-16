@@ -1,213 +1,551 @@
-[2026-02-16 17:50:40] ERROR: AW_ Bitte um Zusendung der Nachhaltigkeitsprämissenblätter.msg -> FileNotFoundError(2, 'Der Dateiname oder die Erweiterung ist zu lang')
-[2026-02-16 17:50:40] Traceback (most recent call last):
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 206] Der Dateiname oder die Erweiterung ist zu lang: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\AW_ Bitte um Zusendung der Nachhaltigkeitsprämissenblätter'
+# ================================
+# .MSG -> ONE .DOCX per email
+# - Redact personal/sensitive info in subject+body+attachments
+# - Append attachment text (pdf/xlsx/docx/txt/csv + OCR for png/jpg if available)
+# - Jupyter-safe (no argparse)
+# - Python 3.14 compatible
+# ================================
 
-During handling of the above exception, another exception occurred:
+import os
+import re
+import sys
+import json
+import traceback
+from pathlib import Path
+from datetime import datetime
+import html as html_mod
 
-Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 464, in run_all
-    msg_to_docx_one_file(p, out_docx, att_root, log_path)
-    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 350, in msg_to_docx_one_file
-    msg_att_dir = ensure_dir(att_root / sanitize_filename(msg_path.stem))
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 59, in ensure_dir
+
+# ---------- CONFIG ----------
+MSG_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus"
+OUT_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports"
+
+RUN_PREFIX = "msg_to_docx_redacted"
+
+BODY_MAX_CHARS = 250_000
+ATTACH_TEXT_MAX_CHARS = 25_000  # increased so PDFs show more useful content
+PDF_MAX_PAGES = 50              # increased
+XLSX_MAX_SHEETS = 10            # increased
+XLSX_MAX_ROWS = 400             # increased
+XLSX_MAX_COLS = 40              # increased
+
+# Names you explicitly want deleted even when single-token:
+FORCE_REDACT_NAMES = [
+    "lisa", "dario", "tim", "daniel", "rasmus", "marvin", "victoria",
+    "janina", "veronika", "athanasia", "alina", "anne"
+]
+
+# ---------- OPTIONAL IMPORTS (auto-skip if missing) ----------
+def try_import(name):
+    try:
+        __import__(name)
+        return sys.modules[name]
+    except Exception:
+        return None
+
+extract_msg = try_import("extract_msg")
+
+docx_mod = None
+try:
+    import docx as docx_mod  # python-docx
+except Exception:
+    docx_mod = None
+
+pdfplumber = try_import("pdfplumber")
+openpyxl = try_import("openpyxl")
+
+# OCR for images (optional)
+PIL_Image = None
+pytesseract = None
+try:
+    from PIL import Image as PIL_Image
+except Exception:
+    PIL_Image = None
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+
+# ---------- UTIL ----------
+def now_ts():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
-    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1021, in mkdir
-    self.mkdir(mode, parents=False, exist_ok=exist_ok)
-    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 206] Der Dateiname oder die Erweiterung ist zu lang: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\AW_ Bitte um Zusendung der Nachhaltigkeitsprämissenblätter'
+    return p
 
-[2026-02-16 17:50:40] ERROR: AW_ Nachhaltigkeitsprämissen Lokal USA Charleston.msg -> FileNotFoundError(2, 'Der Dateiname oder die Erweiterung ist zu lang')
-[2026-02-16 17:50:40] Traceback (most recent call last):
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 206] Der Dateiname oder die Erweiterung ist zu lang: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\AW_ Nachhaltigkeitsprämissen Lokal USA Charleston'
+def safe_str(x) -> str:
+    if x is None:
+        return ""
+    try:
+        return str(x)
+    except Exception:
+        try:
+            return repr(x)
+        except Exception:
+            return ""
 
-During handling of the above exception, another exception occurred:
+def sanitize_filename(name: str, max_len: int = 160) -> str:
+    name = safe_str(name).strip()
+    name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    if len(name) > max_len:
+        name = name[:max_len].rstrip()
+    return name or "message"
 
-Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 464, in run_all
-    msg_to_docx_one_file(p, out_docx, att_root, log_path)
-    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 350, in msg_to_docx_one_file
+def log_line(log_path: Path, line: str):
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(f"[{now_ts()}] {line}\n")
+
+
+# ---------- HTML->TEXT ----------
+def strip_html_to_text(html: str) -> str:
+    h = safe_str(html)
+    h = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", h)
+    h = re.sub(r"(?i)<br\s*/?>", "\n", h)
+    h = re.sub(r"(?i)</p\s*>", "\n\n", h)
+    h = re.sub(r"(?is)<.*?>", " ", h)
+    try:
+        h = html_mod.unescape(h)
+    except Exception:
+        pass
+    h = re.sub(r"[ \t]+\n", "\n", h)
+    h = re.sub(r"\n{3,}", "\n\n", h)
+    h = re.sub(r"[ \t]{2,}", " ", h)
+    return h.strip()
+
+
+# ---------- BODY EXTRACTION ----------
+def body_best_effort(msg) -> str:
+    b = safe_str(getattr(msg, "body", "") or "")
+    if b.strip():
+        return b.strip()
+
+    hb = safe_str(getattr(msg, "htmlBody", "") or "")
+    if hb.strip():
+        t = strip_html_to_text(hb)
+        if t.strip():
+            return t.strip()
+
+    rb = getattr(msg, "rtfBody", None)
+    if rb is not None:
+        try:
+            if isinstance(rb, (bytes, bytearray)):
+                rb = rb.decode("utf-8", errors="ignore")
+            rb = safe_str(rb).strip()
+            if rb:
+                rb2 = re.sub(r"{\\.*?}", " ", rb)
+                rb2 = re.sub(r"\\[a-zA-Z]+\d*\s?", " ", rb2)
+                rb2 = re.sub(r"[{}]", " ", rb2)
+                rb2 = re.sub(r"\s{2,}", " ", rb2).strip()
+                if rb2:
+                    return rb2
+        except Exception:
+            pass
+
+    return ""
+
+
+# ---------- REDACTION ----------
+LEGAL_SUFFIXES = {
+    "gmbh", "ag", "kg", "kgaa", "se", "inc", "ltd", "llc", "plc", "bv", "nv", "oy", "sas", "sarl"
+}
+
+STREET_WORDS = [
+    "straße", "strasse", "str.", "street", "st.", "weg", "allee", "platz", "gasse", "ring",
+    "chaussee", "road", "rd", "avenue", "av.", "boulevard", "blvd"
+]
+
+HEADER_CUE_LINES = [
+    "von:", "from:",
+    "an:", "to:",
+    "cc:", "kopie:", "bcc:",
+    "gesendet:", "sent:",
+    "betreff:", "subject:",
+    "priorität:", "priority:",
+    "mail to:", "mailto:"
+]
+
+# compile forced-name pattern (case-insensitive, whole word)
+FORCE_NAME_RE = re.compile(r"\b(" + "|".join(map(re.escape, FORCE_REDACT_NAMES)) + r")\b", re.IGNORECASE)
+
+def redact_names_heuristic(text: str) -> str:
+    """
+    Heuristic for multi-token names: redact 2-3 token "Person-like" names
+    with Capitalized words, but avoid obvious company forms.
+    """
+    pat = re.compile(r"\b([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){1,2})\b")
+
+    def repl(m):
+        phrase = m.group(1)
+        low = phrase.lower()
+        for sfx in LEGAL_SUFFIXES:
+            if f" {sfx}" in low or low.endswith(sfx):
+                return phrase
+        if any(w in low for w in ["mercedes", "benz", "plant", "werk", "procurement", "supplier", "quality"]):
+            return phrase
+        return "[REDACTED_NAME]"
+
+    return pat.sub(repl, text)
+
+def redact_text(text: str) -> str:
+    t = safe_str(text)
+
+    # 0) Force redact specific first names everywhere (single-token included)
+    # do early so later rules don't miss it
+    t = FORCE_NAME_RE.sub("[REDACTED_NAME]", t)
+
+    # 1) Remove common header lines (Von/An/Cc/Gesendet/Betreff etc.)
+    lines = t.splitlines()
+    cleaned = []
+    for line in lines:
+        l = line.strip()
+        low = l.lower()
+        if any(low.startswith(cue) for cue in HEADER_CUE_LINES):
+            continue
+        if low.startswith("_____") or low.startswith("----") or low.startswith("original message"):
+            continue
+        cleaned.append(line)
+    t = "\n".join(cleaned)
+
+    # 2) Emails
+    t = re.sub(r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b", "[REDACTED_EMAIL]", t)
+
+    # 3) Phone numbers (broad)
+    t = re.sub(r"(?<!\d)(\+?\d[\d\s()./\-]{6,}\d)(?!\d)", "[REDACTED_PHONE]", t)
+
+    # 4) IBAN
+    t = re.sub(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b", "[REDACTED_IBAN]", t)
+
+    # 5) Postal code + city
+    t = re.sub(r"\b\d{5}\s+[A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß\-]{2,}\b", "[REDACTED_LOCATION]", t)
+
+    # 6) Street-like addresses
+    street_word_re = "|".join([re.escape(w) for w in STREET_WORDS])
+    t = re.sub(
+        rf"\b([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß\-\s]{{2,60}}\s(?:{street_word_re})\s*\d{{1,4}}[A-Za-z]?)\b",
+        "[REDACTED_ADDRESS]",
+        t,
+        flags=re.IGNORECASE
+    )
+
+    # 7) Internal codes
+    t = re.sub(r"\b0\d{2}-[A-Z0-9]+\b", "[REDACTED_INTERNAL]", t)
+    t = re.sub(r"\b0\d{2}/[A-Z]{2,}\b", "[REDACTED_INTERNAL]", t)
+    t = re.sub(r"\bMP/RM\d\b", "[REDACTED_INTERNAL]", t)
+
+    # 8) Greeting lines: keep greeting, remove name part
+    t = re.sub(r"(?im)^(hallo|hi|guten morgen|guten tag|sehr geehrte[rn]?|dear|hello)\s+.+?$",
+               r"\1 [REDACTED_NAME]", t)
+
+    # 9) Signature closings
+    t = re.sub(r"(?im)^(mit freundlichen grüßen|freundliche grüße|best regards|kind regards|vg|lg|br)\s*$",
+               r"\1", t)
+    t = re.sub(r"(?im)^(vg|lg|br)\s+.+$", r"\1 [REDACTED_NAME]", t)
+
+    # 10) Heuristic multi-word person names
+    t = redact_names_heuristic(t)
+
+    # 11) Re-apply forced names after heuristics (safe)
+    t = FORCE_NAME_RE.sub("[REDACTED_NAME]", t)
+
+    # 12) Cleanup
+    t = re.sub(r"(\[REDACTED_[A-Z_]+\])(\s+\1)+", r"\1", t)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{4,}", "\n\n\n", t)
+
+    return t.strip()
+
+
+# ---------- ATTACHMENT EXTRACTION ----------
+def ocr_image_to_text(img_path: Path) -> str:
+    """
+    OCR for png/jpg if pillow+pytesseract are available.
+    Skips silently otherwise.
+    """
+    if PIL_Image is None or pytesseract is None:
+        return ""
+    try:
+        img = PIL_Image.open(str(img_path))
+        # modest preprocessing: convert to RGB (helps some scans)
+        img = img.convert("RGB")
+        text = pytesseract.image_to_string(img)
+        return safe_str(text).strip()
+    except Exception:
+        return ""
+
+def extract_attachment_text(path: Path) -> str:
+    if not path.exists() or not path.is_file():
+        return ""
+
+    ext = path.suffix.lower()
+
+    # TXT/CSV
+    if ext in [".txt", ".csv", ".log"]:
+        try:
+            return path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            try:
+                return path.read_text(encoding="latin-1", errors="ignore")
+            except Exception:
+                return ""
+
+    # PDF (text-based)
+    if ext == ".pdf" and pdfplumber is not None:
+        try:
+            parts = []
+            with pdfplumber.open(str(path)) as pdf:
+                for p in pdf.pages[:PDF_MAX_PAGES]:
+                    txt = p.extract_text() or ""
+                    if txt.strip():
+                        parts.append(txt)
+            return "\n\n".join(parts).strip()
+        except Exception:
+            return ""
+
+    # XLSX/XLSM
+    if ext in [".xlsx", ".xlsm"] and openpyxl is not None:
+        try:
+            wb = openpyxl.load_workbook(str(path), data_only=True, read_only=True)
+            out = []
+            for ws in wb.worksheets[:XLSX_MAX_SHEETS]:
+                out.append(f"[Sheet] {ws.title}")
+                for r_i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                    if r_i > XLSX_MAX_ROWS:
+                        break
+                    vals = []
+                    for v in row[:XLSX_MAX_COLS]:
+                        if v is None:
+                            continue
+                        s = safe_str(v).strip()
+                        if s:
+                            vals.append(s)
+                    if vals:
+                        out.append(" | ".join(vals))
+            return "\n".join(out).strip()
+        except Exception:
+            return ""
+
+    # DOCX
+    if ext == ".docx" and docx_mod is not None:
+        try:
+            d = docx_mod.Document(str(path))
+            paras = [p.text for p in d.paragraphs if p.text and p.text.strip()]
+            return "\n".join(paras).strip()
+        except Exception:
+            return ""
+
+    # Images (OCR)
+    if ext in [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"]:
+        return ocr_image_to_text(path)
+
+    return ""
+
+
+# ---------- ATTACHMENT SAVING (more robust) ----------
+def save_attachments_robust(msg_obj, target_dir: Path, log_path: Path):
+    """
+    extract_msg attachment saving differs by version. Try multiple approaches.
+    """
+    target_dir = ensure_dir(target_dir)
+
+    # 1) Standard API
+    saver = getattr(msg_obj, "saveAttachments", None)
+    if callable(saver):
+        try:
+            saver(customPath=str(target_dir))
+            return
+        except TypeError:
+            try:
+                saver(str(target_dir))
+                return
+            except Exception as e:
+                log_line(log_path, f"WARNING: saveAttachments failed: {repr(e)}")
+        except Exception as e:
+            log_line(log_path, f"WARNING: saveAttachments failed: {repr(e)}")
+
+    # 2) Some versions expose attachments list with .save()
+    atts = getattr(msg_obj, "attachments", None)
+    if atts:
+        try:
+            for a in atts:
+                try:
+                    # attachment objects often have .save(customPath=...)
+                    save_fn = getattr(a, "save", None)
+                    if callable(save_fn):
+                        try:
+                            save_fn(customPath=str(target_dir))
+                        except TypeError:
+                            save_fn(str(target_dir))
+                except Exception as e:
+                    log_line(log_path, f"WARNING: attachment.save failed: {repr(e)}")
+            return
+        except Exception as e:
+            log_line(log_path, f"WARNING: iter attachments failed: {repr(e)}")
+
+    # 3) Last resort: msg_obj.save() (exports full contents)
+    save_fn = getattr(msg_obj, "save", None)
+    if callable(save_fn):
+        try:
+            save_fn(customPath=str(target_dir))
+        except Exception as e:
+            log_line(log_path, f"WARNING: msg.save failed: {repr(e)}")
+
+
+# ---------- WRITE DOCX ----------
+def add_text_preserve_lines(doc, text: str):
+    for line in (text or "").splitlines():
+        doc.add_paragraph(line)
+
+def msg_to_docx_one_file(msg_path: Path, out_docx: Path, att_root: Path, log_path: Path):
+    m = extract_msg.Message(str(msg_path))
+
+    proc = getattr(m, "process", None)
+    if callable(proc):
+        proc()
+
+    subject = safe_str(getattr(m, "subject", "") or "").strip()
+    if not subject:
+        subject = msg_path.stem
+
+    date = safe_str(getattr(m, "date", "") or "").strip()
+
+    body = body_best_effort(m)
+    body = (body or "")[:BODY_MAX_CHARS]
+
+    subject_r = redact_text(subject)
+    body_r = redact_text(body)
+
+    # Save attachments into a deterministic folder per msg
     msg_att_dir = ensure_dir(att_root / sanitize_filename(msg_path.stem))
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 59, in ensure_dir
-    p.mkdir(parents=True, exist_ok=True)
-    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1021, in mkdir
-    self.mkdir(mode, parents=False, exist_ok=exist_ok)
-    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 206] Der Dateiname oder die Erweiterung ist zu lang: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\AW_ Nachhaltigkeitsprämissen Lokal USA Charleston'
+    save_attachments_robust(m, msg_att_dir, log_path)
 
-[2026-02-16 17:50:40] ERROR: AW_ Nachhaltigkeitsprämissen Taskforce Zonencontroller _ Rückmeldung Lieferant Vitesco_Schaeffler.msg -> FileNotFoundError(2, 'Das System kann den angegebenen Pfad nicht finden')
-[2026-02-16 17:50:40] Traceback (most recent call last):
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 3] Das System kann den angegebenen Pfad nicht finden: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\AW_ Nachhaltigkeitsprämissen Taskforce Zonencontroller _ Rückmeldung Lieferant Vitesco_Schaeffler'
+    # Extract & append attachment text
+    attachments_info = []
+    supported_exts = {".pdf", ".xlsx", ".xlsm", ".docx", ".txt", ".csv", ".log", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
-During handling of the above exception, another exception occurred:
+    for fp in sorted(msg_att_dir.glob("*")):
+        if not fp.is_file():
+            continue
+        if fp.suffix.lower() not in supported_exts:
+            continue
 
-Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 464, in run_all
-    msg_to_docx_one_file(p, out_docx, att_root, log_path)
-    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 350, in msg_to_docx_one_file
-    msg_att_dir = ensure_dir(att_root / sanitize_filename(msg_path.stem))
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 59, in ensure_dir
-    p.mkdir(parents=True, exist_ok=True)
-    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1021, in mkdir
-    self.mkdir(mode, parents=False, exist_ok=exist_ok)
-    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 3] Das System kann den angegebenen Pfad nicht finden: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\AW_ Nachhaltigkeitsprämissen Taskforce Zonencontroller _ Rückmeldung Lieferant Vitesco_Schaeffler'
+        raw = extract_attachment_text(fp)
+        if raw.strip():
+            red = redact_text(raw)[:ATTACH_TEXT_MAX_CHARS]
+        else:
+            red = ""
 
-[2026-02-16 17:50:40] ERROR: AW_ Nachhaltigkeitsprämissen V530 Rohbau-WU-Paket SP2-10741 Kirchhoff.msg -> FileNotFoundError(2, 'Das System kann den angegebenen Pfad nicht finden')
-[2026-02-16 17:50:40] Traceback (most recent call last):
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 3] Das System kann den angegebenen Pfad nicht finden: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\AW_ Nachhaltigkeitsprämissen V530 Rohbau-WU-Paket SP2-10741 Kirchhoff'
+        attachments_info.append({
+            "name": fp.name,
+            "ext": fp.suffix.lower(),
+            "text": red
+        })
 
-During handling of the above exception, another exception occurred:
+    # Write docx
+    doc = docx_mod.Document()
+    doc.add_heading(subject_r, level=1)
 
-Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 464, in run_all
-    msg_to_docx_one_file(p, out_docx, att_root, log_path)
-    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 350, in msg_to_docx_one_file
-    msg_att_dir = ensure_dir(att_root / sanitize_filename(msg_path.stem))
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 59, in ensure_dir
-    p.mkdir(parents=True, exist_ok=True)
-    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1021, in mkdir
-    self.mkdir(mode, parents=False, exist_ok=exist_ok)
-    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 3] Das System kann den angegebenen Pfad nicht finden: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\AW_ Nachhaltigkeitsprämissen V530 Rohbau-WU-Paket SP2-10741 Kirchhoff'
+    if date:
+        doc.add_paragraph(f"Date: {redact_text(date)}")
 
-[2026-02-16 17:50:40] ERROR: AW_ Nachhaltigkeitsprämissen_VU 2-2024-01727 M177 EVO GT BS Hotend_Coldend.msg -> FileNotFoundError(2, 'Das System kann den angegebenen Pfad nicht finden')
-[2026-02-16 17:50:40] Traceback (most recent call last):
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 3] Das System kann den angegebenen Pfad nicht finden: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\AW_ Nachhaltigkeitsprämissen_VU 2-2024-01727 M177 EVO GT BS Hotend_Coldend'
+    doc.add_paragraph("")
+    doc.add_heading("Body (redacted)", level=2)
+    if body_r.strip():
+        add_text_preserve_lines(doc, body_r)
+    else:
+        doc.add_paragraph("(no usable body text extracted)")
 
-During handling of the above exception, another exception occurred:
+    doc.add_paragraph("")
+    doc.add_heading("Attachments (redacted excerpts)", level=2)
 
-Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 464, in run_all
-    msg_to_docx_one_file(p, out_docx, att_root, log_path)
-    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 350, in msg_to_docx_one_file
-    msg_att_dir = ensure_dir(att_root / sanitize_filename(msg_path.stem))
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 59, in ensure_dir
-    p.mkdir(parents=True, exist_ok=True)
-    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1021, in mkdir
-    self.mkdir(mode, parents=False, exist_ok=exist_ok)
-    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 3] Das System kann den angegebenen Pfad nicht finden: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\AW_ Nachhaltigkeitsprämissen_VU 2-2024-01727 M177 EVO GT BS Hotend_Coldend'
+    if attachments_info:
+        for a in attachments_info:
+            doc.add_heading(f"{a['name']}", level=3)
+            if a["text"].strip():
+                add_text_preserve_lines(doc, a["text"])
+            else:
+                # Tell the truth: either scanned PDF/image w/o OCR libs, or empty
+                doc.add_paragraph("(no text extracted; could be scanned/embedded or extractor not available)")
+            doc.add_paragraph("")
+    else:
+        doc.add_paragraph("(no supported attachments found or extraction not available)")
 
-[2026-02-16 17:50:40] WARNING: attachment extraction failed for AW_ Nachhaltigkeitsprämissenblatt .msg: FileNotFoundError(2, 'No such file or directory')
-[2026-02-16 17:50:41] ERROR: AW_ RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitsprämissen .msg -> FileNotFoundError(2, 'Der Dateiname oder die Erweiterung ist zu lang')
-[2026-02-16 17:50:41] Traceback (most recent call last):
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 206] Der Dateiname oder die Erweiterung ist zu lang: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\AW_ RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitsprämissen'
+    out_docx.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out_docx))
 
-During handling of the above exception, another exception occurred:
+    # close if supported
+    try:
+        close_fn = getattr(m, "close", None)
+        if callable(close_fn):
+            close_fn()
+    except Exception:
+        pass
 
-Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 464, in run_all
-    msg_to_docx_one_file(p, out_docx, att_root, log_path)
-    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 350, in msg_to_docx_one_file
-    msg_att_dir = ensure_dir(att_root / sanitize_filename(msg_path.stem))
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 59, in ensure_dir
-    p.mkdir(parents=True, exist_ok=True)
-    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1021, in mkdir
-    self.mkdir(mode, parents=False, exist_ok=exist_ok)
-    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 206] Der Dateiname oder die Erweiterung ist zu lang: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\AW_ RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitsprämissen'
 
-[2026-02-16 17:50:41] ERROR: AW_ SAQ Woco_ _ Ergänzt um weitere Fragen _ Nachhaltigkeitsprämissenblatt.msg -> FileNotFoundError(2, 'Das System kann den angegebenen Pfad nicht finden')
-[2026-02-16 17:50:41] Traceback (most recent call last):
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 3] Das System kann den angegebenen Pfad nicht finden: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\AW_ SAQ Woco_ _ Ergänzt um weitere Fragen _ Nachhaltigkeitsprämissenblatt'
+# ---------- MAIN RUN ----------
+def run_all():
+    if extract_msg is None:
+        raise RuntimeError("Missing extract-msg. Install: py -m pip install -U extract-msg")
+    if docx_mod is None:
+        raise RuntimeError("Missing python-docx. Install: py -m pip install -U python-docx")
 
-During handling of the above exception, another exception occurred:
+    src = Path(MSG_DIR)
+    out_root = Path(OUT_DIR)
 
-Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 464, in run_all
-    msg_to_docx_one_file(p, out_docx, att_root, log_path)
-    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 350, in msg_to_docx_one_file
-    msg_att_dir = ensure_dir(att_root / sanitize_filename(msg_path.stem))
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 59, in ensure_dir
-    p.mkdir(parents=True, exist_ok=True)
-    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1021, in mkdir
-    self.mkdir(mode, parents=False, exist_ok=exist_ok)
-    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 3] Das System kann den angegebenen Pfad nicht finden: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\AW_ SAQ Woco_ _ Ergänzt um weitere Fragen _ Nachhaltigkeitsprämissenblatt'
+    if not src.exists():
+        raise FileNotFoundError(f"MSG_DIR not found: {src}")
 
-[2026-02-16 17:50:41] WARNING: attachment extraction failed for AW_ Veraltete Links in Nachhaltigkeitsprämissen.msg: FileNotFoundError(2, 'No such file or directory')
-[2026-02-16 17:50:41] WARNING: attachment extraction failed for Legal Feedback CATL RSS Kommentare.msg: FileNotFoundError(2, 'No such file or directory')
-[2026-02-16 17:50:41] ERROR: RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitsprämissen .msg -> FileNotFoundError(2, 'Der Dateiname oder die Erweiterung ist zu lang')
-[2026-02-16 17:50:41] Traceback (most recent call last):
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 206] Der Dateiname oder die Erweiterung ist zu lang: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitsprämissen'
+    run_id = datetime.now().strftime(f"{RUN_PREFIX}_%Y%m%d_%H%M%S")
+    run_dir = ensure_dir(out_root / run_id)
 
-During handling of the above exception, another exception occurred:
+    docx_dir = ensure_dir(run_dir / "docx")
+    att_root = ensure_dir(run_dir / "attachments_saved")
+    log_path = run_dir / "errors.log"
+    index_path = run_dir / "index.jsonl"
 
-Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 464, in run_all
-    msg_to_docx_one_file(p, out_docx, att_root, log_path)
-    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 350, in msg_to_docx_one_file
-    msg_att_dir = ensure_dir(att_root / sanitize_filename(msg_path.stem))
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\3445261954.py", line 59, in ensure_dir
-    p.mkdir(parents=True, exist_ok=True)
-    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1021, in mkdir
-    self.mkdir(mode, parents=False, exist_ok=exist_ok)
-    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py", line 1016, in mkdir
-    os.mkdir(self, mode)
-    ~~~~~~~~^^^^^^^^^^^^
-FileNotFoundError: [WinError 206] Der Dateiname oder die Erweiterung ist zu lang: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus\\_exports\\msg_to_docx_redacted_20260216_175040\\attachments_saved\\RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitsprämissen'
+    msg_files = sorted(src.rglob("*.msg"))
+    print(f"Found .msg files: {len(msg_files)}")
+    print(f"Output run folder: {run_dir}")
 
-[2026-02-16 17:50:41] WARNING: attachment extraction failed for WG_ Brose __ LL __ Prämissen.msg: FileNotFoundError(2, 'No such file or directory')
-[2026-02-16 17:50:41] WARNING: attachment extraction failed for WG_ RFQ Scheinwerfer MMA Mopf - Ambition 2039 .msg: FileNotFoundError(2, 'No such file or directory')
+    print("Extractor availability:")
+    print(f"  pdfplumber:  {'OK' if pdfplumber else 'MISSING (PDF text will be empty)'}")
+    print(f"  openpyxl:    {'OK' if openpyxl else 'MISSING (XLSX text will be empty)'}")
+    print(f"  pytesseract: {'OK' if pytesseract else 'MISSING (image OCR disabled)'}")
+    print(f"  pillow:      {'OK' if PIL_Image else 'MISSING (image OCR disabled)'}")
+
+    if not msg_files:
+        print("No .msg found. Check MSG_DIR path or OneDrive availability (make files offline).")
+        return
+
+    ok = 0
+    fail = 0
+
+    with index_path.open("w", encoding="utf-8") as idx:
+        for i, p in enumerate(msg_files, start=1):
+            try:
+                base = sanitize_filename(p.stem)
+                out_docx = docx_dir / f"{base}__{i:05d}.docx"
+
+                msg_to_docx_one_file(p, out_docx, att_root, log_path)
+
+                rec = {"source": str(p), "out_docx": str(out_docx), "generated": now_ts()}
+                idx.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+                ok += 1
+                if i % 25 == 0:
+                    print(f"Progress: {i}/{len(msg_files)} | ok={ok} fail={fail}")
+
+            except Exception as e:
+                fail += 1
+                log_line(log_path, f"ERROR: {p.name} -> {repr(e)}")
+                log_line(log_path, traceback.format_exc())
+
+    print(f"Done. ok={ok} fail={fail}")
+    if fail:
+        print(f"See errors: {log_path}")
+
+
+# ---- RUN ----
+run_all()
