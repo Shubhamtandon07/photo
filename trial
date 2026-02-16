@@ -1,7 +1,67 @@
-ROOT: C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus
-Found PDFs: 1
-RUN_DIR: C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports\pdf_collect_20260216_194828
-Done. OK=1 FAIL=0
-Manifest: C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports\pdf_collect_20260216_194828\pdf_manifest.csv
-Errors: C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports\pdf_collect_20260216_194828\errors.log
-Collected PDFs folder: C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports\pdf_collect_20260216_194828\pdfs
+from pathlib import Path
+import re
+
+MSG_ROOT = Path(r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus")
+
+def norm(s):
+    return (s or "").strip()
+
+def get_att_name(att):
+    for attr in ("longFilename", "shortFilename", "filename", "name"):
+        if hasattr(att, attr):
+            v = getattr(att, attr)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return ""
+
+import extract_msg
+
+msg_files = sorted(MSG_ROOT.rglob("*.msg"))
+print("MSG files:", len(msg_files))
+
+total_atts = 0
+total_pdf_like = 0
+
+for p in msg_files:
+    try:
+        m = extract_msg.Message(str(p))
+        try:
+            if hasattr(m, "process"):
+                m.process()
+        except Exception:
+            pass
+
+        atts = []
+        if hasattr(m, "attachments") and m.attachments:
+            atts = m.attachments
+        elif hasattr(m, "get_attachments"):
+            try:
+                atts = m.get_attachments()
+            except Exception:
+                atts = []
+
+        names = [get_att_name(a) for a in atts]
+        pdf_like = [n for n in names if n.lower().endswith(".pdf")]
+
+        total_atts += len(atts)
+        total_pdf_like += len(pdf_like)
+
+        print(f"\n{p.name}")
+        print("  attachments:", len(atts))
+        if names:
+            print("  names:")
+            for n in names[:30]:
+                print("   -", n or "(no name)")
+        if len(names) > 30:
+            print("   ...")
+
+        try:
+            m.close()
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"\n{p.name}\n  ERROR:", repr(e))
+
+print("\nTOTAL attachments:", total_atts)
+print("TOTAL *.pdf attachments:", total_pdf_like)
