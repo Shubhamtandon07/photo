@@ -1,4 +1,3 @@
-import os
 import re
 import csv
 import shutil
@@ -36,7 +35,6 @@ def sanitize_filename(name: str, max_len: int = 120) -> str:
     return name
 
 def short_hash(s: str) -> str:
-    # lightweight stable hash without importing hashlib (works fine for filenames)
     h = 0
     for ch in s:
         h = (h * 131 + ord(ch)) % 2_000_000_000
@@ -67,14 +65,11 @@ def collect_pdfs():
 
         for p in pdfs:
             try:
-                # make destination filename unique and short (avoid Win path-length issues)
                 rel = str(p.relative_to(ROOT))
                 base = sanitize_filename(p.stem, max_len=80)
                 uniq = short_hash(rel)
-                dst_name = f"{base}__{uniq}.pdf"
-                dst = OUT_PDF_DIR / dst_name
+                dst = OUT_PDF_DIR / f"{base}__{uniq}.pdf"
 
-                # copy2 keeps timestamps
                 shutil.copy2(p, dst)
 
                 size = dst.stat().st_size if dst.exists() else 0
