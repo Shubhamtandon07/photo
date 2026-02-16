@@ -1,1 +1,554 @@
-C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus
+# -*- coding: utf-8 -*-
+"""
+Convert all .msg files in a folder to 1x DOCX and/or 1x HTML per message.
+
+- Uses extract_msg if available (recommended).
+- If extract_msg fails, optionally falls back to Outlook COM (Windows + Outlook installed).
+- Attachments: listed; tries to extract readable text from txt/html/pdf/docx/xlsx when libraries exist.
+- Never crashes if optional libraries are missing: those parts are skipped.
+
+Outputs:
+  OUT_DIR/
+    docx/
+    html/
+    logs/
+"""
+
+import os
+import re
+import sys
+import json
+import time
+import hashlib
+import traceback
+from datetime import datetime
+from pathlib import Path
+from html import escape
+
+# -----------------------------
+# CONFIG (EDIT THESE)
+# -----------------------------
+MSG_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus"
+OUT_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports_msg_convert"
+
+EXPORT_DOCX = True
+EXPORT_HTML = True
+
+INCLUDE_ATTACHMENTS_TEXT = True      # extract text from attachments if possible
+ATTACH_TEXT_MAX_CHARS = 25000        # per attachment (avoid huge files)
+MSG_BODY_MAX_CHARS = 200000          # avoid pathological huge bodies
+
+USE_OUTLOOK_FALLBACK = True          # if extract_msg fails, try Outlook COM (Windows)
+
+# -----------------------------
+# OPTIONAL IMPORTS (safe)
+# -----------------------------
+def _try_import(name: str):
+    try:
+        return __import__(name)
+    except Exception:
+        return None
+
+extract_msg = _try_import("extract_msg")
+
+docx_mod = _try_import("docx")          # python-docx
+bs4 = _try_import("bs4")                # beautifulsoup4
+
+pypdf = _try_import("pypdf")            # pypdf
+pdfplumber = _try_import("pdfplumber")  # pdfplumber
+openpyxl = _try_import("openpyxl")      # openpyxl
+
+win32 = _try_import("win32com.client")  # pywin32 (for Outlook fallback)
+
+# -----------------------------
+# HELPERS
+# -----------------------------
+def now_ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def mkdir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def log_line(log_path: Path, msg: str):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(f"[{now_ts()}] {msg}\n")
+
+def safe_filename(name: str, max_len: int = 120) -> str:
+    name = name.strip()
+    name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    if len(name) > max_len:
+        name = name[:max_len].rstrip()
+    if not name:
+        name = "message"
+    return name
+
+def short_hash(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:8]
+
+def html_to_text_basic(html: str) -> str:
+    if not html:
+        return ""
+    if bs4:
+        try:
+            soup = bs4.BeautifulSoup(html, "html.parser")
+            return re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip()
+        except Exception:
+            pass
+    # fallback: strip tags crudely
+    txt = re.sub(r"<[^>]+>", " ", html, flags=re.S)
+    return re.sub(r"\s+", " ", txt).strip()
+
+def normalize_body(s: str) -> str:
+    s = s or ""
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # Remove common Word/Outlook VML CSS noise lines if they dominate
+    # (keeps real text)
+    lines = s.split("\n")
+    cleaned = []
+    noise_hits = 0
+    for ln in lines:
+        l = ln.strip()
+        if not l:
+            cleaned.append("")
+            continue
+        if "urn:schemas-microsoft-com:vml" in l.lower() or "behavior:url(#default#vml)" in l.lower():
+            noise_hits += 1
+            continue
+        cleaned.append(ln)
+    out = "\n".join(cleaned).strip()
+    # If we removed too much and got empty, fall back to original
+    if not out and s.strip():
+        out = s.strip()
+    return out[:MSG_BODY_MAX_CHARS]
+
+def extract_attachment_text(att_path: Path) -> str:
+    """
+    Best-effort text extraction from an attachment file.
+    Skips gracefully if libs missing.
+    """
+    ext = att_path.suffix.lower()
+
+    try:
+        if ext in [".txt", ".csv", ".log"]:
+            return att_path.read_text(encoding="utf-8", errors="ignore")[:ATTACH_TEXT_MAX_CHARS]
+
+        if ext in [".htm", ".html"]:
+            raw = att_path.read_text(encoding="utf-8", errors="ignore")
+            return html_to_text_basic(raw)[:ATTACH_TEXT_MAX_CHARS]
+
+        if ext == ".pdf":
+            if pdfplumber:
+                try:
+                    texts = []
+                    with pdfplumber.open(str(att_path)) as pdf:
+                        for page in pdf.pages[:30]:
+                            texts.append(page.extract_text() or "")
+                    return ("\n".join(texts)).strip()[:ATTACH_TEXT_MAX_CHARS]
+                except Exception:
+                    pass
+            if pypdf:
+                try:
+                    reader = pypdf.PdfReader(str(att_path))
+                    texts = []
+                    for page in reader.pages[:30]:
+                        texts.append(page.extract_text() or "")
+                    return ("\n".join(texts)).strip()[:ATTACH_TEXT_MAX_CHARS]
+                except Exception:
+                    pass
+            return ""  # no pdf libs or extraction failed
+
+        if ext == ".docx" and docx_mod:
+            try:
+                Document = docx_mod.Document
+                d = Document(str(att_path))
+                paras = [p.text for p in d.paragraphs if p.text and p.text.strip()]
+                return ("\n".join(paras)).strip()[:ATTACH_TEXT_MAX_CHARS]
+            except Exception:
+                return ""
+
+        if ext == ".xlsx" and openpyxl:
+            try:
+                wb = openpyxl.load_workbook(str(att_path), data_only=True, read_only=True)
+                out = []
+                for ws in wb.worksheets[:5]:
+                    out.append(f"Sheet: {ws.title}")
+                    max_rows = min(ws.max_row or 0, 100)
+                    max_cols = min(ws.max_column or 0, 25)
+                    for r in range(1, max_rows + 1):
+                        row_vals = []
+                        for c in range(1, max_cols + 1):
+                            v = ws.cell(row=r, column=c).value
+                            row_vals.append("" if v is None else str(v))
+                        if any(x.strip() for x in row_vals):
+                            out.append(" | ".join(row_vals))
+                return ("\n".join(out)).strip()[:ATTACH_TEXT_MAX_CHARS]
+            except Exception:
+                return ""
+
+    except Exception:
+        return ""
+
+    return ""
+
+# -----------------------------
+# MSG PARSING
+# -----------------------------
+def parse_msg_with_extractmsg(msg_path: Path, tmp_attach_dir: Path):
+    """
+    Returns dict:
+      subject, date, from, to, cc, body_text, attachments: list of {name, saved_path, text_excerpt}
+    """
+    if not extract_msg:
+        raise RuntimeError("extract_msg not installed")
+
+    # extract_msg API differs across versions; handle both styles.
+    m = extract_msg.Message(str(msg_path))
+
+    # Newer versions often need .process() or .extract_attachments()
+    # Try multiple strategies safely.
+    try:
+        if hasattr(m, "process") and callable(getattr(m, "process")):
+            m.process()
+    except Exception:
+        pass
+
+    subject = getattr(m, "subject", "") or ""
+    sender = getattr(m, "sender", "") or getattr(m, "from_", "") or ""
+    to = getattr(m, "to", "") or ""
+    cc = getattr(m, "cc", "") or ""
+    date = getattr(m, "date", "") or ""
+
+    body = getattr(m, "body", "") or ""
+    html_body = getattr(m, "htmlBody", "") or getattr(m, "htmlbody", "") or ""
+    rtf_body = getattr(m, "rtfBody", "") or getattr(m, "rtfbody", "") or ""
+
+    # Prefer body; if empty, use html->text; if still empty, try rtf (as plain)
+    body_text = body.strip()
+    if not body_text and html_body:
+        body_text = html_to_text_basic(html_body)
+    if not body_text and rtf_body:
+        # crude: treat as text; better RTF parsing needs extra libs (skip)
+        body_text = str(rtf_body)
+
+    body_text = normalize_body(body_text)
+
+    attachments = []
+
+    # Attachment extraction
+    # extract_msg may expose attachments in different properties
+    # We try the safest path: use m.saveAttachments or m.attachments where possible.
+    try:
+        # Some versions support saveAttachments(customPath=..)
+        if hasattr(m, "saveAttachments") and callable(getattr(m, "saveAttachments")):
+            m.saveAttachments(customPath=str(tmp_attach_dir))
+    except Exception:
+        pass
+
+    # Collect saved files in tmp_attach_dir that changed recently (best-effort)
+    # If extract_msg didn't save anything, this will be empty.
+    try:
+        saved = sorted([p for p in tmp_attach_dir.glob("*") if p.is_file()], key=lambda p: p.stat().st_mtime, reverse=True)
+        # Keep only very recent ones to reduce cross-talk; but this tmp folder is per message anyway.
+        for p in saved:
+            att_name = p.name
+            att_text = extract_attachment_text(p) if INCLUDE_ATTACHMENTS_TEXT else ""
+            attachments.append({"name": att_name, "saved_path": str(p), "text_excerpt": att_text})
+    except Exception:
+        pass
+
+    return {
+        "subject": subject,
+        "date": date,
+        "from": sender,
+        "to": to,
+        "cc": cc,
+        "body_text": body_text,
+        "attachments": attachments,
+        "source_file": str(msg_path),
+        "parser": "extract_msg",
+    }
+
+def parse_msg_with_outlook(msg_path: Path, tmp_attach_dir: Path):
+    """
+    Outlook COM fallback. Requires Windows + Outlook + pywin32.
+    Returns same dict as extractmsg parser.
+    """
+    if not win32:
+        raise RuntimeError("pywin32 not installed for Outlook fallback")
+
+    app = win32.Dispatch("Outlook.Application")
+    ns = app.GetNamespace("MAPI")
+
+    # OpenSharedItem usually works for .msg
+    item = ns.OpenSharedItem(str(msg_path))
+
+    subject = getattr(item, "Subject", "") or ""
+    sender = ""
+    try:
+        sender = getattr(item, "SenderName", "") or ""
+    except Exception:
+        sender = ""
+    to = getattr(item, "To", "") or ""
+    cc = getattr(item, "CC", "") or ""
+    date = ""
+    try:
+        date = str(getattr(item, "SentOn", "") or "")
+    except Exception:
+        pass
+
+    # Prefer HTMLBody -> text; fallback Body
+    html_body = getattr(item, "HTMLBody", "") or ""
+    body = getattr(item, "Body", "") or ""
+    body_text = body.strip()
+    if not body_text and html_body:
+        body_text = html_to_text_basic(html_body)
+    body_text = normalize_body(body_text)
+
+    attachments = []
+    try:
+        atts = item.Attachments
+        for i in range(1, atts.Count + 1):
+            att = atts.Item(i)
+            fname = getattr(att, "FileName", "") or f"attachment_{i}"
+            save_path = tmp_attach_dir / safe_filename(fname, 150)
+            try:
+                att.SaveAsFile(str(save_path))
+                att_text = extract_attachment_text(save_path) if INCLUDE_ATTACHMENTS_TEXT else ""
+                attachments.append({"name": fname, "saved_path": str(save_path), "text_excerpt": att_text})
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return {
+        "subject": subject,
+        "date": date,
+        "from": sender,
+        "to": to,
+        "cc": cc,
+        "body_text": body_text,
+        "attachments": attachments,
+        "source_file": str(msg_path),
+        "parser": "outlook_com",
+    }
+
+# -----------------------------
+# EXPORTERS
+# -----------------------------
+def export_html(msg_obj: dict, out_path: Path):
+    subject = msg_obj.get("subject", "")
+    meta = {
+        "source_file": msg_obj.get("source_file", ""),
+        "parser": msg_obj.get("parser", ""),
+        "generated": now_ts(),
+        "subject": subject,
+        "date": msg_obj.get("date", ""),
+        "from": msg_obj.get("from", ""),
+        "to": msg_obj.get("to", ""),
+        "cc": msg_obj.get("cc", ""),
+    }
+    body = msg_obj.get("body_text", "") or ""
+    body_html = "<br>\n".join(escape(line) for line in body.split("\n"))
+
+    att_html = ""
+    atts = msg_obj.get("attachments", []) or []
+    if atts:
+        att_html += "<h3>Attachments</h3><ul>"
+        for a in atts:
+            att_html += f"<li><b>{escape(a.get('name',''))}</b></li>"
+        att_html += "</ul>"
+
+        # include excerpts
+        for a in atts:
+            ex = (a.get("text_excerpt") or "").strip()
+            if ex:
+                att_html += f"<h4>Attachment text excerpt: {escape(a.get('name',''))}</h4>"
+                att_html += "<pre style='white-space:pre-wrap; font-family:Consolas,monospace;'>"
+                att_html += escape(ex)
+                att_html += "</pre>"
+
+    html = f"""<html>
+<head>
+  <meta charset="utf-8">
+  <title>{escape(subject) or "Message"}</title>
+</head>
+<body style="font-family:Segoe UI,Arial; font-size:13px; line-height:1.35; padding:16px;">
+  <h2>{escape(subject) or "(no subject)"}</h2>
+
+  <div style="margin-bottom:12px; padding:10px; background:#f6f6f6; border-radius:8px;">
+    <div><b>Date:</b> {escape(meta["date"])}</div>
+    <div><b>From:</b> {escape(meta["from"])}</div>
+    <div><b>To:</b> {escape(meta["to"])}</div>
+    <div><b>CC:</b> {escape(meta["cc"])}</div>
+    <div><b>Parser:</b> {escape(meta["parser"])}</div>
+    <div><b>Source:</b> {escape(meta["source_file"])}</div>
+    <div><b>Generated:</b> {escape(meta["generated"])}</div>
+  </div>
+
+  <h3>Body</h3>
+  <div style="white-space:normal;">{body_html}</div>
+
+  {att_html}
+</body>
+</html>"""
+
+    out_path.write_text(html, encoding="utf-8")
+
+def export_docx(msg_obj: dict, out_path: Path):
+    if not docx_mod:
+        raise RuntimeError("python-docx not installed (pip install python-docx)")
+
+    Document = docx_mod.Document
+    doc = Document()
+
+    subject = msg_obj.get("subject", "") or "(no subject)"
+    doc.add_heading(subject, level=1)
+
+    # meta
+    doc.add_paragraph(f"Date: {msg_obj.get('date','')}")
+    doc.add_paragraph(f"From: {msg_obj.get('from','')}")
+    doc.add_paragraph(f"To: {msg_obj.get('to','')}")
+    doc.add_paragraph(f"CC: {msg_obj.get('cc','')}")
+    doc.add_paragraph(f"Parser: {msg_obj.get('parser','')}")
+    doc.add_paragraph(f"Source: {msg_obj.get('source_file','')}")
+    doc.add_paragraph(f"Generated: {now_ts()}")
+
+    doc.add_paragraph("")  # spacer
+    doc.add_heading("Body", level=2)
+
+    body = msg_obj.get("body_text", "") or ""
+    # preserve paragraph breaks
+    for block in body.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+        doc.add_paragraph(block)
+
+    # attachments
+    atts = msg_obj.get("attachments", []) or []
+    if atts:
+        doc.add_paragraph("")
+        doc.add_heading("Attachments", level=2)
+        for a in atts:
+            doc.add_paragraph(f"- {a.get('name','')}", style=None)
+
+        # excerpts
+        for a in atts:
+            ex = (a.get("text_excerpt") or "").strip()
+            if ex:
+                doc.add_paragraph("")
+                doc.add_heading(f"Attachment excerpt: {a.get('name','')}", level=3)
+                doc.add_paragraph(ex)
+
+    doc.save(str(out_path))
+
+# -----------------------------
+# MAIN
+# -----------------------------
+def main():
+    base = Path(MSG_DIR)
+    out_base = Path(OUT_DIR)
+
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"MSG_DIR not found or not a folder: {MSG_DIR}")
+
+    docx_dir = out_base / "docx"
+    html_dir = out_base / "html"
+    logs_dir = out_base / "logs"
+    mkdir(docx_dir)
+    mkdir(html_dir)
+    mkdir(logs_dir)
+
+    log_path = logs_dir / "convert.log"
+    errors_path = logs_dir / "errors.log"
+    index_path = logs_dir / "index.jsonl"
+
+    msg_files = sorted([p for p in base.rglob("*.msg") if p.is_file()])
+    log_line(log_path, f"Found .msg files: {len(msg_files)} in {base}")
+
+    if not msg_files:
+        print("No .msg files found.")
+        return
+
+    processed = 0
+    failed = 0
+
+    for msg_path in msg_files:
+        try:
+            # per-message temp attachment directory
+            tmp_attach_dir = out_base / "_tmp_attachments" / (safe_filename(msg_path.stem, 60) + "__" + short_hash(str(msg_path)))
+            mkdir(tmp_attach_dir)
+
+            msg_obj = None
+            parse_err = None
+
+            # 1) try extract_msg
+            if extract_msg:
+                try:
+                    msg_obj = parse_msg_with_extractmsg(msg_path, tmp_attach_dir)
+                except Exception as e:
+                    parse_err = e
+
+            # 2) fallback: Outlook COM
+            if msg_obj is None and USE_OUTLOOK_FALLBACK:
+                try:
+                    msg_obj = parse_msg_with_outlook(msg_path, tmp_attach_dir)
+                except Exception as e2:
+                    parse_err = e2
+
+            if msg_obj is None:
+                raise RuntimeError(f"Could not parse msg (no parser succeeded): {parse_err!r}")
+
+            # output names
+            stem = safe_filename(msg_path.stem, 90)
+            h = short_hash(str(msg_path))
+            out_stem = f"{stem}__{h}"
+
+            if EXPORT_HTML:
+                out_html = html_dir / (out_stem + ".html")
+                export_html(msg_obj, out_html)
+
+            if EXPORT_DOCX:
+                out_docx = docx_dir / (out_stem + ".docx")
+                export_docx(msg_obj, out_docx)
+
+            # write index record (for tracking)
+            rec = {
+                "source": str(msg_path),
+                "parser": msg_obj.get("parser"),
+                "subject": msg_obj.get("subject"),
+                "date": msg_obj.get("date"),
+                "from": msg_obj.get("from"),
+                "to": msg_obj.get("to"),
+                "cc": msg_obj.get("cc"),
+                "body_len": len(msg_obj.get("body_text") or ""),
+                "attachments": [a.get("name") for a in (msg_obj.get("attachments") or [])],
+                "export_html": str((html_dir / (out_stem + ".html"))) if EXPORT_HTML else None,
+                "export_docx": str((docx_dir / (out_stem + ".docx"))) if EXPORT_DOCX else None,
+                "generated": now_ts(),
+            }
+            with index_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+            processed += 1
+            if processed % 10 == 0:
+                log_line(log_path, f"Progress: processed={processed} failed={failed}")
+
+        except Exception as e:
+            failed += 1
+            log_line(errors_path, f"ERROR: {msg_path.name} -> {repr(e)}")
+            # optionally include stack trace for debugging
+            try:
+                log_line(errors_path, traceback.format_exc())
+            except Exception:
+                pass
+
+    log_line(log_path, f"DONE. processed={processed} failed={failed}")
+    print("Done.")
+    print("Processed:", processed, "| Failed:", failed)
+    print("Output:", str(out_base))
+
+if __name__ == "__main__":
+    main()
