@@ -1,11 +1,9 @@
 # ================================
-# MSG -> HTML (and optional DOCX)
-# Python 3.14 / Jupyter-safe (NO argparse)
-# - Reads all .msg recursively from MSG_DIR
-# - Writes ONE .html per .msg into a unique run folder under OUT_DIR
-# - Tries to extract usable body text (plain -> html -> rtf fallback)
-# - Tries to extract attachment text (pdf/txt/docx/xlsx/csv) and embeds short excerpts
-# - Skips missing libraries instead of crashing
+# .MSG -> ONE .DOCX per email
+# - Redact personal/sensitive info in subject+body+attachment text
+# - Append attachment text (pdf/xlsx/docx/txt/csv) at end
+# - Jupyter-safe (no argparse)
+# - Python 3.14 compatible
 # ================================
 
 import os
@@ -16,22 +14,22 @@ import traceback
 from pathlib import Path
 from datetime import datetime
 
-import html as html_mod  # IMPORTANT: avoid "from html import escape" to prevent collisions
-
 # ---------- CONFIG ----------
 MSG_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus"
 OUT_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports"
 
-# Output format:
-WRITE_HTML = True
-WRITE_DOCX = True   # will auto-skip if python-docx not installed
+# Output folder will be unique per run (so trials don't overwrite)
+RUN_PREFIX = "msg_to_docx_redacted"
 
-# Attachment text extraction:
-EXTRACT_ATTACHMENT_TEXT = True
-ATTACHMENT_TEXT_MAX_CHARS = 6000   # embedded excerpt per attachment
-BODY_MAX_CHARS = 200000            # limit body size in html/docx
+# Extraction limits
+BODY_MAX_CHARS = 250_000
+ATTACH_TEXT_MAX_CHARS = 12_000
+PDF_MAX_PAGES = 30
+XLSX_MAX_SHEETS = 5
+XLSX_MAX_ROWS = 250
+XLSX_MAX_COLS = 30
 
-# ---------- OPTIONAL LIBS (auto-skip if missing) ----------
+# ---------- OPTIONAL IMPORTS (auto-skip if missing) ----------
 def try_import(name):
     try:
         __import__(name)
@@ -40,8 +38,6 @@ def try_import(name):
         return None
 
 extract_msg = try_import("extract_msg")
-pdfplumber = try_import("pdfplumber")
-openpyxl = try_import("openpyxl")
 
 docx_mod = None
 try:
@@ -49,15 +45,21 @@ try:
 except Exception:
     docx_mod = None
 
+pdfplumber = try_import("pdfplumber")
+openpyxl = try_import("openpyxl")
+
+import html as html_mod  # for html unescape
+
+
 # ---------- UTIL ----------
 def now_ts():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def ensure_dir(p: Path):
+def ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
 
-def safe_str(x):
+def safe_str(x) -> str:
     if x is None:
         return ""
     try:
@@ -74,64 +76,50 @@ def sanitize_filename(name: str, max_len: int = 160) -> str:
     name = re.sub(r"\s+", " ", name).strip()
     if len(name) > max_len:
         name = name[:max_len].rstrip()
-    if not name:
-        name = "message"
-    return name
+    return name or "message"
 
 def log_line(log_path: Path, line: str):
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as f:
         f.write(f"[{now_ts()}] {line}\n")
 
-def html_escape(s: str) -> str:
-    return html_mod.escape(safe_str(s), quote=True)
 
+# ---------- HTML->TEXT (lightweight) ----------
 def strip_html_to_text(html: str) -> str:
-    # very lightweight html->text without external libs
     h = safe_str(html)
-    # remove scripts/styles
     h = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", h)
-    # convert breaks
     h = re.sub(r"(?i)<br\s*/?>", "\n", h)
     h = re.sub(r"(?i)</p\s*>", "\n\n", h)
-    # strip tags
     h = re.sub(r"(?is)<.*?>", " ", h)
-    # unescape entities
     try:
         h = html_mod.unescape(h)
     except Exception:
         pass
-    # normalize whitespace
     h = re.sub(r"[ \t]+\n", "\n", h)
     h = re.sub(r"\n{3,}", "\n\n", h)
     h = re.sub(r"[ \t]{2,}", " ", h)
     return h.strip()
 
+
+# ---------- BODY EXTRACTION (plain -> html -> rtf fallback) ----------
 def body_best_effort(msg) -> str:
-    """
-    Try plain body, then htmlBody, then rtfBody (as raw), then fallback empty.
-    """
     b = safe_str(getattr(msg, "body", "") or "")
     if b.strip():
         return b.strip()
 
-    hb = getattr(msg, "htmlBody", None)
-    hb = safe_str(hb or "")
+    hb = safe_str(getattr(msg, "htmlBody", "") or "")
     if hb.strip():
-        txt = strip_html_to_text(hb)
-        if txt.strip():
-            return txt.strip()
+        t = strip_html_to_text(hb)
+        if t.strip():
+            return t.strip()
 
-    # Some versions expose rtfBody as bytes/str; without an rtf parser we keep it minimal
     rb = getattr(msg, "rtfBody", None)
     if rb is not None:
         try:
             if isinstance(rb, (bytes, bytearray)):
                 rb = rb.decode("utf-8", errors="ignore")
-            rb = safe_str(rb)
-            rb = rb.strip()
+            rb = safe_str(rb).strip()
             if rb:
-                # last resort: remove common RTF control words crudely
+                # crude rtf cleanup
                 rb2 = re.sub(r"{\\.*?}", " ", rb)
                 rb2 = re.sub(r"\\[a-zA-Z]+\d*\s?", " ", rb2)
                 rb2 = re.sub(r"[{}]", " ", rb2)
@@ -143,12 +131,127 @@ def body_best_effort(msg) -> str:
 
     return ""
 
+
+# ---------- REDACTION ----------
+LEGAL_SUFFIXES = {
+    "gmbh", "ag", "kg", "kgaa", "se", "inc", "ltd", "llc", "plc", "bv", "nv", "oy", "sas", "sarl"
+}
+
+STREET_WORDS = [
+    "straße", "strasse", "str.", "street", "st.", "weg", "allee", "platz", "gasse", "ring",
+    "chaussee", "road", "rd", "avenue", "av.", "boulevard", "blvd"
+]
+
+HEADER_CUE_LINES = [
+    "von:", "from:",
+    "an:", "to:",
+    "cc:", "kopie:", "bcc:",
+    "gesendet:", "sent:",
+    "betreff:", "subject:",
+    "priorität:", "priority:",
+    "mail to:", "mailto:"
+]
+
+def redact_names_heuristic(text: str) -> str:
+    """
+    Heuristic: redact 2-3 token "Person-like" names with Capitalized words,
+    but skip if it looks like a company (GmbH/AG/etc).
+    """
+    # match 2-3 capitalized words (incl. umlauts)
+    pat = re.compile(r"\b([A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){1,2})\b")
+
+    def repl(m):
+        phrase = m.group(1)
+        low = phrase.lower()
+        # Skip if contains legal suffix word after/inside phrase
+        for sfx in LEGAL_SUFFIXES:
+            if f" {sfx}" in low or low.endswith(sfx):
+                return phrase
+        # Skip common non-person words
+        if any(w in low for w in ["mercedes", "benz", "plant", "werk", "procurement", "supplier", "quality"]):
+            return phrase
+        return "[REDACTED_NAME]"
+
+    return pat.sub(repl, text)
+
+def redact_text(text: str) -> str:
+    t = safe_str(text)
+
+    # 1) Remove common header blocks line-by-line (Von/An/Cc/Gesendet/Betreff etc.)
+    lines = t.splitlines()
+    cleaned = []
+    skip_block = False
+
+    for line in lines:
+        l = line.strip()
+        low = l.lower()
+
+        # If we detect typical Outlook header sections, remove those lines
+        if any(low.startswith(cue) for cue in HEADER_CUE_LINES):
+            continue
+
+        # Some mails contain multi-line header blocks; remove until blank line
+        if low.startswith("_____") or low.startswith("----") or low.startswith("original message"):
+            # keep separators but not required
+            continue
+
+        cleaned.append(line)
+
+    t = "\n".join(cleaned)
+
+    # 2) Emails
+    t = re.sub(r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b", "[REDACTED_EMAIL]", t)
+
+    # 3) Phone numbers (broad, but avoids short numbers)
+    # patterns like +49 151 58 60..., (0711) 12345, 050-xxxx, etc
+    t = re.sub(r"(?<!\d)(\+?\d[\d\s()./\-]{6,}\d)(?!\d)", "[REDACTED_PHONE]", t)
+
+    # 4) IBAN
+    t = re.sub(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b", "[REDACTED_IBAN]", t)
+
+    # 5) Postal code + city (Germany-ish)
+    t = re.sub(r"\b\d{5}\s+[A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß\-]{2,}\b", "[REDACTED_LOCATION]", t)
+
+    # 6) Street-like addresses (street word + number)
+    street_word_re = "|".join([re.escape(w) for w in STREET_WORDS])
+    t = re.sub(
+        rf"\b([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß\-\s]{{2,60}}\s(?:{street_word_re})\s*\d{{1,4}}[A-Za-z]?)\b",
+        "[REDACTED_ADDRESS]",
+        t,
+        flags=re.IGNORECASE
+    )
+
+    # 7) Mercedes internal org codes / cost center-ish
+    t = re.sub(r"\b0\d{2}-[A-Z0-9]+\b", "[REDACTED_INTERNAL]", t)          # 050-G277 etc
+    t = re.sub(r"\b0\d{2}/[A-Z]{2,}\b", "[REDACTED_INTERNAL]", t)          # 050/HPC
+    t = re.sub(r"\bMP/RM\d\b", "[REDACTED_INTERNAL]", t)
+
+    # 8) Greeting lines: keep greeting, remove the name part
+    t = re.sub(r"(?im)^(hallo|hi|guten morgen|guten tag|sehr geehrte[rn]?|dear|hello)\s+.+?$",
+               r"\1 [REDACTED_NAME]", t)
+
+    # 9) Signature closings: remove name line(s) after closing phrase
+    t = re.sub(r"(?im)^(mit freundlichen grüßen|freundliche grüße|best regards|kind regards|vg|lg|br)\s*$",
+               r"\1", t)
+    # common "VG Name" in same line
+    t = re.sub(r"(?im)^(vg|lg|br)\s+.+$", r"\1 [REDACTED_NAME]", t)
+
+    # 10) Heuristic person names in running text (2-3 capitalized tokens)
+    t = redact_names_heuristic(t)
+
+    # 11) Collapse repeated placeholders
+    t = re.sub(r"(\[REDACTED_[A-Z_]+\])(\s+\1)+", r"\1", t)
+
+    # 12) Cleanup extra spaces
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{4,}", "\n\n\n", t)
+
+    return t.strip()
+
+
+# ---------- ATTACHMENT EXTRACTION ----------
 def extract_attachment_text(path: Path) -> str:
-    """
-    Extract text from common office attachments.
-    Skips safely if libs missing.
-    """
-    if not path.exists():
+    if not path.exists() or not path.is_file():
         return ""
 
     ext = path.suffix.lower()
@@ -166,29 +269,35 @@ def extract_attachment_text(path: Path) -> str:
     # PDF
     if ext == ".pdf" and pdfplumber is not None:
         try:
-            texts = []
+            parts = []
             with pdfplumber.open(str(path)) as pdf:
-                for page in pdf.pages[:20]:  # cap pages
-                    t = page.extract_text() or ""
-                    if t.strip():
-                        texts.append(t)
-            return "\n\n".join(texts).strip()
+                for p in pdf.pages[:PDF_MAX_PAGES]:
+                    txt = p.extract_text() or ""
+                    if txt.strip():
+                        parts.append(txt)
+            return "\n\n".join(parts).strip()
         except Exception:
             return ""
 
-    # XLSX
+    # XLSX/XLSM
     if ext in [".xlsx", ".xlsm"] and openpyxl is not None:
         try:
             wb = openpyxl.load_workbook(str(path), data_only=True, read_only=True)
             out = []
-            for ws in wb.worksheets[:5]:
+            for ws in wb.worksheets[:XLSX_MAX_SHEETS]:
                 out.append(f"[Sheet] {ws.title}")
                 for r_i, row in enumerate(ws.iter_rows(values_only=True), start=1):
-                    if r_i > 200:
+                    if r_i > XLSX_MAX_ROWS:
                         break
-                    vals = [safe_str(v) for v in row if v is not None and safe_str(v).strip() != ""]
+                    vals = []
+                    for v in row[:XLSX_MAX_COLS]:
+                        if v is None:
+                            continue
+                        s = safe_str(v).strip()
+                        if s:
+                            vals.append(s)
                     if vals:
-                        out.append(" | ".join(vals[:30]))
+                        out.append(" | ".join(vals))
             return "\n".join(out).strip()
         except Exception:
             return ""
@@ -202,94 +311,124 @@ def extract_attachment_text(path: Path) -> str:
         except Exception:
             return ""
 
-    # Not supported / skipped
+    # unsupported
     return ""
 
-def write_docx(out_path: Path, subject: str, meta: dict, body: str, attachments: list[dict]):
-    if docx_mod is None:
-        return False
 
-    d = docx_mod.Document()
-    d.add_heading(subject or "(no subject)", level=1)
+# ---------- WRITE DOCX ----------
+def add_text_preserve_lines(doc, text: str):
+    # Word doesn't preserve \n inside one paragraph reliably for your use-case;
+    # add paragraph per line for readability.
+    for line in (text or "").splitlines():
+        doc.add_paragraph(line)
 
-    # meta table
-    t = d.add_table(rows=0, cols=2)
-    t.style = "Table Grid"
-    for k in ["date", "from", "to", "cc", "source_file", "generated"]:
-        row = t.add_row().cells
-        row[0].text = k.upper()
-        row[1].text = safe_str(meta.get(k, ""))
+def msg_to_docx_one_file(msg_path: Path, out_docx: Path, att_root: Path, log_path: Path):
+    # parse message
+    m = extract_msg.Message(str(msg_path))
 
-    d.add_paragraph("")
-    d.add_heading("Body", level=2)
-    for line in (body or "").split("\n"):
-        d.add_paragraph(line)
+    # Some versions need process(); some don't.
+    proc = getattr(m, "process", None)
+    if callable(proc):
+        proc()
 
-    if attachments:
-        d.add_paragraph("")
-        d.add_heading("Attachments (text excerpts)", level=2)
-        for a in attachments:
-            name = safe_str(a.get("name", ""))
-            ex = safe_str(a.get("text_excerpt", ""))
-            d.add_heading(name, level=3)
-            if ex.strip():
-                d.add_paragraph(ex[:ATTACHMENT_TEXT_MAX_CHARS])
-            else:
-                d.add_paragraph("(no text extracted)")
+    subject = safe_str(getattr(m, "subject", "") or "").strip()
+    if not subject:
+        subject = msg_path.stem
 
-    d.save(str(out_path))
-    return True
+    date = safe_str(getattr(m, "date", "") or "").strip()
 
-def write_html(out_path: Path, subject: str, meta: dict, body: str, attachments: list[dict]):
+    # Body best effort (try plain/html/rtf)
+    body = body_best_effort(m)
     body = (body or "")[:BODY_MAX_CHARS]
-    body_html = "<br>\n".join(html_escape(line) for line in body.split("\n"))
 
-    att_html = ""
-    if attachments:
-        att_html += "<h3>Attachments</h3><ul>"
-        for a in attachments:
-            att_html += f"<li><b>{html_escape(a.get('name',''))}</b></li>"
-        att_html += "</ul>"
+    # redact
+    subject_r = redact_text(subject)
+    body_r = redact_text(body)
 
-        for a in attachments:
-            ex = safe_str(a.get("text_excerpt", "")).strip()
-            if ex:
-                att_html += f"<h4>Attachment excerpt: {html_escape(a.get('name',''))}</h4>"
-                att_html += "<pre style='white-space:pre-wrap; font-family:Consolas,monospace;'>"
-                att_html += html_escape(ex[:ATTACHMENT_TEXT_MAX_CHARS])
-                att_html += "</pre>"
+    # attachments: save then extract text
+    attachments_info = []
+    msg_att_dir = ensure_dir(att_root / sanitize_filename(msg_path.stem))
 
-    html_doc = f"""<html>
-<head>
-  <meta charset="utf-8">
-  <title>{html_escape(subject) or "Message"}</title>
-</head>
-<body style="font-family:Segoe UI,Arial; font-size:13px; line-height:1.35; padding:16px;">
-  <h2>{html_escape(subject) or "(no subject)"}</h2>
+    try:
+        saver = getattr(m, "saveAttachments", None)
+        if callable(saver):
+            try:
+                saver(customPath=str(msg_att_dir))
+            except TypeError:
+                try:
+                    saver(str(msg_att_dir))
+                except Exception:
+                    pass
 
-  <div style="margin-bottom:12px; padding:10px; background:#f6f6f6; border-radius:8px;">
-    <div><b>Date:</b> {html_escape(meta.get("date",""))}</div>
-    <div><b>From:</b> {html_escape(meta.get("from",""))}</div>
-    <div><b>To:</b> {html_escape(meta.get("to",""))}</div>
-    <div><b>CC:</b> {html_escape(meta.get("cc",""))}</div>
-    <div><b>Source:</b> {html_escape(meta.get("source_file",""))}</div>
-    <div><b>Generated:</b> {html_escape(meta.get("generated",""))}</div>
-  </div>
+        # read saved attachment files
+        for fp in sorted(msg_att_dir.glob("*")):
+            if not fp.is_file():
+                continue
+            ext = fp.suffix.lower()
+            if ext not in [".pdf", ".xlsx", ".xlsm", ".docx", ".txt", ".csv", ".log"]:
+                continue
 
-  <h3>Body</h3>
-  <div style="white-space:normal;">{body_html}</div>
+            raw = extract_attachment_text(fp)
+            if raw.strip():
+                red = redact_text(raw)[:ATTACH_TEXT_MAX_CHARS]
+            else:
+                red = ""
 
-  {att_html}
-</body>
-</html>"""
+            attachments_info.append({
+                "name": fp.name,
+                "path": str(fp),
+                "text": red
+            })
 
-    out_path.write_text(html_doc, encoding="utf-8")
-    return True
+    except Exception as e:
+        log_line(log_path, f"WARNING: attachment extraction failed for {msg_path.name}: {repr(e)}")
 
-# ---------- MAIN ----------
-def run_conversion():
+    # write docx
+    doc = docx_mod.Document()
+    doc.add_heading(subject_r, level=1)
+
+    if date:
+        doc.add_paragraph(f"Date: {redact_text(date)}")
+
+    doc.add_paragraph("")  # spacer
+    doc.add_heading("Body (redacted)", level=2)
+    if body_r.strip():
+        add_text_preserve_lines(doc, body_r)
+    else:
+        doc.add_paragraph("(no usable body text extracted)")
+
+    # Append attachments
+    doc.add_paragraph("")
+    doc.add_heading("Attachments (redacted excerpts)", level=2)
+    if attachments_info:
+        for a in attachments_info:
+            doc.add_heading(a["name"], level=3)
+            if a["text"].strip():
+                add_text_preserve_lines(doc, a["text"])
+            else:
+                doc.add_paragraph("(no text extracted or unsupported file type)")
+            doc.add_paragraph("")
+    else:
+        doc.add_paragraph("(no supported attachments found)")
+
+    out_docx.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out_docx))
+
+    # close msg if supported
+    try:
+        close_fn = getattr(m, "close", None)
+        if callable(close_fn):
+            close_fn()
+    except Exception:
+        pass
+
+
+# ---------- MAIN RUN ----------
+def run_all():
     if extract_msg is None:
-        raise RuntimeError("extract_msg is not installed. Run: py -m pip install -U extract-msg")
+        raise RuntimeError("Missing extract-msg. Install: py -m pip install -U extract-msg")
+    if docx_mod is None:
+        raise RuntimeError("Missing python-docx. Install: py -m pip install -U python-docx")
 
     src = Path(MSG_DIR)
     out_root = Path(OUT_DIR)
@@ -297,142 +436,43 @@ def run_conversion():
     if not src.exists():
         raise FileNotFoundError(f"MSG_DIR not found: {src}")
 
-    # unique run folder to avoid overwriting
-    run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    run_id = datetime.now().strftime(f"{RUN_PREFIX}_%Y%m%d_%H%M%S")
     run_dir = ensure_dir(out_root / run_id)
-    html_dir = ensure_dir(run_dir / "html")
+
     docx_dir = ensure_dir(run_dir / "docx")
-    att_dir  = ensure_dir(run_dir / "attachments")
+    att_root = ensure_dir(run_dir / "attachments_saved")
     log_path = run_dir / "errors.log"
     index_path = run_dir / "index.jsonl"
 
     msg_files = sorted(src.rglob("*.msg"))
     print(f"Found .msg files: {len(msg_files)}")
-    print(f"Output folder: {run_dir}")
+    print(f"Output run folder: {run_dir}")
 
     if not msg_files:
-        print("No .msg found. Check the folder path and OneDrive availability (make files offline).")
+        print("No .msg found. Check your MSG_DIR path or OneDrive availability (make files offline).")
         return
 
     ok = 0
     fail = 0
 
-    with index_path.open("w", encoding="utf-8") as idxf:
+    with index_path.open("w", encoding="utf-8") as idx:
         for i, p in enumerate(msg_files, start=1):
             try:
-                # Parse MSG
-                m = extract_msg.Message(str(p))
-                # Some versions use .process(), others do parsing in __init__.
-                # We'll call process if present and callable.
-                proc = getattr(m, "process", None)
-                if callable(proc):
-                    proc()
-
-                subject = safe_str(getattr(m, "subject", "") or "").strip()
-                if not subject:
-                    subject = p.stem
-
-                # meta
-                meta = {
-                    "source_file": str(p),
-                    "generated": now_ts(),
-                    "date": safe_str(getattr(m, "date", "") or ""),
-                    "from": safe_str(getattr(m, "sender", "") or getattr(m, "from_", "") or ""),
-                    "to": safe_str(getattr(m, "to", "") or ""),
-                    "cc": safe_str(getattr(m, "cc", "") or ""),
-                }
-
-                body = body_best_effort(m)
-                body = (body or "")[:BODY_MAX_CHARS]
-
-                # Attachments (save + extract text)
-                attachments = []
-                if EXTRACT_ATTACHMENT_TEXT:
-                    try:
-                        # extract_msg API varies; try common patterns
-                        att_list = []
-                        if hasattr(m, "attachments") and m.attachments:
-                            att_list = m.attachments
-                        elif hasattr(m, "attachment_files") and m.attachment_files:
-                            att_list = m.attachment_files
-
-                        # Save attachments if possible
-                        # Many extract_msg versions can save via m.saveAttachments(customPath=...)
-                        saver = getattr(m, "saveAttachments", None)
-                        if callable(saver):
-                            # Create per-message attachment folder
-                            msg_att_dir = ensure_dir(att_dir / sanitize_filename(p.stem))
-                            try:
-                                saver(customPath=str(msg_att_dir))
-                            except TypeError:
-                                # some versions use different param name
-                                try:
-                                    saver(str(msg_att_dir))
-                                except Exception:
-                                    pass
-
-                            # read files from that folder
-                            for fp in sorted(msg_att_dir.glob("*")):
-                                if fp.is_file():
-                                    txt = extract_attachment_text(fp) if EXTRACT_ATTACHMENT_TEXT else ""
-                                    attachments.append({
-                                        "name": fp.name,
-                                        "path": str(fp),
-                                        "text_excerpt": (txt or "")[:ATTACHMENT_TEXT_MAX_CHARS]
-                                    })
-                        else:
-                            # if we can't save, we still at least list names if accessible
-                            for a in att_list:
-                                attachments.append({"name": safe_str(a), "path": "", "text_excerpt": ""})
-                    except Exception:
-                        # attachment extraction must never break conversion
-                        log_line(log_path, f"WARNING: attachment handling failed for {p.name}")
-
-                # output names
                 base = sanitize_filename(p.stem)
-                # keep stable and avoid collisions
-                out_base = f"{base}__{i:05d}"
+                out_docx = docx_dir / f"{base}__{i:05d}.docx"
 
-                wrote_any = False
-                if WRITE_HTML:
-                    out_html = html_dir / (out_base + ".html")
-                    write_html(out_html, subject, meta, body, attachments)
-                    wrote_any = True
+                msg_to_docx_one_file(p, out_docx, att_root, log_path)
 
-                if WRITE_DOCX and docx_mod is not None:
-                    out_docx = docx_dir / (out_base + ".docx")
-                    write_docx(out_docx, subject, meta, body, attachments)
-                    wrote_any = True
-
-                # index record
                 rec = {
                     "source": str(p),
-                    "subject": subject,
-                    "date": meta.get("date", ""),
-                    "from": meta.get("from", ""),
-                    "to": meta.get("to", ""),
-                    "cc": meta.get("cc", ""),
-                    "body_len": len(body or ""),
-                    "attachments": [a.get("name","") for a in attachments],
-                    "out_html": str((html_dir / (out_base + ".html"))) if WRITE_HTML else "",
-                    "out_docx": str((docx_dir / (out_base + ".docx"))) if (WRITE_DOCX and docx_mod is not None) else "",
+                    "out_docx": str(out_docx),
+                    "generated": now_ts(),
                 }
-                idxf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                idx.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
                 ok += 1
                 if i % 25 == 0:
                     print(f"Progress: {i}/{len(msg_files)} | ok={ok} fail={fail}")
-
-                # Close message file cleanly if supported
-                try:
-                    close_fn = getattr(m, "close", None)
-                    if callable(close_fn):
-                        close_fn()
-                except Exception:
-                    pass
-
-                if not wrote_any:
-                    raise RuntimeError("Nothing written (WRITE_HTML/DOCX disabled or python-docx missing).")
 
             except Exception as e:
                 fail += 1
@@ -440,9 +480,8 @@ def run_conversion():
                 log_line(log_path, traceback.format_exc())
 
     print(f"Done. ok={ok} fail={fail}")
-    print(f"Outputs: {run_dir}")
     if fail:
         print(f"See errors: {log_path}")
 
-# ---- run it ----
-run_conversion()
+# ---- RUN ----
+run_all()
