@@ -1,252 +1,448 @@
-[2026-02-16 13:20:36] ERROR: AW_ Bitte um Zusendung der Nachhaltigkeitsprämissenblätter.msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:36] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+# ================================
+# MSG -> HTML (and optional DOCX)
+# Python 3.14 / Jupyter-safe (NO argparse)
+# - Reads all .msg recursively from MSG_DIR
+# - Writes ONE .html per .msg into a unique run folder under OUT_DIR
+# - Tries to extract usable body text (plain -> html -> rtf fallback)
+# - Tries to extract attachment text (pdf/txt/docx/xlsx/csv) and embeds short excerpts
+# - Skips missing libraries instead of crashing
+# ================================
 
-[2026-02-16 13:20:36] ERROR: AW_ CO2-Ziele _ techn_ Anforderung.msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:36] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+import os
+import re
+import sys
+import json
+import traceback
+from pathlib import Path
+from datetime import datetime
 
-[2026-02-16 13:20:36] ERROR: AW_ Fragen zu Prämissenblatt CO2 Zielwerte.msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:36] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+import html as html_mod  # IMPORTANT: avoid "from html import escape" to prevent collisions
 
-[2026-02-16 13:20:36] ERROR: AW_ Nachhaltigkeit Prämissenblatt EB-L Schütze.msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:36] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+# ---------- CONFIG ----------
+MSG_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus"
+OUT_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus\_exports"
 
-[2026-02-16 13:20:36] ERROR: AW_ Nachhaltigkeitsprämissen Conti.msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:36] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+# Output format:
+WRITE_HTML = True
+WRITE_DOCX = True   # will auto-skip if python-docx not installed
 
-[2026-02-16 13:20:36] ERROR: AW_ Nachhaltigkeitsprämissen Lokal USA Charleston.msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:36] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+# Attachment text extraction:
+EXTRACT_ATTACHMENT_TEXT = True
+ATTACHMENT_TEXT_MAX_CHARS = 6000   # embedded excerpt per attachment
+BODY_MAX_CHARS = 200000            # limit body size in html/docx
 
-[2026-02-16 13:20:36] ERROR: AW_ Nachhaltigkeitsprämissen Taskforce Zonencontroller _ Rückmeldung Lieferant Vitesco_Schaeffler.msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:36] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+# ---------- OPTIONAL LIBS (auto-skip if missing) ----------
+def try_import(name):
+    try:
+        __import__(name)
+        return sys.modules[name]
+    except Exception:
+        return None
 
-[2026-02-16 13:20:36] ERROR: AW_ Nachhaltigkeitsprämissen V530 Rohbau-WU-Paket SP2-10741 Kirchhoff.msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:36] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+extract_msg = try_import("extract_msg")
+pdfplumber = try_import("pdfplumber")
+openpyxl = try_import("openpyxl")
 
-[2026-02-16 13:20:37] ERROR: AW_ Nachhaltigkeitsprämissen_VU 2-2024-01727 M177 EVO GT BS Hotend_Coldend.msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:37] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+docx_mod = None
+try:
+    import docx as docx_mod  # python-docx
+except Exception:
+    docx_mod = None
 
-[2026-02-16 13:20:38] ERROR: AW_ Nachhaltigkeitsprämissenblatt .msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:38] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+# ---------- UTIL ----------
+def now_ts():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-[2026-02-16 13:20:39] ERROR: AW_ RFQ Scheinwerfer MMA Mopf - Ambition 2039 .msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:39] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
-[2026-02-16 13:20:39] ERROR: AW_ RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitsprämissen .msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:39] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+def safe_str(x):
+    if x is None:
+        return ""
+    try:
+        return str(x)
+    except Exception:
+        try:
+            return repr(x)
+        except Exception:
+            return ""
 
-[2026-02-16 13:20:39] ERROR: AW_ SAQ Woco_ _ Ergänzt um weitere Fragen _ Nachhaltigkeitsprämissenblatt.msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:39] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+def sanitize_filename(name: str, max_len: int = 160) -> str:
+    name = safe_str(name).strip()
+    name = re.sub(r"[\\/:*?\"<>|]+", "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    if len(name) > max_len:
+        name = name[:max_len].rstrip()
+    if not name:
+        name = "message"
+    return name
 
-[2026-02-16 13:20:39] ERROR: AW_ V530 Update _ Nachhaltigkeitsprämissen .msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:39] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+def log_line(log_path: Path, line: str):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(f"[{now_ts()}] {line}\n")
 
-[2026-02-16 13:20:39] ERROR: AW_ V530_ Vergabeerweiterung PVC.msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:39] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+def html_escape(s: str) -> str:
+    return html_mod.escape(safe_str(s), quote=True)
 
-[2026-02-16 13:20:40] ERROR: AW_ Veraltete Links in Nachhaltigkeitsprämissen.msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:40] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+def strip_html_to_text(html: str) -> str:
+    # very lightweight html->text without external libs
+    h = safe_str(html)
+    # remove scripts/styles
+    h = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", h)
+    # convert breaks
+    h = re.sub(r"(?i)<br\s*/?>", "\n", h)
+    h = re.sub(r"(?i)</p\s*>", "\n\n", h)
+    # strip tags
+    h = re.sub(r"(?is)<.*?>", " ", h)
+    # unescape entities
+    try:
+        h = html_mod.unescape(h)
+    except Exception:
+        pass
+    # normalize whitespace
+    h = re.sub(r"[ \t]+\n", "\n", h)
+    h = re.sub(r"\n{3,}", "\n\n", h)
+    h = re.sub(r"[ \t]{2,}", " ", h)
+    return h.strip()
 
-[2026-02-16 13:20:40] ERROR: AW_ VU 2-2025-01735 Fokusvergabe (wiegt nur 60g).msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:40] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+def body_best_effort(msg) -> str:
+    """
+    Try plain body, then htmlBody, then rtfBody (as raw), then fallback empty.
+    """
+    b = safe_str(getattr(msg, "body", "") or "")
+    if b.strip():
+        return b.strip()
 
-[2026-02-16 13:20:40] ERROR: Legal Feedback CATL RSS Kommentare.msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:40] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+    hb = getattr(msg, "htmlBody", None)
+    hb = safe_str(hb or "")
+    if hb.strip():
+        txt = strip_html_to_text(hb)
+        if txt.strip():
+            return txt.strip()
 
-[2026-02-16 13:20:40] ERROR: RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitsprämissen .msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:40] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+    # Some versions expose rtfBody as bytes/str; without an rtf parser we keep it minimal
+    rb = getattr(msg, "rtfBody", None)
+    if rb is not None:
+        try:
+            if isinstance(rb, (bytes, bytearray)):
+                rb = rb.decode("utf-8", errors="ignore")
+            rb = safe_str(rb)
+            rb = rb.strip()
+            if rb:
+                # last resort: remove common RTF control words crudely
+                rb2 = re.sub(r"{\\.*?}", " ", rb)
+                rb2 = re.sub(r"\\[a-zA-Z]+\d*\s?", " ", rb2)
+                rb2 = re.sub(r"[{}]", " ", rb2)
+                rb2 = re.sub(r"\s{2,}", " ", rb2).strip()
+                if rb2:
+                    return rb2
+        except Exception:
+            pass
 
-[2026-02-16 13:20:40] ERROR: WG_ Brose __ LL __ Prämissen.msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:40] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+    return ""
 
-[2026-02-16 13:20:41] ERROR: WG_ RFQ Scheinwerfer MMA Mopf - Ambition 2039 .msg -> TypeError("'str' object cannot be interpreted as an integer")
-[2026-02-16 13:20:41] Traceback (most recent call last):
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 511, in main
-    export_html(msg_obj, out_html)
-    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\SHTANDO\AppData\Local\Temp\ipykernel_20576\129646723.py", line 381, in export_html
-    <div><b>Date:</b> {escape(meta["date"])}</div>
-                       ~~~~~~^^^^^^^^^^^^^^
-  File "c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\html\__init__.py", line 19, in escape
-    s = s.replace("&", "&amp;") # Must be done first!
-TypeError: 'str' object cannot be interpreted as an integer
+def extract_attachment_text(path: Path) -> str:
+    """
+    Extract text from common office attachments.
+    Skips safely if libs missing.
+    """
+    if not path.exists():
+        return ""
 
+    ext = path.suffix.lower()
+
+    # TXT/CSV
+    if ext in [".txt", ".csv", ".log"]:
+        try:
+            return path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            try:
+                return path.read_text(encoding="latin-1", errors="ignore")
+            except Exception:
+                return ""
+
+    # PDF
+    if ext == ".pdf" and pdfplumber is not None:
+        try:
+            texts = []
+            with pdfplumber.open(str(path)) as pdf:
+                for page in pdf.pages[:20]:  # cap pages
+                    t = page.extract_text() or ""
+                    if t.strip():
+                        texts.append(t)
+            return "\n\n".join(texts).strip()
+        except Exception:
+            return ""
+
+    # XLSX
+    if ext in [".xlsx", ".xlsm"] and openpyxl is not None:
+        try:
+            wb = openpyxl.load_workbook(str(path), data_only=True, read_only=True)
+            out = []
+            for ws in wb.worksheets[:5]:
+                out.append(f"[Sheet] {ws.title}")
+                for r_i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                    if r_i > 200:
+                        break
+                    vals = [safe_str(v) for v in row if v is not None and safe_str(v).strip() != ""]
+                    if vals:
+                        out.append(" | ".join(vals[:30]))
+            return "\n".join(out).strip()
+        except Exception:
+            return ""
+
+    # DOCX
+    if ext == ".docx" and docx_mod is not None:
+        try:
+            d = docx_mod.Document(str(path))
+            paras = [p.text for p in d.paragraphs if p.text and p.text.strip()]
+            return "\n".join(paras).strip()
+        except Exception:
+            return ""
+
+    # Not supported / skipped
+    return ""
+
+def write_docx(out_path: Path, subject: str, meta: dict, body: str, attachments: list[dict]):
+    if docx_mod is None:
+        return False
+
+    d = docx_mod.Document()
+    d.add_heading(subject or "(no subject)", level=1)
+
+    # meta table
+    t = d.add_table(rows=0, cols=2)
+    t.style = "Table Grid"
+    for k in ["date", "from", "to", "cc", "source_file", "generated"]:
+        row = t.add_row().cells
+        row[0].text = k.upper()
+        row[1].text = safe_str(meta.get(k, ""))
+
+    d.add_paragraph("")
+    d.add_heading("Body", level=2)
+    for line in (body or "").split("\n"):
+        d.add_paragraph(line)
+
+    if attachments:
+        d.add_paragraph("")
+        d.add_heading("Attachments (text excerpts)", level=2)
+        for a in attachments:
+            name = safe_str(a.get("name", ""))
+            ex = safe_str(a.get("text_excerpt", ""))
+            d.add_heading(name, level=3)
+            if ex.strip():
+                d.add_paragraph(ex[:ATTACHMENT_TEXT_MAX_CHARS])
+            else:
+                d.add_paragraph("(no text extracted)")
+
+    d.save(str(out_path))
+    return True
+
+def write_html(out_path: Path, subject: str, meta: dict, body: str, attachments: list[dict]):
+    body = (body or "")[:BODY_MAX_CHARS]
+    body_html = "<br>\n".join(html_escape(line) for line in body.split("\n"))
+
+    att_html = ""
+    if attachments:
+        att_html += "<h3>Attachments</h3><ul>"
+        for a in attachments:
+            att_html += f"<li><b>{html_escape(a.get('name',''))}</b></li>"
+        att_html += "</ul>"
+
+        for a in attachments:
+            ex = safe_str(a.get("text_excerpt", "")).strip()
+            if ex:
+                att_html += f"<h4>Attachment excerpt: {html_escape(a.get('name',''))}</h4>"
+                att_html += "<pre style='white-space:pre-wrap; font-family:Consolas,monospace;'>"
+                att_html += html_escape(ex[:ATTACHMENT_TEXT_MAX_CHARS])
+                att_html += "</pre>"
+
+    html_doc = f"""<html>
+<head>
+  <meta charset="utf-8">
+  <title>{html_escape(subject) or "Message"}</title>
+</head>
+<body style="font-family:Segoe UI,Arial; font-size:13px; line-height:1.35; padding:16px;">
+  <h2>{html_escape(subject) or "(no subject)"}</h2>
+
+  <div style="margin-bottom:12px; padding:10px; background:#f6f6f6; border-radius:8px;">
+    <div><b>Date:</b> {html_escape(meta.get("date",""))}</div>
+    <div><b>From:</b> {html_escape(meta.get("from",""))}</div>
+    <div><b>To:</b> {html_escape(meta.get("to",""))}</div>
+    <div><b>CC:</b> {html_escape(meta.get("cc",""))}</div>
+    <div><b>Source:</b> {html_escape(meta.get("source_file",""))}</div>
+    <div><b>Generated:</b> {html_escape(meta.get("generated",""))}</div>
+  </div>
+
+  <h3>Body</h3>
+  <div style="white-space:normal;">{body_html}</div>
+
+  {att_html}
+</body>
+</html>"""
+
+    out_path.write_text(html_doc, encoding="utf-8")
+    return True
+
+# ---------- MAIN ----------
+def run_conversion():
+    if extract_msg is None:
+        raise RuntimeError("extract_msg is not installed. Run: py -m pip install -U extract-msg")
+
+    src = Path(MSG_DIR)
+    out_root = Path(OUT_DIR)
+
+    if not src.exists():
+        raise FileNotFoundError(f"MSG_DIR not found: {src}")
+
+    # unique run folder to avoid overwriting
+    run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    run_dir = ensure_dir(out_root / run_id)
+    html_dir = ensure_dir(run_dir / "html")
+    docx_dir = ensure_dir(run_dir / "docx")
+    att_dir  = ensure_dir(run_dir / "attachments")
+    log_path = run_dir / "errors.log"
+    index_path = run_dir / "index.jsonl"
+
+    msg_files = sorted(src.rglob("*.msg"))
+    print(f"Found .msg files: {len(msg_files)}")
+    print(f"Output folder: {run_dir}")
+
+    if not msg_files:
+        print("No .msg found. Check the folder path and OneDrive availability (make files offline).")
+        return
+
+    ok = 0
+    fail = 0
+
+    with index_path.open("w", encoding="utf-8") as idxf:
+        for i, p in enumerate(msg_files, start=1):
+            try:
+                # Parse MSG
+                m = extract_msg.Message(str(p))
+                # Some versions use .process(), others do parsing in __init__.
+                # We'll call process if present and callable.
+                proc = getattr(m, "process", None)
+                if callable(proc):
+                    proc()
+
+                subject = safe_str(getattr(m, "subject", "") or "").strip()
+                if not subject:
+                    subject = p.stem
+
+                # meta
+                meta = {
+                    "source_file": str(p),
+                    "generated": now_ts(),
+                    "date": safe_str(getattr(m, "date", "") or ""),
+                    "from": safe_str(getattr(m, "sender", "") or getattr(m, "from_", "") or ""),
+                    "to": safe_str(getattr(m, "to", "") or ""),
+                    "cc": safe_str(getattr(m, "cc", "") or ""),
+                }
+
+                body = body_best_effort(m)
+                body = (body or "")[:BODY_MAX_CHARS]
+
+                # Attachments (save + extract text)
+                attachments = []
+                if EXTRACT_ATTACHMENT_TEXT:
+                    try:
+                        # extract_msg API varies; try common patterns
+                        att_list = []
+                        if hasattr(m, "attachments") and m.attachments:
+                            att_list = m.attachments
+                        elif hasattr(m, "attachment_files") and m.attachment_files:
+                            att_list = m.attachment_files
+
+                        # Save attachments if possible
+                        # Many extract_msg versions can save via m.saveAttachments(customPath=...)
+                        saver = getattr(m, "saveAttachments", None)
+                        if callable(saver):
+                            # Create per-message attachment folder
+                            msg_att_dir = ensure_dir(att_dir / sanitize_filename(p.stem))
+                            try:
+                                saver(customPath=str(msg_att_dir))
+                            except TypeError:
+                                # some versions use different param name
+                                try:
+                                    saver(str(msg_att_dir))
+                                except Exception:
+                                    pass
+
+                            # read files from that folder
+                            for fp in sorted(msg_att_dir.glob("*")):
+                                if fp.is_file():
+                                    txt = extract_attachment_text(fp) if EXTRACT_ATTACHMENT_TEXT else ""
+                                    attachments.append({
+                                        "name": fp.name,
+                                        "path": str(fp),
+                                        "text_excerpt": (txt or "")[:ATTACHMENT_TEXT_MAX_CHARS]
+                                    })
+                        else:
+                            # if we can't save, we still at least list names if accessible
+                            for a in att_list:
+                                attachments.append({"name": safe_str(a), "path": "", "text_excerpt": ""})
+                    except Exception:
+                        # attachment extraction must never break conversion
+                        log_line(log_path, f"WARNING: attachment handling failed for {p.name}")
+
+                # output names
+                base = sanitize_filename(p.stem)
+                # keep stable and avoid collisions
+                out_base = f"{base}__{i:05d}"
+
+                wrote_any = False
+                if WRITE_HTML:
+                    out_html = html_dir / (out_base + ".html")
+                    write_html(out_html, subject, meta, body, attachments)
+                    wrote_any = True
+
+                if WRITE_DOCX and docx_mod is not None:
+                    out_docx = docx_dir / (out_base + ".docx")
+                    write_docx(out_docx, subject, meta, body, attachments)
+                    wrote_any = True
+
+                # index record
+                rec = {
+                    "source": str(p),
+                    "subject": subject,
+                    "date": meta.get("date", ""),
+                    "from": meta.get("from", ""),
+                    "to": meta.get("to", ""),
+                    "cc": meta.get("cc", ""),
+                    "body_len": len(body or ""),
+                    "attachments": [a.get("name","") for a in attachments],
+                    "out_html": str((html_dir / (out_base + ".html"))) if WRITE_HTML else "",
+                    "out_docx": str((docx_dir / (out_base + ".docx"))) if (WRITE_DOCX and docx_mod is not None) else "",
+                }
+                idxf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+                ok += 1
+                if i % 25 == 0:
+                    print(f"Progress: {i}/{len(msg_files)} | ok={ok} fail={fail}")
+
+                # Close message file cleanly if supported
+                try:
+                    close_fn = getattr(m, "close", None)
+                    if callable(close_fn):
+                        close_fn()
+                except Exception:
+                    pass
+
+                if not wrote_any:
+                    raise RuntimeError("Nothing written (WRITE_HTML/DOCX disabled or python-docx missing).")
+
+            except Exception as e:
+                fail += 1
+                log_line(log_path, f"ERROR: {p.name} -> {repr(e)}")
+                log_line(log_path, traceback.format_exc())
+
+    print(f"Done. ok={ok} fail={fail}")
+    print(f"Outputs: {run_dir}")
+    if fail:
+        print(f"See errors: {log_path}")
+
+# ---- run it ----
+run_conversion()
