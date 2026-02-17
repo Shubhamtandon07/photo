@@ -1,67 +1,288 @@
-from pathlib import Path
+# -*- coding: utf-8 -*-
+# ============================================================
+# KI Risiko – STRICT material-based HR / ENV scraper
+# ============================================================
+
+import os
+import csv
+import time
 import re
+from pathlib import Path
+from datetime import datetime
+from urllib.parse import quote_plus, urlparse
 
-MSG_ROOT = Path(r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus")
+import dateparser
+from bs4 import BeautifulSoup
+import openai
 
-def norm(s):
-    return (s or "").strip()
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-def get_att_name(att):
-    for attr in ("longFilename", "shortFilename", "filename", "name"):
-        if hasattr(att, attr):
-            v = getattr(att, attr)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-    return ""
 
-import extract_msg
+# ============================================================
+# 1) PATHS / CONFIG
+# ============================================================
 
-msg_files = sorted(MSG_ROOT.rglob("*.msg"))
-print("MSG files:", len(msg_files))
+PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
 
-total_atts = 0
-total_pdf_like = 0
+SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
+SCRAPED_DIR = PROJECT_ROOT / "gescrapte_Artikel-Links"
+SCRAPED_DIR.mkdir(parents=True, exist_ok=True)
 
-for p in msg_files:
+EINSTELLUNGEN_CSV = SETTINGS_DIR / "Einstellungen_Analyse.csv"
+BEKANNTE_SEITEN_CSV = SETTINGS_DIR / "Bekannte_Seiten.csv"
+SCHLAGWORT_CSV = SETTINGS_DIR / "Schlagwörter.csv"
+
+MAX_ARTICLES_PER_SITE = 3
+MAX_DDG_PAGES = 2
+HEADLESS = False
+
+
+# ============================================================
+# 2) RISK TERMS (EXTENDED)
+# ============================================================
+
+RISK_TERMS_BASE = [
+    "human rights",
+    "violation",
+    "abuse",
+    "forced labour",
+    "forced labor",
+    "child labour",
+    "child labor",
+    "unsafe working conditions",
+    "hazardous work",
+    "worker exploitation",
+    "discrimination",
+    "racial discrimination",
+    "religious discrimination",
+    "age discrimination",
+    "trade union",
+    "union rights",
+    "union busting",
+    "collective bargaining",
+    "pollution",
+    "environmental damage",
+    "toxic waste",
+    "spill",
+    "deforestation",
+    "community conflict",
+]
+
+
+# ============================================================
+# 3) OpenAI (unchanged)
+# ============================================================
+
+client = openai.AzureOpenAI(
+    api_version="2024-06-01",
+    azure_endpoint="https://genai-nexus.api.corpinter.net/apikey/",
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+
+
+# ============================================================
+# 4) READ SETTINGS
+# ============================================================
+
+rohst = rawm = max_datum_str = None
+
+def lese_einstellungen():
+    global rohst, rawm, max_datum_str
+
+    with EINSTELLUNGEN_CSV.open("r", encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.reader(f, delimiter=","))
+
+    rohst = rows[5][0].strip()
+    rawm = rows[8][0].strip()
+    max_datum_str = rows[11][0].strip()
+
+    max_date = dateparser.parse(max_datum_str, languages=["de"])
+    return max_date.date() if max_date else None
+
+
+# ============================================================
+# 5) HELPERS
+# ============================================================
+
+def lese_einfache_liste(pfad: Path) -> list[str]:
+    if not pfad.exists():
+        return []
+    items = []
+    with pfad.open("r", encoding="utf-8-sig", newline="") as f:
+        for row in csv.reader(f):
+            for c in row:
+                c = c.strip()
+                if c:
+                    items.append(c)
+    return list(dict.fromkeys(items))
+
+
+def contains_required_material(text: str, material: str) -> bool:
+    if not text or not material:
+        return False
+    t = text.lower()
+    m = material.lower()
+    variants = [
+        m,
+        f"{m} mining",
+        f"{m} refinery",
+        f"{m} smelting",
+        f"{m} production",
+    ]
+    return any(v in t for v in variants)
+
+
+def contains_risk_terms(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in RISK_TERMS_BASE)
+
+
+def is_bad_domain(url: str, material: str) -> bool:
+    domain = urlparse(url).netloc.lower()
+
+    bad_domains = [
+        "facebook.com", "youtube.com", "twitter.com", "x.com",
+        "instagram.com", "tiktok.com",
+    ]
+
+    if any(b in domain for b in bad_domains):
+        return True
+
+    if domain.endswith(".pdf"):
+        return True
+
+    if material.lower().replace(" ", "") in domain.replace("-", ""):
+        return True
+
+    return False
+
+
+# ============================================================
+# 6) SELENIUM
+# ============================================================
+
+def make_driver():
+    opts = Options()
+    if HEADLESS:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--start-maximized")
+    return webdriver.Chrome(options=opts)
+
+
+# ============================================================
+# 7) SEARCH + SCRAPE
+# ============================================================
+
+def ddg_search_url(q: str) -> str:
+    return "https://duckduckgo.com/?q=" + quote_plus(q) + "&ia=web"
+
+
+def scrape_ddg_results(driver, url):
+    driver.get(url)
+    time.sleep(3)
+
+    results = []
     try:
-        m = extract_msg.Message(str(p))
+        articles = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="result"]')
+    except Exception:
+        return results
+
+    for art in articles:
         try:
-            if hasattr(m, "process"):
-                m.process()
+            a = art.find_element(By.CSS_SELECTOR, "a[data-testid='result-title-a']")
+            link = a.get_attribute("href")
+            title = a.text.strip()
+        except Exception:
+            continue
+
+        snippet = ""
+        try:
+            snippet = art.find_element(By.CSS_SELECTOR, "div[data-testid='result-snippet']").text.strip()
         except Exception:
             pass
 
-        atts = []
-        if hasattr(m, "attachments") and m.attachments:
-            atts = m.attachments
-        elif hasattr(m, "get_attachments"):
-            try:
-                atts = m.get_attachments()
-            except Exception:
-                atts = []
+        results.append({
+            "url": link,
+            "title": title,
+            "snippet": snippet
+        })
 
-        names = [get_att_name(a) for a in atts]
-        pdf_like = [n for n in names if n.lower().endswith(".pdf")]
+    return results
 
-        total_atts += len(atts)
-        total_pdf_like += len(pdf_like)
 
-        print(f"\n{p.name}")
-        print("  attachments:", len(atts))
-        if names:
-            print("  names:")
-            for n in names[:30]:
-                print("   -", n or "(no name)")
-        if len(names) > 30:
-            print("   ...")
+# ============================================================
+# 8) MAIN
+# ============================================================
 
-        try:
-            m.close()
-        except Exception:
-            pass
+if __name__ == "__main__":
+    max_date = lese_einstellungen()
 
-    except Exception as e:
-        print(f"\n{p.name}\n  ERROR:", repr(e))
+    seiten = lese_einfache_liste(BEKANNTE_SEITEN_CSV)
+    schlagwoerter = lese_einfache_liste(SCHLAGWORT_CSV)
 
-print("\nTOTAL attachments:", total_atts)
-print("TOTAL *.pdf attachments:", total_pdf_like)
+    out_path = SCRAPED_DIR / f"gescrapte_links_{rohst}.csv"
+    global_seen_urls = set()
+
+    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
+        csv.writer(f, delimiter=";").writerow(
+            ["url", "site", "query", "title", "snippet"]
+        )
+
+    driver = make_driver()
+
+    try:
+        for site in seiten:
+            queries = [
+                f"{rawm} {site} human rights violation",
+                f"{rawm} {site} child labour",
+                f"{rawm} {site} environmental damage",
+                f"{rawm} {site} discrimination trade union",
+            ]
+
+            accepted = 0
+
+            for q in queries:
+                if accepted >= MAX_ARTICLES_PER_SITE:
+                    break
+
+                results = scrape_ddg_results(driver, ddg_search_url(q))
+
+                for r in results:
+                    if accepted >= MAX_ARTICLES_PER_SITE:
+                        break
+
+                    url = r["url"]
+                    text = (r["title"] + " " + r["snippet"]).lower()
+
+                    if not url or url in global_seen_urls:
+                        continue
+
+                    if is_bad_domain(url, site):
+                        continue
+
+                    if not contains_required_material(text, rawm):
+                        continue
+
+                    if not contains_risk_terms(text):
+                        continue
+
+                    global_seen_urls.add(url)
+                    accepted += 1
+
+                    with out_path.open("a", newline="", encoding="utf-8-sig") as f:
+                        csv.writer(f, delimiter=";").writerow(
+                            [url, site, q, r["title"], r["snippet"]]
+                        )
+
+                time.sleep(2)
+
+    finally:
+        driver.quit()
+
+    print(f"\n✅ Finished. Strict material-based results written to:\n{out_path}")
