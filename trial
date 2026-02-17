@@ -1,6 +1,23 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# KI Risiko – STRICT material-based HR / ENV scraper
+# KI Risiko – STRICT material-based HR / ENV scraper (v2)
+# ------------------------------------------------------------
+# Reads (from: C:\Users\SHTANDO\Desktop\KI Risko\Textdoks_für_Einstellungen_der_Suche\):
+#   1) Einstellungen_Analyse.csv
+#   2) Bekannte_Seiten.csv
+#   3) Schlagwörter.csv
+#
+# Writes:
+#   C:\Users\SHTANDO\Desktop\KI Risko\gescrapte_Artikel-Links\gescrapte_links_<rohst>.csv
+#
+# Goal:
+#   - Prioritize YOUR known sites, but also add extra trustworthy sites (built-in list)
+#   - Only keep hits that mention the required material (rawm) + risk terms
+#   - Avoid noisy sources: social media, jobs/careers, finance/IR pages, PDFs
+#   - De-duplicate across all sites/queries
+#
+# Notes:
+#   - If you get PermissionError: close the output CSV in Excel before running.
 # ============================================================
 
 import os
@@ -8,12 +25,10 @@ import csv
 import time
 import re
 from pathlib import Path
-from datetime import datetime
 from urllib.parse import quote_plus, urlparse
 
 import dateparser
-from bs4 import BeautifulSoup
-import openai
+from bs4 import BeautifulSoup  # kept (sometimes useful when DDG markup changes)
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -29,109 +44,98 @@ from selenium.webdriver.support import expected_conditions as EC
 PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
 
 SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
-SCRAPED_DIR = PROJECT_ROOT / "gescrapte_Artikel-Links"
+SCRAPED_DIR  = PROJECT_ROOT / "gescrapte_Artikel-Links"
 SCRAPED_DIR.mkdir(parents=True, exist_ok=True)
 
-EINSTELLUNGEN_CSV = SETTINGS_DIR / "Einstellungen_Analyse.csv"
+EINSTELLUNGEN_CSV   = SETTINGS_DIR / "Einstellungen_Analyse.csv"
 BEKANNTE_SEITEN_CSV = SETTINGS_DIR / "Bekannte_Seiten.csv"
-SCHLAGWORT_CSV = SETTINGS_DIR / "Schlagwörter.csv"
+SCHLAGWORT_CSV      = SETTINGS_DIR / "Schlagwörter.csv"
 
 MAX_ARTICLES_PER_SITE = 3
 MAX_DDG_PAGES = 2
 HEADLESS = False
 
+# How many keywords from Schlagwörter.csv to use per site (higher = more recall, slower)
+MAX_KEYWORDS_PER_SITE = 6
 
 # ============================================================
 # 2) RISK TERMS (EXTENDED)
 # ============================================================
 
 RISK_TERMS_BASE = [
-    "human rights",
-    "violation",
-    "abuse",
-    "forced labour",
-    "forced labor",
-    "child labour",
-    "child labor",
-    "unsafe working conditions",
-    "hazardous work",
-    "worker exploitation",
-    "discrimination",
-    "racial discrimination",
-    "religious discrimination",
-    "age discrimination",
-    "trade union",
-    "union rights",
-    "union busting",
-    "collective bargaining",
-    "pollution",
-    "environmental damage",
-    "toxic waste",
-    "spill",
-    "deforestation",
-    "community conflict",
+    # general HR
+    "human rights", "violation", "abuse",
+    "forced labour", "forced labor",
+    "child labour", "child labor",
+    "underage", "modern slavery",
+    "unsafe working conditions", "hazardous work", "worker exploitation",
+    "wage theft", "trafficking",
+
+    # discrimination (your ask)
+    "discrimination", "age discrimination", "racial discrimination", "religious discrimination",
+    "race", "religion", "age",
+
+    # trade union freedoms (your ask)
+    "trade union", "union rights", "union busting", "collective bargaining", "right to strike",
+
+    # environment / env-human-rights intersection
+    "pollution", "environmental damage", "contamination", "toxic waste", "spill",
+    "tailings", "tailings dam", "deforestation",
+    "community conflict", "protest", "displacement",
 ]
 
+# Exclude obvious noise (even if they contain risk words)
+BAD_DOMAIN_SUBSTRINGS = [
+    "facebook.com", "m.facebook.com",
+    "youtube.com", "youtu.be",
+    "instagram.com",
+    "tiktok.com",
+    "twitter.com", "x.com",
+    "pinterest.",
+
+    # often noisy
+    "reddit.com",
+]
+
+BAD_URL_HINTS = [
+    "/jobs", "/job", "/careers", "/career", "/karriere", "/stellen", "/vacancies",
+    "/investor", "/investors", "/ir", "/investor-relations",
+    "/stock", "/shares", "/quote", "/pricing",
+    "/privacy", "/cookie", "/cookies", "/terms",
+]
+
+BAD_FILE_EXTS = (".pdf", ".doc", ".docx", ".ppt", ".pptx")
+
 
 # ============================================================
-# 2b) EXTRA TRUSTWORTHY SITES (ADDED)
+# 3) EXTRA TRUSTWORTHY SITES (added on top of your Bekannte_Seiten.csv)
+#    These are domains to be used with site: queries.
+#    Your sites remain PRIORITY because we keep their order first.
 # ============================================================
-# These get appended AFTER your Bekannte_Seiten.csv domains.
-# Use bare domains (no https://, no paths).
-TRUSTED_EXTRA_SITES = [
-    # NGOs / human-rights orgs
+
+EXTRA_TRUSTWORTHY_SITES = [
+    # NGOs / intergov
     "humanrightswatch.org",
     "amnesty.org",
-    "freedomhouse.org",
-    "freedomunited.org",
-    "business-humanrights.org",
-    "verite.org",
-    "walkfree.org",
+    "ilo.org",
+    "oecd.org",
+    "ohchr.org",
+    "un.org",
+    "unep.org",
+    "worldbank.org",
 
-    # Investigative / watchdog / reporting
+    # investigative / journalism
     "reuters.com",
     "apnews.com",
-    "bbc.com",
+    "bbc.co.uk",
     "dw.com",
     "theguardian.com",
     "ft.com",
-    "wsj.com",
-    "bloomberg.com",
 
-    # Sustainability / supply chain / ESG reporting
-    "responsiblemineralsinitiative.org",
-    "rmi.org",  # Rocky Mountain Institute (occasionally relevant)
-    "oecd.org",
-    "ilo.org",
-    "ohchr.org",
-
-    # Regulators / public agencies (often enforcement / sanctions / legal)
-    "justice.gov",
-    "sec.gov",
+    # environment / regulation (sometimes very good for incidents)
     "epa.gov",
-    "europarl.europa.eu",
     "ec.europa.eu",
-
-    # Industry standards / audit schemes (sometimes incident-driven)
-    "lbma.org.uk",
-    "responsiblejewellery.com",
-
-    # Academic / policy repositories (not PDFs are filtered elsewhere, but the domain can still have HTML pages)
-    "journals.sagepub.com",
-    "tandfonline.com",
-    "sciencedirect.com",
 ]
-
-
-# ============================================================
-# 3) OpenAI (unchanged)
-# ============================================================
-
-client = openai.AzureOpenAI(
-    api_version="2024-06-01",
-    azure_endpoint="https://genai-nexus.api.corpinter.net/apikey/",
-    api_key=os.getenv("OPENAI_API_KEY"),
-)
 
 
 # ============================================================
@@ -141,219 +145,414 @@ client = openai.AzureOpenAI(
 rohst = rawm = max_datum_str = None
 
 def lese_einstellungen():
+    """
+    Uses the same indices you’ve been using:
+      rows[5]  = rohst (German)
+      rows[8]  = rawm  (English)
+      rows[11] = max_datum (e.g., 20.11.2020)
+    """
     global rohst, rawm, max_datum_str
+
+    if not EINSTELLUNGEN_CSV.exists():
+        raise FileNotFoundError(f"Settings file not found: {EINSTELLUNGEN_CSV}")
 
     with EINSTELLUNGEN_CSV.open("r", encoding="utf-8-sig", newline="") as f:
         rows = list(csv.reader(f, delimiter=","))
 
-    rohst = rows[5][0].strip()
-    rawm = rows[8][0].strip()
-    max_datum_str = rows[11][0].strip()
+    def safe_get(idx: int, default: str = "") -> str:
+        if len(rows) > idx and rows[idx] and rows[idx][0].strip():
+            return rows[idx][0].strip()
+        return default
 
-    max_date = dateparser.parse(max_datum_str, languages=["de"])
-    return max_date.date() if max_date else None
+    rohst = safe_get(5, "Stahl")
+    rawm = safe_get(8, "Steel")
+    max_datum_str = safe_get(11, "20.11.2020")
+
+    print("SETTINGS:")
+    print("  rohst     =", rohst)
+    print("  rawm      =", rawm)
+    print("  max_datum =", max_datum_str)
+
+    # parse date (DE/EN)
+    parsed = dateparser.parse(max_datum_str, languages=["de", "en"])
+    return parsed.date() if parsed else None
 
 
 # ============================================================
-# 5) HELPERS
+# 5) CSV LIST LOADERS
 # ============================================================
 
-def lese_einfache_liste(pfad: Path) -> list[str]:
+def lese_einfache_liste(pfad: Path, delimiter: str = ",") -> list[str]:
     if not pfad.exists():
+        print("⚠️ File not found:", pfad)
         return []
-    items = []
+    items: list[str] = []
     with pfad.open("r", encoding="utf-8-sig", newline="") as f:
-        for row in csv.reader(f):
-            for c in row:
-                c = c.strip()
-                if c:
-                    items.append(c)
-    return list(dict.fromkeys(items))
+        r = csv.reader(f, delimiter=delimiter)
+        for row in r:
+            for cell in row:
+                val = (cell or "").strip()
+                if val:
+                    items.append(val)
+    # dedupe keep order
+    seen = set()
+    uniq = []
+    for it in items:
+        k = it.strip().lower()
+        if k not in seen:
+            seen.add(k)
+            uniq.append(it.strip())
+    return uniq
 
+def normalize_domain(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"^https?://", "", s, flags=re.IGNORECASE)
+    s = s.split("/")[0].strip()
+    s = s.replace("www.", "").strip()
+    return s
+
+def merge_sites(user_sites: list[str]) -> list[str]:
+    # user sites first (priority), then extras not already present
+    out: list[str] = []
+    seen = set()
+
+    def add_site(site: str):
+        d = normalize_domain(site)
+        if not d:
+            return
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+
+    for s in user_sites:
+        add_site(s)
+    for s in EXTRA_TRUSTWORTHY_SITES:
+        add_site(s)
+
+    return out
+
+
+# ============================================================
+# 6) FILTERS
+# ============================================================
 
 def contains_required_material(text: str, material: str) -> bool:
+    """
+    Strict: the required material (rawm) must appear in title/snippet.
+    This prevents random cobalt/steel articles when you want gold, etc.
+    """
     if not text or not material:
         return False
     t = text.lower()
-    m = material.lower()
-    variants = [
+    m = material.lower().strip()
+    # allow small variations (very conservative)
+    variants = {
         m,
-        f"{m} mining",
-        f"{m} refinery",
-        f"{m} smelting",
-        f"{m} production",
-    ]
-    return any(v in t for v in variants)
+        m.replace("-", " "),
+        m.replace(" ", "-"),
+    }
+    return any(v in t for v in variants if v)
 
+def contains_risk_terms(text: str, extra_terms: list[str]) -> bool:
+    """
+    Risk term must appear in title/snippet to reduce noise.
+    Also uses Schlagwörter.csv (where you may have 'child + labour' etc).
+    """
+    t = (text or "").lower()
 
-def contains_risk_terms(text: str) -> bool:
-    t = text.lower()
-    return any(k in t for k in RISK_TERMS_BASE)
+    for kw in RISK_TERMS_BASE:
+        if kw.lower() in t:
+            return True
 
+    for sw in extra_terms:
+        sw_clean = (sw or "").replace("+", " ").strip().lower()
+        if not sw_clean:
+            continue
+        # check either full phrase or any token (token check gives more recall)
+        if sw_clean in t:
+            return True
+        for token in sw_clean.split():
+            if len(token) >= 4 and token in t:
+                return True
 
-def is_bad_domain(url: str, material: str) -> bool:
-    domain = urlparse(url).netloc.lower()
+    return False
 
-    bad_domains = [
-        "facebook.com", "youtube.com", "twitter.com", "x.com",
-        "instagram.com", "tiktok.com",
-    ]
-
-    if any(b in domain for b in bad_domains):
+def is_bad_result(url: str, title: str, snippet: str) -> bool:
+    if not url:
         return True
 
-    if domain.endswith(".pdf"):
+    u = url.strip()
+    ul = u.lower()
+
+    # file types
+    if any(ul.endswith(ext) for ext in BAD_FILE_EXTS):
         return True
 
-    if material.lower().replace(" ", "") in domain.replace("-", ""):
+    # bad domains
+    dom = urlparse(u).netloc.lower()
+    if any(bad in dom for bad in BAD_DOMAIN_SUBSTRINGS):
+        return True
+
+    # bad url hints (jobs/finance/IR etc.)
+    if any(hint in ul for hint in BAD_URL_HINTS):
+        return True
+
+    # extra noise heuristics
+    combined = f"{title} {snippet}".lower()
+    if "policy" in combined and "violation" not in combined and "abuse" not in combined:
+        # policies are usually PR; keep only if explicitly about violations/abuse
         return True
 
     return False
 
 
 # ============================================================
-# 6) SELENIUM
+# 7) SELENIUM
 # ============================================================
 
-def make_driver():
+def make_driver() -> webdriver.Chrome:
     opts = Options()
     if HEADLESS:
         opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--enable-javascript")
     opts.add_argument("--start-maximized")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
     return webdriver.Chrome(options=opts)
 
 
 # ============================================================
-# 7) SEARCH + SCRAPE
+# 8) DUCKDUCKGO QUERY BUILDING / SCRAPING
 # ============================================================
 
-def ddg_search_url(q: str) -> str:
-    return "https://duckduckgo.com/?q=" + quote_plus(q) + "&ia=web"
+def ddg_search_url(query: str) -> str:
+    return "https://duckduckgo.com/?q=" + quote_plus(query) + "&kp=1&ia=web"
 
+def build_queries_for_site(domain: str, rawm: str, schlagwoerter: list[str]) -> list[str]:
+    """
+    No quotes, no OR. Also removes any accidental quotes.
+    Keep it recall-friendly but still material-focused.
+    """
+    # base HR/env combos
+    base_queries = [
+        f"site:{domain} {rawm} human rights violation",
+        f"site:{domain} {rawm} forced labour",
+        f"site:{domain} {rawm} child labour",
+        f"site:{domain} {rawm} pollution spill contamination",
+        f"site:{domain} {rawm} discrimination trade union collective bargaining",
+        f"site:{domain} {rawm} unsafe working conditions hazardous work",
+    ]
 
-def scrape_ddg_results(driver, url):
-    driver.get(url)
-    time.sleep(3)
+    # add keyword queries
+    kws = schlagwoerter[:MAX_KEYWORDS_PER_SITE]
+    for sw in kws:
+        sw_clean = (sw or "").replace("+", " ").strip()
+        if sw_clean:
+            base_queries.append(f"site:{domain} {rawm} {sw_clean}")
 
-    results = []
+    # sanitize quotes (ASCII + smart quotes)
+    sanitized = [re.sub(r'[\u201C\u201D\"\']', "", q) for q in base_queries]
+    return sanitized
+
+def scrape_ddg_results(driver: webdriver.Chrome, search_url: str, max_pages: int) -> list[dict]:
+    """
+    Returns list of dicts: {url, title, snippet, date_txt}
+    """
+    items: list[dict] = []
+
     try:
-        articles = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="result"]')
+        driver.get(search_url)
     except Exception:
-        return results
+        return items
 
-    for art in articles:
+    pages_seen = 0
+    while pages_seen < max_pages:
+        time.sleep(2)
+
+        html = (driver.page_source or "").lower()
+        if "filter löschen" in html or "try again" in html:
+            # DDG sometimes shows this. Skip query quickly.
+            break
+
         try:
-            a = art.find_element(By.CSS_SELECTOR, "a[data-testid='result-title-a']")
-            link = a.get_attribute("href")
-            title = a.text.strip()
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'article[data-testid="result"]'))
+            )
         except Exception:
-            continue
+            # If DDG changes markup, attempt a light parse:
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            txt = soup.get_text(" ", strip=True).lower()
+            if "no results" in txt or "keine ergebnisse" in txt:
+                break
+            break
 
-        snippet = ""
+        articles = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="result"]')
+        for art in articles:
+            try:
+                a = art.find_element(By.CSS_SELECTOR, "a[data-testid='result-title-a']")
+                url = (a.get_attribute("href") or "").strip()
+                title = (a.text or "").strip()
+                if not url or "duckduckgo.com" in url:
+                    continue
+            except Exception:
+                continue
+
+            snippet = ""
+            try:
+                snippet = (art.find_element(By.CSS_SELECTOR, "div[data-testid='result-snippet']").text or "").strip()
+            except Exception:
+                pass
+
+            date_txt = ""
+            try:
+                date_txt = (art.find_element(By.CSS_SELECTOR, "span.MILR5XIVy9h75WrLvKiq").text or "").strip()
+            except Exception:
+                pass
+
+            items.append({"url": url, "title": title, "snippet": snippet, "date_txt": date_txt})
+
+        # more results
         try:
-            snippet = art.find_element(By.CSS_SELECTOR, "div[data-testid='result-snippet']").text.strip()
+            more_btn = WebDriverWait(driver, 2).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "#more-results"))
+            )
+            driver.execute_script("arguments[0].scrollIntoView(true);", more_btn)
+            time.sleep(0.8)
+            more_btn.click()
+            pages_seen += 1
+            time.sleep(1.2)
         except Exception:
-            pass
+            break
 
-        results.append({
-            "url": link,
-            "title": title,
-            "snippet": snippet
-        })
-
-    return results
+    return items
 
 
 # ============================================================
-# 8) MAIN
+# 9) DATE CHECK (optional, permissive)
+# ============================================================
+
+def is_date_ok(date_txt: str, min_date, _url: str) -> bool:
+    """
+    Very permissive: if can't parse, allow.
+    """
+    if min_date is None:
+        return True
+    if not date_txt:
+        return True
+    parsed = dateparser.parse(date_txt, languages=["de", "en"])
+    if not parsed:
+        return True
+    return parsed.date() >= min_date
+
+
+# ============================================================
+# 10) MAIN
 # ============================================================
 
 if __name__ == "__main__":
-    max_date = lese_einstellungen()
+    min_date = lese_einstellungen()
 
-    seiten = lese_einfache_liste(BEKANNTE_SEITEN_CSV)
-    schlagwoerter = lese_einfache_liste(SCHLAGWORT_CSV)
+    user_sites_raw = lese_einfache_liste(BEKANNTE_SEITEN_CSV, delimiter=",")
+    schlagwoerter  = lese_einfache_liste(SCHLAGWORT_CSV, delimiter=",")
 
-    # -------------------------------
-    # ONLY CHANGE: append extra sites
-    # while keeping YOUR list first
-    # -------------------------------
-    combined_sites = []
-    seen = set()
+    sites = merge_sites(user_sites_raw)
 
-    for s in seiten:
-        key = s.strip().lower()
-        if key and key not in seen:
-            combined_sites.append(s.strip())
-            seen.add(key)
-
-    for s in TRUSTED_EXTRA_SITES:
-        key = s.strip().lower()
-        if key and key not in seen:
-            combined_sites.append(s.strip())
-            seen.add(key)
-
-    seiten = combined_sites
+    print("\nUser sites found:", len(user_sites_raw))
+    print("Total sites used (user + extras):", len(sites))
+    print("Material (rawm) strict filter:", rawm)
+    print("Keywords loaded:", len(schlagwoerter))
 
     out_path = SCRAPED_DIR / f"gescrapte_links_{rohst}.csv"
+
+    # global de-dup across all sites and queries
     global_seen_urls = set()
 
+    # write header
     with out_path.open("w", newline="", encoding="utf-8-sig") as f:
         csv.writer(f, delimiter=";").writerow(
-            ["url", "site", "query", "title", "snippet"]
+            ["gefundener link", "datum", "seite", "suche", "titel", "snippet"]
         )
 
     driver = make_driver()
 
     try:
-        for site in seiten:
-            queries = [
-                f"{rawm} {site} human rights violation",
-                f"{rawm} {site} child labour",
-                f"{rawm} {site} environmental damage",
-                f"{rawm} {site} discrimination trade union",
-            ]
+        for idx_site, domain in enumerate(sites, start=1):
+            print(f"\n🌐 Site {idx_site}/{len(sites)}: {domain}")
 
-            accepted = 0
+            queries = build_queries_for_site(domain, rawm, schlagwoerter)
+            print(f"   → Queries: {len(queries)}")
 
-            for q in queries:
-                if accepted >= MAX_ARTICLES_PER_SITE:
+            accepted_for_site = 0
+            seen_urls_for_site = set()
+
+            for q_idx, q in enumerate(queries, start=1):
+                if accepted_for_site >= MAX_ARTICLES_PER_SITE:
+                    print(f"   ✅ Limit reached ({MAX_ARTICLES_PER_SITE}) for {domain}")
                     break
 
-                results = scrape_ddg_results(driver, ddg_search_url(q))
+                search_url = ddg_search_url(q)
+                print(f"   🔎 Query {q_idx}/{len(queries)}")
 
-                for r in results:
-                    if accepted >= MAX_ARTICLES_PER_SITE:
+                results = scrape_ddg_results(driver, search_url, max_pages=MAX_DDG_PAGES)
+                if not results:
+                    continue
+
+                for res in results:
+                    if accepted_for_site >= MAX_ARTICLES_PER_SITE:
                         break
 
-                    url = r["url"]
-                    text = (r["title"] + " " + r["snippet"]).lower()
+                    url = res["url"]
+                    title = res["title"]
+                    snippet = res["snippet"]
+                    date_txt = res.get("date_txt", "")
 
-                    if not url or url in global_seen_urls:
+                    if not url:
+                        continue
+                    if url in global_seen_urls or url in seen_urls_for_site:
                         continue
 
-                    if is_bad_domain(url, site):
+                    if is_bad_result(url, title, snippet):
                         continue
 
-                    if not contains_required_material(text, rawm):
+                    if not is_date_ok(date_txt, min_date, url):
                         continue
 
-                    if not contains_risk_terms(text):
+                    combined = f"{title} {snippet}".strip()
+                    # strict material presence
+                    if not contains_required_material(combined, rawm):
+                        continue
+                    # require risk term presence
+                    if not contains_risk_terms(combined, schlagwoerter):
                         continue
 
+                    # accept
                     global_seen_urls.add(url)
-                    accepted += 1
+                    seen_urls_for_site.add(url)
+                    accepted_for_site += 1
+
+                    print(f"      ✅ ACCEPTED #{accepted_for_site}: {title}")
 
                     with out_path.open("a", newline="", encoding="utf-8-sig") as f:
                         csv.writer(f, delimiter=";").writerow(
-                            [url, site, q, r["title"], r["snippet"]]
+                            [url, date_txt, domain, q, title, snippet]
                         )
 
-                time.sleep(2)
+                time.sleep(1.5)
+
+            if accepted_for_site == 0:
+                print("   → No accepted hits for this site.")
+            else:
+                print(f"   → Accepted for {domain}: {accepted_for_site}")
+
+            time.sleep(1.5)
 
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
-    print(f"\n✅ Finished. Strict material-based results written to:\n{out_path}")
+    print("\n✅ Done. Output written to:")
+    print(out_path)
