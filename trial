@@ -74,6 +74,56 @@ RISK_TERMS_BASE = [
 
 
 # ============================================================
+# 2b) EXTRA TRUSTWORTHY SITES (ADDED)
+# ============================================================
+# These get appended AFTER your Bekannte_Seiten.csv domains.
+# Use bare domains (no https://, no paths).
+TRUSTED_EXTRA_SITES = [
+    # NGOs / human-rights orgs
+    "humanrightswatch.org",
+    "amnesty.org",
+    "freedomhouse.org",
+    "freedomunited.org",
+    "business-humanrights.org",
+    "verite.org",
+    "walkfree.org",
+
+    # Investigative / watchdog / reporting
+    "reuters.com",
+    "apnews.com",
+    "bbc.com",
+    "dw.com",
+    "theguardian.com",
+    "ft.com",
+    "wsj.com",
+    "bloomberg.com",
+
+    # Sustainability / supply chain / ESG reporting
+    "responsiblemineralsinitiative.org",
+    "rmi.org",  # Rocky Mountain Institute (occasionally relevant)
+    "oecd.org",
+    "ilo.org",
+    "ohchr.org",
+
+    # Regulators / public agencies (often enforcement / sanctions / legal)
+    "justice.gov",
+    "sec.gov",
+    "epa.gov",
+    "europarl.europa.eu",
+    "ec.europa.eu",
+
+    # Industry standards / audit schemes (sometimes incident-driven)
+    "lbma.org.uk",
+    "responsiblejewellery.com",
+
+    # Academic / policy repositories (not PDFs are filtered elsewhere, but the domain can still have HTML pages)
+    "journals.sagepub.com",
+    "tandfonline.com",
+    "sciencedirect.com",
+]
+
+
+# ============================================================
 # 3) OpenAI (unchanged)
 # ============================================================
 
@@ -225,6 +275,27 @@ if __name__ == "__main__":
 
     seiten = lese_einfache_liste(BEKANNTE_SEITEN_CSV)
     schlagwoerter = lese_einfache_liste(SCHLAGWORT_CSV)
+
+    # -------------------------------
+    # ONLY CHANGE: append extra sites
+    # while keeping YOUR list first
+    # -------------------------------
+    combined_sites = []
+    seen = set()
+
+    for s in seiten:
+        key = s.strip().lower()
+        if key and key not in seen:
+            combined_sites.append(s.strip())
+            seen.add(key)
+
+    for s in TRUSTED_EXTRA_SITES:
+        key = s.strip().lower()
+        if key and key not in seen:
+            combined_sites.append(s.strip())
+            seen.add(key)
+
+    seiten = combined_sites
 
     out_path = SCRAPED_DIR / f"gescrapte_links_{rohst}.csv"
     global_seen_urls = set()
