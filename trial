@@ -1,380 +1,364 @@
 # -*- coding: utf-8 -*-
-"""
-DETERMINISTIC ANALYSE (NO LLM)
-reads:  C:/Users/SHTANDO/Desktop/KI Risko/gescrapte_Artikel-Links/gescrapte_links_<rohst>.csv
-writes: C:/Users/SHTANDO/Desktop/KI Risko/Analyse_Tabelle/analyse_tabelle_<rohst>.csv
-"""
+# ============================================================
+# KI Risiko – Per-article executive summaries + ONE overall summary sheet
+# Reads:  C:\Users\SHTANDO\Desktop\KI Risko\Analyse_Tabelle\analyse_tabelle_<rohst>.csv
+# Writes: C:\Users\SHTANDO\Desktop\KI Risko\Executive_Summary_<rohst>\Executive_Summary_Artikelweise_<rohst>.xlsx
+#
+# What it does:
+#  - Creates 1 Excel workbook
+#  - Sheet "Case_1..Case_n": per-article (100–200 words) summary using ONLY analysis table fields
+#  - Sheet "Overall_Summary": 200–400 words overall summary that MUST mention top countries/years/etc.
+#    computed from the analysis table (no hallucination)
+# ============================================================
 
+import os
 import csv
 import re
-import time
-import random
 from pathlib import Path
-from urllib.parse import urlparse
+from collections import Counter
 
-import requests
-from bs4 import BeautifulSoup
+import openai
+from openpyxl import Workbook
 
-# Selenium fallback (only if needed)
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
 
-# --------------------------------------------------
-# 0) Paths
-# --------------------------------------------------
+# -----------------------------
+# 1) Paths and OpenAI client
+# -----------------------------
 PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
+ANALYSE_DIR = PROJECT_ROOT / "Analyse_Tabelle"
 SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
-SCRAPED_DIR = PROJECT_ROOT / "gescrapte_Artikel-Links"
-OUTPUT_DIR = PROJECT_ROOT / "Analyse_Tabelle"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-WRITE_DEBUG = True
+EINSTELLUNGEN_CSV = SETTINGS_DIR / "Einstellungen_Analyse.csv"
 
-# --------------------------------------------------
-# 1) Read settings
-# --------------------------------------------------
-rohst = rawm = max_datum = None
+client = openai.AzureOpenAI(
+    api_version="2024-06-01",
+    azure_endpoint="https://genai-nexus.api.corpinter.net/apikey/",
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
+
+# -----------------------------
+# 2) Read settings (rohst/rawm)
+# -----------------------------
+rohst = rawm = None
+
 
 def lese_einstellungen():
-    global rohst, rawm, max_datum
-    settings_path = SETTINGS_DIR / "Einstellungen_Analyse.csv"
-    with settings_path.open("r", encoding="utf-8-sig") as f:
+    global rohst, rawm
+    with EINSTELLUNGEN_CSV.open("r", encoding="utf-8-sig", newline="") as f:
         rows = list(csv.reader(f, delimiter=","))
-    def get_row(idx, default=""):
-        return rows[idx][0].strip() if len(rows) > idx and len(rows[idx]) > 0 else default
-    rohst     = get_row(5, "Stahl")
-    rawm      = get_row(8, "Steel")
-    max_datum = get_row(11, "20.11.2020")
 
-# --------------------------------------------------
-# 2) Link loader
-# --------------------------------------------------
-def lese_links_aus_scrape_csv(rohstoff: str) -> list[str]:
-    fpath = SCRAPED_DIR / f"gescrapte_links_{rohstoff}.csv"
-    if not fpath.exists():
-        raise FileNotFoundError(f"Scrape CSV not found: {fpath}")
-    links = []
-    with fpath.open("r", encoding="utf-8-sig") as f:
-        r = csv.reader(f, delimiter=";")
-        next(r, None)
-        for row in r:
-            if row and row[0].strip():
-                links.append(row[0].strip())
-    # dedupe keep order
-    seen = set()
-    out = []
-    for u in links:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
+    # keep same indices as your working pipeline
+    rohst = rows[5][0].strip()
+    rawm = rows[8][0].strip()
+    print(f"Loaded settings → rohst={rohst}, rawm={rawm}")
 
-# --------------------------------------------------
-# 3) Fetch helpers (requests -> jina -> selenium)
-# --------------------------------------------------
-UA_LIST = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
-]
 
-def _looks_like_block(html_text: str) -> bool:
-    if not html_text:
-        return True
-    t = html_text.lower()
-    block_signals = [
-        "captcha", "cloudflare", "attention required", "access denied",
-        "bot detection", "verify you are human", "unusual traffic",
-        "checking your browser", "ddos protection",
-    ]
-    return any(s in t for s in block_signals)
+# -----------------------------
+# 3) Load analyse_tabelle_<rohst>.csv
+# -----------------------------
+def lade_analyse_tabelle() -> tuple[list[str], list[list[str]]]:
+    analyse_path = ANALYSE_DIR / f"analyse_tabelle_{rohst}.csv"
+    if not analyse_path.exists():
+        raise FileNotFoundError(f"Analysis file not found: {analyse_path}")
 
-def fetch_requests(url: str, timeout: int = 20) -> tuple[bool, str, str]:
-    """Returns (ok, text, reason)"""
+    with analyse_path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f, delimiter=";")
+        rows = list(reader)
+
+    if not rows:
+        raise ValueError(f"Analysis file is empty: {analyse_path}")
+
+    header = rows[0]
+    data_rows = rows[1:]
+    print(f"Loaded {len(data_rows)} analysed rows from: {analyse_path}")
+    return header, data_rows
+
+
+# -----------------------------
+# 4) GPT summary for one article
+# -----------------------------
+def baue_prompt_aus_zeile(header: list[str], row: list[str]) -> str:
+    def get(col_name: str, default: str = "Not in Text") -> str:
+        if col_name in header:
+            idx = header.index(col_name)
+            if idx < len(row) and row[idx].strip():
+                return row[idx].strip()
+        return default
+
+    link = get("link", "")
+    risk_categories = get("Risikokategorien (A–M)", "")
+    harms = get("Arten der Menschenrechts-/Umweltschädigungen", "")
+    begruendung = get("Begründung", "")
+    years = get("Jahr(e)", "")
+    countries = get("Land/Länder", "")
+    locations = get("Ort(e)", "")
+    stage = get("Stufe der Rohstoffgewinnung", "")
+    companies = get("Involvierte Unternehmen", "")
+    groups = get("Betroffene Personengruppen/Ökosysteme", "")
+    min_people = get("Mindestzahl der betroffenen Personen", "")
+    min_reason = get("Begründung Mindestzahl", "")
+    severity = get("Schwere", "")
+    severity_reason = get("Begründung Schwere", "")
+
+    context = f"""
+Link: {link}
+Risk categories: {risk_categories}
+Types of harm: {harms}
+Reason / evidence: {begruendung}
+Years: {years}
+Countries: {countries}
+Locations: {locations}
+Supply-chain stage: {stage}
+Companies involved: {companies}
+Affected groups / ecosystems: {groups}
+Minimum number of affected persons: {min_people}
+Reason for this minimum: {min_reason}
+Severity level: {severity}
+Reason for severity: {severity_reason}
+""".strip()
+
+    prompt = f"""
+You are a human-rights and environmental-risk analyst.
+
+You receive the structured analysis of ONE article about the raw material "{rawm}".
+Your task is to write a concise, well-structured executive summary of this SINGLE case.
+
+Very important rules:
+- Use ONLY the information given in the structured data below.
+- Do NOT invent any new numbers, companies, places, or years.
+- If something is "Not in Text" or missing, do not make it up; simply omit it or describe it more generally.
+- Focus on human-rights and environmental impacts, not financial details.
+- Length: about 120–200 words.
+- Tone: neutral, factual, clear.
+- Structure: 1–3 short paragraphs, no bullet points, no headings.
+
+At the end of the summary, include a simple reference like:
+[Article link: {link}]
+
+Here is the structured data you must use and stay inside:
+
+{context}
+"""
+    return prompt
+
+
+def gpt_summary_for_row(header: list[str], row: list[str]) -> str:
+    prompt = baue_prompt_aus_zeile(header, row)
     try:
-        headers = {"User-Agent": random.choice(UA_LIST), "Accept-Language": "en,de;q=0.9"}
-        r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-        if r.status_code >= 400:
-            return False, "", f"http_{r.status_code}"
-        if _looks_like_block(r.text):
-            return False, r.text, "blocked_or_captcha"
-        return True, r.text, "ok"
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a careful analyst. You never invent facts that are not supported by the input.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+        )
+        return resp.choices[0].message.content.strip()
     except Exception as e:
-        return False, "", f"requests_error:{e}"
+        print(f"⚠️ GPT error for one article: {e}")
+        return "Error: could not generate summary for this article."
 
-def fetch_jina_text(url: str, timeout: int = 25) -> tuple[bool, str, str]:
-    """
-    Jina AI text mirror: https://r.jina.ai/http(s)://...
-    Often bypasses heavy JS/CF pages and returns readable text.
-    """
+
+# -----------------------------
+# 5) Overall-summary helpers (facts from analyse table)
+# -----------------------------
+def _split_values(cell: str) -> list[str]:
+    if not cell or cell.strip().lower() == "not in text":
+        return []
+    parts = re.split(r"[;,/|]+", cell)
+    return [p.strip() for p in parts if p.strip() and p.strip().lower() != "not in text"]
+
+
+def compute_overall_facts(header: list[str], rows: list[list[str]]) -> dict:
+    def get(row: list[str], col: str) -> str:
+        if col in header:
+            idx = header.index(col)
+            if idx < len(row):
+                return (row[idx] or "").strip()
+        return ""
+
+    countries = Counter()
+    years = Counter()
+    companies = Counter()
+    severities = Counter()
+    categories = Counter()
+
+    for row in rows:
+        for c in _split_values(get(row, "Land/Länder")):
+            countries[c] += 1
+
+        y_raw = get(row, "Jahr(e)")
+        for y in re.findall(r"\b(19\d{2}|20\d{2})\b", y_raw or ""):
+            years[y] += 1
+
+        for comp in _split_values(get(row, "Involvierte Unternehmen")):
+            companies[comp] += 1
+
+        sev = get(row, "Schwere").lower()
+        if sev and sev != "not in text":
+            severities[sev] += 1
+
+        cat = get(row, "Risikokategorien (A–M)")
+        if cat and cat.strip().lower() != "not in text":
+            for token in [t.strip() for t in cat.split(",") if t.strip()]:
+                categories[token] += 1
+
+    def top_n(counter: Counter, n: int) -> list[tuple[str, int]]:
+        return counter.most_common(n)
+
+    return {
+        "total_articles": len(rows),
+        "top_countries": top_n(countries, 6),
+        "top_years": top_n(years, 8),
+        "top_companies": top_n(companies, 8),
+        "severity_counts": dict(severities),
+        "top_categories": top_n(categories, 8),
+    }
+
+
+def gpt_overall_summary(raw_material: str, facts: dict) -> str:
+    prompt = f"""
+You are a careful human-rights and environmental-risk analyst.
+
+Write ONE overall executive summary (200–400 words) for the raw material "{raw_material}".
+You MUST use ONLY the factual aggregates provided below (they are computed from the analysed rows).
+Do NOT invent new places, years, companies, numbers, or incidents.
+
+Hard requirements:
+- Explicitly mention the most common country/countries (from Top countries).
+- Mention the most frequent years if provided.
+- Mention the severity distribution exactly as given (minor/moderate/major/critical counts).
+- Mention the most frequent companies only if they appear in the list.
+- If a list is empty, omit it (do not guess).
+- Tone: factual, concise, readable prose. No bullets, no headings.
+
+Aggregated facts (from analysis table):
+Total analysed articles: {facts.get("total_articles")}
+
+Top countries (count): {facts.get("top_countries")}
+Top years (count): {facts.get("top_years")}
+Top companies (count): {facts.get("top_companies")}
+Top risk category tokens (count): {facts.get("top_categories")}
+Severity counts: {facts.get("severity_counts")}
+
+Write the summary now.
+"""
     try:
-        mirror = "https://r.jina.ai/" + url
-        headers = {"User-Agent": random.choice(UA_LIST)}
-        r = requests.get(mirror, headers=headers, timeout=timeout)
-        if r.status_code >= 400:
-            return False, "", f"jina_http_{r.status_code}"
-        txt = r.text
-        if not txt or len(txt) < 200:
-            return False, txt, "jina_too_short"
-        # Mirror returns plain text; still check for bot blocks
-        if _looks_like_block(txt):
-            return False, txt, "blocked_or_captcha"
-        return True, txt, "ok_jina"
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You never add facts not supported by the input."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.25,
+        )
+        return resp.choices[0].message.content.strip()
     except Exception as e:
-        return False, "", f"jina_error:{e}"
+        print(f"⚠️ GPT error for overall summary: {e}")
+        return "Error: could not generate overall summary."
 
-def make_driver():
-    opts = Options()
-    # IMPORTANT: try non-headless first for fewer blocks
-    # opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--start-maximized")
-    opts.add_argument(f"user-agent={random.choice(UA_LIST)}")
-    return webdriver.Chrome(options=opts)
 
-def fetch_selenium(url: str, timeout: int = 20) -> tuple[bool, str, str]:
-    d = make_driver()
-    try:
-        d.set_page_load_timeout(timeout)
-        d.get(url)
-        time.sleep(3)
-        html = d.page_source or ""
-        if _looks_like_block(html):
-            return False, html, "blocked_or_captcha"
-        return True, html, "ok_selenium"
-    except Exception as e:
-        return False, "", f"selenium_error:{e}"
-    finally:
-        try:
-            d.quit()
-        except Exception:
-            pass
+# -----------------------------
+# 6) Write Excel with 1 sheet per article + Overall sheet
+# -----------------------------
+def schreibe_excel_pro_artikel(header: list[str], rows: list[list[str]], rohstoff_name: str) -> Path:
+    exec_dir = PROJECT_ROOT / f"Executive_Summary_{rohstoff_name}"
+    exec_dir.mkdir(parents=True, exist_ok=True)
 
-def url_to_html(url: str) -> tuple[bool, str, str]:
-    # 1) requests
-    ok, html, reason = fetch_requests(url)
-    if ok:
-        return True, html, reason
+    out_path = exec_dir / f"Executive_Summary_Artikelweise_{rohstoff_name}.xlsx"
 
-    # 2) jina mirror fallback
-    ok2, txt2, reason2 = fetch_jina_text(url)
-    if ok2:
-        # already text, not html; we treat it as "html-like" container
-        return True, txt2, reason2
+    wb = Workbook()
+    default_sheet = wb.active
+    wb.remove(default_sheet)
 
-    # 3) selenium fallback
-    ok3, html3, reason3 = fetch_selenium(url)
-    return ok3, html3, reason3
+    # --- per-article sheets ---
+    for idx, row in enumerate(rows, start=1):
+        sheet_name = f"Case_{idx}"
+        ws = wb.create_sheet(title=sheet_name[:31])
 
-# --------------------------------------------------
-# 4) Text extraction (deterministic)
-# --------------------------------------------------
-def extract_text_from_html(html_or_text: str) -> str:
-    # If it's already plain text (jina), keep it
-    if "<html" not in (html_or_text[:500].lower()):
-        return re.sub(r"\n{3,}", "\n\n", html_or_text).strip()
+        ws["A1"] = "Row index in analyse_tabelle"
+        ws["B1"] = idx + 1  # +1 because CSV header is row 1
 
-    soup = BeautifulSoup(html_or_text, "html.parser")
+        excel_row = 3
+        for col_idx, col_name in enumerate(header, start=1):
+            value = row[col_idx - 1] if col_idx - 1 < len(row) else ""
+            ws.cell(row=excel_row, column=1).value = col_name
+            ws.cell(row=excel_row, column=2).value = value
+            excel_row += 1
 
-    # remove junk
-    for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
-        tag.decompose()
+        print(f"Generating summary for article {idx}/{len(rows)}...")
+        summary_text = gpt_summary_for_row(header, row)
 
-    article = soup.find("article")
-    if article:
-        text = article.get_text("\n", strip=True)
-        return text
+        excel_row += 1
+        ws.cell(row=excel_row, column=1).value = "Executive Summary"
+        ws.cell(row=excel_row, column=2).value = summary_text
 
-    body = soup.find("body")
-    if body:
-        text = body.get_text("\n", strip=True)
-        return text
+        ws.column_dimensions["A"].width = 45
+        ws.column_dimensions["B"].width = 120
 
-    return soup.get_text("\n", strip=True)
+    # --- overall summary sheet (NEW) ---
+    facts = compute_overall_facts(header, rows)
+    overall_text = gpt_overall_summary(rawm, facts)
 
-# --------------------------------------------------
-# 5) Deterministic risk analysis
-# --------------------------------------------------
-RISIKOKATEGORIEN = {
-    "A": ("Working conditions, including occupational health and safety",
-          [r"unsafe working", r"occupational", r"injur", r"fatalit", r"accident", r"hazard", r"explosion"]),
-    "B": ("Child labour",
-          [r"child labour", r"child labor", r"underage", r"minor[s]?\b", r"children working"]),
-    "C": ("Modern slavery, including forced labour",
-          [r"forced labour", r"forced labor", r"modern slavery", r"traffick", r"bonded labour", r"debt bondage"]),
-    "D": ("Community and indigenous peoples’ rights",
-          [r"indigenous", r"displacement", r"evict", r"land grab", r"community (?:conflict|protest)", r"resettlement"]),
-    "E": ("Excessive violence by private and public security forces",
-          [r"shoot", r"kill", r"violence", r"security forces", r"military", r"police brutality"]),
-    "F": ("Environmental risks with impact on human rights",
-          [r"pollution", r"contaminat", r"toxic", r"spill", r"tailings", r"waste", r"poison", r"radiation"]),
-    "G": ("Business conduct in Conflict and High Risk Areas",
-          [r"conflict mineral", r"armed group", r"war", r"sanction", r"high risk area"]),
-    "H": ("Serious human rights abuses",
-          [r"human rights abuse", r"gross violation", r"crimes against humanity", r"torture"]),
-    "I": ("Biodiversity",
-          [r"biodiversity", r"habitat", r"endangered", r"wildlife", r"protected area"]),
-    "J": ("Water",
-          [r"water pollution", r"river", r"groundwater", r"drinking water", r"water contamination"]),
-    "K": ("Air",
-          [r"air pollution", r"emission", r"smog", r"dust", r"sulfur dioxide", r"so2\b"]),
-    "L": ("Soil",
-          [r"soil contamination", r"soil pollution", r"land contamination"]),
-    "M": ("Waste, hazardous substances, and plant safety",
-          [r"hazardous", r"hazmat", r"cyanide", r"mercury", r"arsenic", r"chemical leak"]),
-}
+    ws_overall = wb.create_sheet(title="Overall_Summary")
+    ws_overall["A1"] = "Overall Executive Summary (200–400 words)"
+    ws_overall["A3"] = overall_text
 
-# Add your requested extra keywords conceptually (no LLM needed)
-DISCRIMINATION_PATTERNS = [r"discrimination", r"racial", r"religion", r"religious", r"age discrimination"]
-UNION_PATTERNS = [r"trade union", r"union rights", r"union-bust", r"collective bargaining", r"strike", r"labor strike"]
+    # Traceability block: computed facts from analysis table
+    ws_overall["A5"] = "Computed facts (from analyse_tabelle)"
+    ws_overall["A6"] = "Total analysed articles"
+    ws_overall["B6"] = facts.get("total_articles")
 
-def analyse_text(rohstoff_name: str, text: str) -> list[str]:
-    t = (text or "").lower()
+    ws_overall["A8"] = "Top countries (count)"
+    r = 9
+    for name, cnt in facts.get("top_countries", []):
+        ws_overall.cell(row=r, column=1).value = name
+        ws_overall.cell(row=r, column=2).value = cnt
+        r += 1
 
-    # Basic gates
-    years = sorted(set(re.findall(r"\b(19\d{2}|20\d{2})\b", t)))
+    r += 1
+    ws_overall.cell(row=r, column=1).value = "Top years (count)"
+    r += 1
+    for name, cnt in facts.get("top_years", []):
+        ws_overall.cell(row=r, column=1).value = name
+        ws_overall.cell(row=r, column=2).value = cnt
+        r += 1
 
-    # crude countries: just detect common “in <Country>” style tokens if present
-    # (You can later replace this with spaCy when you move to Python 3.12)
-    country_hits = []
-    for c in ["china","india","brazil","indonesia","peru","mexico","canada","australia",
-              "vietnam","philippines","south africa","zimbabwe","congo","russia","ukraine","germany"]:
-        if re.search(rf"\b{re.escape(c)}\b", t):
-            country_hits.append(c.title())
+    r += 1
+    ws_overall.cell(row=r, column=1).value = "Severity counts"
+    r += 1
+    for sev, cnt in (facts.get("severity_counts") or {}).items():
+        ws_overall.cell(row=r, column=1).value = sev
+        ws_overall.cell(row=r, column=2).value = cnt
+        r += 1
 
-    # Categories
-    matched_cats = []
-    harms = []
+    r += 1
+    ws_overall.cell(row=r, column=1).value = "Top companies (count)"
+    r += 1
+    for name, cnt in facts.get("top_companies", []):
+        ws_overall.cell(row=r, column=1).value = name
+        ws_overall.cell(row=r, column=2).value = cnt
+        r += 1
 
-    for code, (label, pats) in RISIKOKATEGORIEN.items():
-        if any(re.search(p, t) for p in pats):
-            matched_cats.append(f"{code} ({label})")
+    ws_overall.column_dimensions["A"].width = 55
+    ws_overall.column_dimensions["B"].width = 40
 
-    # Discrimination + union freedoms (map them into A/H/D depending on your taxonomy)
-    if any(re.search(p, t) for p in DISCRIMINATION_PATTERNS):
-        harms.append("Discrimination (e.g., age/race/religion)")
-        # often fits under H or A depending on your scheme; keep as harm text
-        if not any(x.startswith("H ") for x in matched_cats):
-            matched_cats.append("H (Serious human rights abuses)")
+    wb.save(out_path)
+    return out_path
 
-    if any(re.search(p, t) for p in UNION_PATTERNS):
-        harms.append("Trade union freedoms / union rights issues")
-        if not any(x.startswith("A ") for x in matched_cats):
-            matched_cats.append("A (Working conditions, including occupational health and safety)")
 
-    # Harms (simple)
-    harm_terms = [
-        ("child labour", [r"child labour", r"child labor", r"underage"]),
-        ("forced labour", [r"forced labour", r"forced labor", r"modern slavery", r"traffick"]),
-        ("unsafe working conditions", [r"unsafe", r"fatal", r"injur", r"accident", r"hazard"]),
-        ("pollution / contamination", [r"pollution", r"contaminat", r"toxic", r"spill", r"tailings"]),
-        ("community conflict", [r"community conflict", r"protest", r"displacement", r"evict"]),
-    ]
-    for name, pats in harm_terms:
-        if any(re.search(p, t) for p in pats):
-            harms.append(name)
-
-    harms = list(dict.fromkeys([h for h in harms if h]))
-
-    # severity heuristic
-    severity = "minor"
-    if re.search(r"\b(killed|death|deaths|fatal)\b", t) or re.search(r"\bmajor spill\b", t):
-        severity = "major"
-    if re.search(r"\b(critical|catastroph)\b", t) or re.search(r"\bmass (?:death|deaths)\b", t):
-        severity = "critical"
-    if re.search(r"\b(lawsuit|prosecution|criminal)\b", t) and severity == "minor":
-        severity = "moderate"
-
-    # minimal structured output (13 fields like your table)
-    out = [
-        ", ".join(matched_cats) if matched_cats else "Not in Text",
-        "; ".join(harms) if harms else "Not in Text",
-        "Deterministic keyword-based classification (no LLM).",
-        ", ".join(years) if years else "Not in Text",
-        ", ".join(country_hits) if country_hits else "Not in Text",
-        "Not in Text",  # Orte
-        "Not in Text",  # Stufe
-        "Not in Text",  # Unternehmen
-        "Not in Text",  # Gruppen/Öko
-        "Not in Text",  # Mindestzahl
-        "Not in Text",  # Begründung Mindestzahl
-        severity,
-        "Heuristic severity based on presence of deaths/major incidents/legal action keywords.",
-    ]
-    return out
-
-# --------------------------------------------------
-# 6) Write analyse CSV
-# --------------------------------------------------
-def schreibe_analyse_csv(rohstoff: str, daten_zeilen: list[list[str]]):
-    out_path = OUTPUT_DIR / f"analyse_tabelle_{rohstoff}.csv"
-    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f, delimiter=";")
-        w.writerow([
-            "link",
-            "Risikokategorien (A–M)",
-            "Arten der Menschenrechts-/Umweltschädigungen",
-            "Begründung",
-            "Jahr(e)",
-            "Land/Länder",
-            "Ort(e)",
-            "Stufe der Rohstoffgewinnung",
-            "Involvierte Unternehmen",
-            "Betroffene Personengruppen/Ökosysteme",
-            "Mindestzahl der betroffenen Personen",
-            "Begründung Mindestzahl",
-            "Schwere",
-            "Begründung Schwere",
-            "fetch_reason",
-        ])
-        for row in daten_zeilen:
-            if not WRITE_DEBUG:
-                all_not = all(isinstance(x, str) and x.strip().lower() == "not in text" for x in row[1:14])
-                if all_not:
-                    continue
-            w.writerow(row)
-    print(f"✅ Analyse geschrieben nach: {out_path}")
-
-# --------------------------------------------------
+# -----------------------------
 # 7) Main
-# --------------------------------------------------
+# -----------------------------
 if __name__ == "__main__":
     lese_einstellungen()
-    print(f"SETTINGS:\n  rohst     = {rohst}\n  rawm      = {rawm}\n  max_datum = {max_datum}")
+    header, data_rows = lade_analyse_tabelle()
 
-    links = lese_links_aus_scrape_csv(rohst)
-    print("Links gefunden:", len(links))
-
-    rows, failed = [], []
-
-    for i, link in enumerate(links, start=1):
-        print(f"[{i}/{len(links)}] analysiere: {link}")
-        ok, html_or_text, fetch_reason = url_to_html(link)
-        if not ok:
-            print(f"  ❌ error: {fetch_reason}")
-            failed.append((link, fetch_reason))
-            continue
-
-        text = extract_text_from_html(html_or_text)
-        if not text or len(text) < 400:
-            print("  ❌ error: too_little_text")
-            failed.append((link, "too_little_text"))
-            continue
-
-        analysed = analyse_text(rawm, text)
-        rows.append([link] + analysed + [fetch_reason])
-        print(f"  ✅ done | fetch={fetch_reason} | text_len={len(text)}")
-
-        time.sleep(1.5)
-
-    schreibe_analyse_csv(rohst, rows)
-
-    if failed:
-        fail_path = OUTPUT_DIR / f"fehlgeschlagene_urls_analyse_{rohst}.csv"
-        with fail_path.open("w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f, delimiter=";")
-            w.writerow(["link", "reason"])
-            for u, r in failed:
-                w.writerow([u, r])
-        print(f"⚠️ Fehlgeschlagen: {len(failed)} → {fail_path}")
+    if not data_rows:
+        print("No data rows found in analysis table. Nothing to summarize.")
+    else:
+        out_file = schreibe_excel_pro_artikel(header, data_rows, rohst)
+        print(f"\n✅ Excel file written to:\n{out_file}")
