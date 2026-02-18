@@ -1,2 +1,1 @@
-k = os.getenv("OPENAI_API_KEY")
-print("Key present:", bool(k), "| length:", len(k) if k else None, "| prefix:", k[:4] if k else None)
+https://<resource-name>.openai.azure.com/
