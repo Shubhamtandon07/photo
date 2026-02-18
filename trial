@@ -1,3 +1,5 @@
 import socket
 host = "genai-nexus.api.corpinter.net"
 print(socket.gethostbyname(host))
+
+18.156.207.124
