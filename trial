@@ -1,29 +1,629 @@
+# -*- coding: utf-8 -*-
+"""
+DETERMINISTIC ANALYSE-SKRIPT (NO LLM)
+reads:  C:/Users/SHTANDO/Desktop/KI Risko/gescrapte_Artikel-Links/gescrapte_links_<rohst>.csv
+writes: C:/Users/SHTANDO/Desktop/KI Risko/Analyse_Tabelle/analyse_tabelle_<rohst>.csv
+
+No AI / no GPT / no Azure required.
+"""
+
+import os
+import csv
+import re
+import time
+from pathlib import Path
+from collections import Counter
+from typing import Optional, Tuple, List, Dict
+
 import requests
+from bs4 import BeautifulSoup
 
-host = "https://genai-nexus.api.corpinter.net"
+# -------------------------
+# OPTIONAL: readability
+# -------------------------
+READABILITY_AVAILABLE = False
+try:
+    from readability import Document  # readability-lxml
+    READABILITY_AVAILABLE = True
+except Exception:
+    READABILITY_AVAILABLE = False
 
-paths = [
-    "/docs", "/swagger", "/swagger/", "/swagger/index.html",
-    "/openapi.json", "/api-docs", "/redoc",
-    "/health", "/healthz", "/status", "/version",
-    "/api", "/api/", "/api/v1", "/api/v1/",
-    "/nexus", "/nexus/", "/genai", "/genai/",
-    "/proxy", "/proxy/", "/gateway", "/gateway/",
-    "/openai-proxy", "/openai-proxy/",
-    "/azure", "/azure/", "/azureopenai", "/azureopenai/",
-    "/aoai", "/aoai/",
-    "/chat", "/chat/", "/completions", "/completions/",
+# -------------------------
+# OPTIONAL: spaCy (NER)
+# -------------------------
+SPACY_AVAILABLE = False
+NLP = None
+try:
+    import spacy
+    SPACY_AVAILABLE = True
+    try:
+        NLP = spacy.load("en_core_web_sm")
+    except Exception:
+        NLP = None
+except Exception:
+    SPACY_AVAILABLE = False
+    NLP = None
+
+
+# --------------------------------------------------
+# 0) Paths
+# --------------------------------------------------
+PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
+SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
+SCRAPED_DIR = PROJECT_ROOT / "gescrapte_Artikel-Links"
+OUTPUT_DIR = PROJECT_ROOT / "Analyse_Tabelle"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+WRITE_DEBUG = True  # keep rows even if many fields are "Not in Text"
+
+
+# --------------------------------------------------
+# 1) Read settings
+# --------------------------------------------------
+rohst = rawm = max_datum = None
+seitenumfang = 3
+
+def lese_einstellungen():
+    global rohst, rawm, max_datum, seitenumfang
+    settings_path = SETTINGS_DIR / "Einstellungen_Analyse.csv"
+    with settings_path.open("r", encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.reader(f, delimiter=","))
+
+    def get_row(idx, default=""):
+        return rows[idx][0].strip() if len(rows) > idx and len(rows[idx]) > 0 else default
+
+    rohst        = get_row(5, "Stahl")
+    rawm         = get_row(8, "Steel")
+    max_datum    = get_row(11, "20.11.2020")
+    seitenumfang = int(get_row(14, "3") or "3")
+
+
+# --------------------------------------------------
+# 2) CSV IO
+# --------------------------------------------------
+def lese_links_aus_scrape_csv(rohstoff: str) -> list[str]:
+    fpath = SCRAPED_DIR / f"gescrapte_links_{rohstoff}.csv"
+    if not fpath.exists():
+        raise FileNotFoundError(f"Scrape CSV not found: {fpath}")
+
+    links = []
+    with fpath.open("r", encoding="utf-8-sig", newline="") as f:
+        r = csv.reader(f, delimiter=";")
+        next(r, None)
+        for row in r:
+            if row and row[0].strip():
+                links.append(row[0].strip())
+
+    # global dedupe preserve order
+    seen = set()
+    out = []
+    for u in links:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def schreibe_analyse_csv(rohstoff: str, daten_zeilen: list[list[str]]):
+    out_path = OUTPUT_DIR / f"analyse_tabelle_{rohstoff}.csv"
+    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow([
+            "link",
+            "Risikokategorien (A–M)",
+            "Arten der Menschenrechts-/Umweltschädigungen",
+            "Begründung",
+            "Jahr(e)",
+            "Land/Länder",
+            "Ort(e)",
+            "Stufe der Rohstoffgewinnung",
+            "Involvierte Unternehmen",
+            "Betroffene Personengruppen/Ökosysteme",
+            "Mindestzahl der betroffenen Personen",
+            "Begründung Mindestzahl",
+            "Schwere",
+            "Begründung Schwere",
+        ])
+
+        for row in daten_zeilen:
+            if not WRITE_DEBUG:
+                all_not = all(
+                    (isinstance(x, str) and x.strip().lower() == "not in text")
+                    for x in row[1:]
+                )
+                if all_not:
+                    continue
+            w.writerow(row)
+
+    print(f"✅ Analyse geschrieben nach: {out_path}")
+
+
+# --------------------------------------------------
+# 3) Robust HTTP fetch + basic block/captcha detection
+# --------------------------------------------------
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
+BLOCK_MARKERS = [
+    "captcha", "cloudflare", "access denied", "blocked", "verify you are human",
+    "unusual traffic", "robot", "enable javascript"
 ]
 
-methods = ["GET", "HEAD", "OPTIONS"]
-
-for p in paths:
-    url = host + p
-    for m in methods:
+def fetch_html(url: str, timeout: int = 20, retries: int = 2) -> str:
+    headers = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9,de;q=0.8"}
+    last_err = None
+    for _ in range(retries + 1):
         try:
-            r = requests.request(m, url, timeout=10, allow_redirects=True)
-            code = r.status_code
-            if code != 404:
-                print(f"{m:7} {p:25} -> {code}  server={r.headers.get('server')}  len={len(r.text)}")
+            r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            txt = r.text or ""
+            if r.status_code in (401, 403, 429):
+                raise RuntimeError("blocked_or_captcha")
+            low = txt.lower()
+            if any(m in low for m in BLOCK_MARKERS):
+                raise RuntimeError("blocked_or_captcha")
+            if r.status_code >= 400:
+                raise RuntimeError(f"http_{r.status_code}")
+            return txt
         except Exception as e:
+            last_err = e
+            time.sleep(1.2)
+    raise RuntimeError(str(last_err) if last_err else "fetch_failed")
+
+
+# --------------------------------------------------
+# 4) Text extraction (readability -> <article> -> body)
+# --------------------------------------------------
+def clean_text(t: str) -> str:
+    t = re.sub(r"\s+", " ", t or "").strip()
+    return t
+
+def html_to_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # remove scripts/styles
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+
+    # 1) readability if available
+    if READABILITY_AVAILABLE:
+        try:
+            doc = Document(str(soup))
+            content_html = doc.summary(html_partial=True)
+            soup2 = BeautifulSoup(content_html, "html.parser")
+            txt = soup2.get_text(" ", strip=True)
+            txt = clean_text(txt)
+            if len(txt) > 600:
+                return txt
+        except Exception:
             pass
+
+    # 2) <article>
+    art = soup.find("article")
+    if art:
+        txt = clean_text(art.get_text(" ", strip=True))
+        if len(txt) > 400:
+            return txt
+
+    # 3) main content divs (heuristic)
+    candidates = soup.find_all(["main", "div", "section"], limit=200)
+    best = ""
+    for c in candidates:
+        cls = " ".join(c.get("class", [])).lower()
+        if any(k in cls for k in ["content", "article", "post", "entry", "story", "body"]):
+            txt = clean_text(c.get_text(" ", strip=True))
+            if len(txt) > len(best):
+                best = txt
+    if len(best) > 400:
+        return best
+
+    # 4) fallback body
+    body = soup.find("body")
+    if body:
+        return clean_text(body.get_text(" ", strip=True))
+
+    return clean_text(soup.get_text(" ", strip=True))
+
+
+# --------------------------------------------------
+# 5) Deterministic extraction utilities
+# --------------------------------------------------
+YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
+
+# basic country list (high-coverage, no external deps)
+COUNTRY_HINTS = [
+    "Afghanistan","Albania","Algeria","Angola","Argentina","Armenia","Australia","Austria",
+    "Azerbaijan","Bangladesh","Belgium","Bolivia","Brazil","Bulgaria","Cambodia","Cameroon",
+    "Canada","Chile","China","Colombia","Congo","Costa Rica","Croatia","Cuba","Cyprus","Czech",
+    "Denmark","Dominican","Ecuador","Egypt","Eritrea","Estonia","Ethiopia","Finland","France",
+    "Georgia","Germany","Ghana","Greece","Guatemala","Guinea","Haiti","Honduras","Hungary",
+    "Iceland","India","Indonesia","Iran","Iraq","Ireland","Israel","Italy","Ivory Coast",
+    "Jamaica","Japan","Jordan","Kazakhstan","Kenya","Korea","Kuwait","Kyrgyzstan","Laos","Latvia",
+    "Lebanon","Liberia","Libya","Lithuania","Luxembourg","Madagascar","Malaysia","Mali","Mexico",
+    "Mongolia","Morocco","Mozambique","Myanmar","Namibia","Nepal","Netherlands","New Zealand",
+    "Nicaragua","Niger","Nigeria","Norway","Oman","Pakistan","Panama","Paraguay","Peru",
+    "Philippines","Poland","Portugal","Qatar","Romania","Russia","Rwanda","Saudi","Senegal",
+    "Serbia","Singapore","Slovakia","Slovenia","Somalia","South Africa","Spain","Sri Lanka",
+    "Sudan","Sweden","Switzerland","Syria","Taiwan","Tajikistan","Tanzania","Thailand","Tunisia",
+    "Turkey","Uganda","Ukraine","United Kingdom","UK","United States","USA","Uruguay","Uzbekistan",
+    "Venezuela","Vietnam","Yemen","Zambia","Zimbabwe",
+    "Democratic Republic of the Congo","DRC"
+]
+
+def extract_years(text: str) -> str:
+    yrs = YEAR_RE.findall(text or "")
+    if not yrs:
+        return "Not in Text"
+    # unique preserve order
+    seen = set()
+    out = []
+    for y in yrs:
+        if y not in seen:
+            seen.add(y)
+            out.append(y)
+    return ", ".join(out)
+
+def extract_countries(text: str) -> str:
+    t = text or ""
+    found = []
+    low = t.lower()
+    for c in COUNTRY_HINTS:
+        if c.lower() in low:
+            found.append(c)
+
+    # dedupe preserve order
+    seen = set()
+    out = []
+    for c in found:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return ", ".join(out) if out else "Not in Text"
+
+def extract_locations_spacy(text: str) -> str:
+    if not (SPACY_AVAILABLE and NLP):
+        return "Not in Text"
+    doc = NLP(text[:80000])
+    locs = []
+    for ent in doc.ents:
+        if ent.label_ in ("GPE", "LOC"):
+            val = ent.text.strip()
+            if len(val) >= 2:
+                locs.append(val)
+    # keep top uniques
+    seen = set()
+    out = []
+    for v in locs:
+        if v.lower() not in seen:
+            seen.add(v.lower())
+            out.append(v)
+        if len(out) >= 12:
+            break
+    return ", ".join(out) if out else "Not in Text"
+
+COMPANY_SUFFIX = r"(?:Inc\.?|Ltd\.?|Limited|LLC|PLC|Corp\.?|Corporation|Company|Co\.?|AG|GmbH|S\.A\.|S\.p\.A\.|SAS|BV|NV|PT|Tbk)"
+COMPANY_RE = re.compile(rf"\b[A-Z][A-Za-z0-9&\-\., ]{{2,60}}?\s+{COMPANY_SUFFIX}\b")
+
+def extract_companies(text: str) -> str:
+    # 1) spaCy ORG if available
+    comps = []
+    if SPACY_AVAILABLE and NLP:
+        doc = NLP(text[:80000])
+        for ent in doc.ents:
+            if ent.label_ == "ORG":
+                v = ent.text.strip()
+                if len(v) >= 3:
+                    comps.append(v)
+
+    # 2) regex suffix matches
+    for m in COMPANY_RE.findall(text or ""):
+        comps.append(m.strip())
+
+    # dedupe & limit
+    seen = set()
+    out = []
+    for c in comps:
+        key = c.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+        if len(out) >= 15:
+            break
+    return ", ".join(out) if out else "Not in Text"
+
+def extract_affected_groups(text: str) -> str:
+    t = (text or "").lower()
+    groups = []
+    mapping = {
+        "children": ["child", "children", "underage", "minor"],
+        "workers": ["worker", "workers", "labour", "labor", "employee", "employees"],
+        "trade union members": ["union", "collective bargaining", "strike", "union-busting"],
+        "indigenous peoples": ["indigenous", "tribe", "tribal", "first nation", "aboriginal"],
+        "local communities": ["community", "communities", "villagers", "residents", "locals"],
+        "human rights defenders": ["activist", "defender", "human rights defender"],
+        "ecosystems / biodiversity": ["ecosystem", "biodiversity", "wildlife", "habitat", "species"],
+        "farmers / fishers": ["farmer", "farmers", "fisher", "fishers"],
+    }
+    for label, kws in mapping.items():
+        if any(k in t for k in kws):
+            groups.append(label)
+    return ", ".join(groups) if groups else "Not in Text"
+
+def extract_stage(text: str) -> str:
+    t = (text or "").lower()
+    stage_map = [
+        ("Exploration", ["exploration", "prospecting"]),
+        ("Mining / Extraction", ["mine", "mining", "extraction", "pit", "artisanal", "asm"]),
+        ("Processing / Beneficiation", ["processing", "beneficiation", "concentrate"]),
+        ("Smelting", ["smelt", "smelting", "furnace"]),
+        ("Refining", ["refine", "refinery", "refining", "hydrometallurgy"]),
+        ("Transport / Trading", ["trading", "shipment", "export", "import", "transport", "supply chain"]),
+        ("Manufacturing / Downstream", ["manufacturing", "factory", "production", "component", "battery", "electronics"]),
+    ]
+    for label, kws in stage_map:
+        if any(k in t for k in kws):
+            return label
+    return "Not in Text"
+
+def extract_min_people(text: str) -> Tuple[str, str]:
+    """
+    Returns (min_people, justification).
+    Deterministic: finds the largest plausible numeric mention near people/families/workers/children.
+    """
+    t = text or ""
+    # normalize thousand separators
+    t2 = t.replace(",", " ").replace(".", " ")
+    pattern = re.compile(r"\b(\d{1,3}(?:\s\d{3})*|\d+)\b(?:\s+)(people|persons|workers|children|families|residents|miners|villagers)\b", re.I)
+    hits = []
+    for m in pattern.finditer(t2):
+        num_raw = m.group(1)
+        unit = m.group(2).lower()
+        num = int(num_raw.replace(" ", ""))
+        hits.append((num, unit, m.group(0)))
+
+    if not hits:
+        return "Not in Text", "Not in Text"
+
+    # choose largest as conservative "minimum referenced" (still deterministic)
+    hits.sort(key=lambda x: x[0], reverse=True)
+    num, unit, phrase = hits[0]
+    return str(num), f"Extracted from text phrase: '{phrase}'."
+
+# --------------------------------------------------
+# 6) Risk categories A–M (regex patterns)
+# --------------------------------------------------
+RISIKOKATEGORIEN = {
+    "A": "Working conditions, including occupational health and safety",
+    "B": "Child labour",
+    "C": "Modern slavery, including forced labour",
+    "D": "Community and indigenous peoples’ rights",
+    "E": "Excessive violence by private and public security forces",
+    "F": "Environmental risks with impact on human rights",
+    "G": "Business conduct in Conflict and High Risk Areas",
+    "H": "Serious human rights abuses",
+    "I": "Biodiversity",
+    "J": "Water",
+    "K": "Air",
+    "L": "Soil",
+    "M": "Waste, hazardous substances, and plant safety",
+}
+
+# Patterns (stems / variants)
+PATTERNS = {
+    "A": [r"\bunsafe\b", r"\bsafety\b", r"\bhazardous\b", r"\baccident\b", r"\binjur", r"\bfatalit", r"\boccupational\b", r"\bworking conditions\b"],
+    "B": [r"\bchild labou?r\b", r"\bunderage\b", r"\bminor\b", r"\bchildren\b.*\bmine\b"],
+    "C": [r"\bforced labou?r\b", r"\bmodern slavery\b", r"\btraffick", r"\bdebt bondage\b", r"\bcoerc", r"\binvoluntary\b"],
+    "D": [r"\bindigenous\b", r"\bland grabbing\b", r"\bdisplacement\b", r"\brelocat", r"\bcommunity\b.*\bconsent\b", r"\bFPIC\b", r"\bwater rights\b"],
+    "E": [r"\bsecurity forces\b", r"\bpolice\b", r"\bmilitary\b", r"\bshoot", r"\bkill", r"\bviolent\b", r"\bassault\b"],
+    "F": [r"\bpollution\b", r"\bcontamin", r"\btoxic\b", r"\bspill\b", r"\bdam\b", r"\btailing", r"\bhazardous\b.*\bwaste\b", r"\bhealth risk\b"],
+    "G": [r"\bconflict\b", r"\barmed\b", r"\bmilitia\b", r"\bCHRA\b", r"\bhigh[- ]risk area\b", r"\bsanction", r"\bwar\b"],
+    "H": [r"\btorture\b", r"\barbitrary detention\b", r"\bmass detention\b", r"\bcrimes against humanity\b", r"\bextrajudicial\b"],
+    "I": [r"\bbiodivers", r"\bendangered\b", r"\bhabitat\b", r"\bwildlife\b", r"\bprotected species\b"],
+    "J": [r"\bwater\b", r"\briver\b", r"\bgroundwater\b", r"\baquifer\b", r"\bdrinking water\b", r"\bwater scarcity\b"],
+    "K": [r"\bair\b", r"\bsmog\b", r"\bfumes\b", r"\bSO2\b", r"\bNOx\b", r"\bparticulate\b", r"\bdust\b"],
+    "L": [r"\bsoil\b", r"\bland contamination\b", r"\btopsoil\b"],
+    "M": [r"\bhazardous substance\b", r"\bchemical\b", r"\bcyanide\b", r"\bmercury\b", r"\barsenic\b", r"\blead\b", r"\bwaste\b", r"\bplant safety\b"],
+}
+
+# Add explicit discrimination + trade union freedoms indicators (user request)
+DISCRIMINATION_PATTERNS = [r"\bdiscriminat", r"\brace\b.*\bdiscriminat", r"\breligio", r"\bage\b.*\bdiscriminat", r"\bethnic"]
+UNION_PATTERNS = [r"\btrade union\b", r"\bunion rights\b", r"\bcollective bargaining\b", r"\bunion[- ]busting\b", r"\bstrike\b", r"\banti[- ]union\b"]
+
+# Attach them into A/H depending on your taxonomy (best practical mapping):
+# - Discrimination -> H (Serious HR abuses) or A (working conditions). Here: H.
+# - Trade union freedoms -> A (working conditions/labour rights). Here: A.
+PATTERNS["H"] += DISCRIMINATION_PATTERNS
+PATTERNS["A"] += UNION_PATTERNS
+
+def find_categories(text: str) -> List[str]:
+    t = (text or "").lower()
+    cats = []
+    for code, regs in PATTERNS.items():
+        for rg in regs:
+            if re.search(rg, t, flags=re.I):
+                cats.append(code)
+                break
+    # order A..M
+    order = list("ABCDEFGHIJKLM")
+    cats = sorted(set(cats), key=lambda c: order.index(c))
+    return cats
+
+def expand_categories(codes: List[str]) -> str:
+    if not codes:
+        return "Not in Text"
+    return ", ".join([f"{c} ({RISIKOKATEGORIEN.get(c,'')})".strip() for c in codes])
+
+
+# --------------------------------------------------
+# 7) Harm types + justification (deterministic)
+# --------------------------------------------------
+HARM_LABELS = [
+    ("Child labour", [r"\bchild labou?r\b", r"\bunderage\b", r"\bminor\b"]),
+    ("Forced labour / modern slavery", [r"\bforced labou?r\b", r"\bmodern slavery\b", r"\btraffick", r"\bdebt bondage\b"]),
+    ("Unsafe working conditions", [r"\bunsafe\b", r"\bhazardous\b", r"\binjur", r"\bfatalit", r"\baccident\b"]),
+    ("Trade union / labour-rights violations", [r"\btrade union\b", r"\bcollective bargaining\b", r"\bunion[- ]busting\b", r"\banti[- ]union\b", r"\bstrike\b"]),
+    ("Discrimination", [r"\bdiscriminat", r"\bracis", r"\breligio", r"\bethnic", r"\bage\b.*\bdiscriminat"]),
+    ("Pollution / contamination", [r"\bpollution\b", r"\bcontamin", r"\btoxic\b", r"\bspill\b", r"\bcyanide\b", r"\bmercury\b"]),
+    ("Water impacts", [r"\bwater\b", r"\briver\b", r"\baquifer\b", r"\bdrinking water\b", r"\bwater scarcity\b"]),
+    ("Biodiversity / deforestation", [r"\bbiodivers", r"\bdeforestation\b", r"\bhabi?tat\b", r"\bendangered\b"]),
+    ("Community conflict / displacement", [r"\bdisplacement\b", r"\brelocat", r"\bcommunity conflict\b", r"\bprotest\b", r"\bland grabbing\b"]),
+    ("Violence / killings", [r"\bkill", r"\bshoot", r"\bviolent\b", r"\bassault\b", r"\bsecurity forces\b"]),
+]
+
+def infer_harms(text: str) -> str:
+    t = (text or "").lower()
+    harms = []
+    for label, regs in HARM_LABELS:
+        if any(re.search(r, t, flags=re.I) for r in regs):
+            harms.append(label)
+    return ", ".join(harms) if harms else "Not in Text"
+
+def build_justification(text: str, categories: List[str], harms: str) -> str:
+    # deterministic: cite top matched keyword hits (short)
+    t = (text or "").lower()
+    evidence = []
+    # pick a few strong markers
+    strong_markers = [
+        "child labour", "child labor", "forced labour", "forced labor", "modern slavery",
+        "discrimination", "union", "strike", "pollution", "contamination", "toxic", "spill",
+        "tailings", "cyanide", "mercury", "killed", "injured", "displacement", "relocation"
+    ]
+    for m in strong_markers:
+        if m in t:
+            evidence.append(m)
+        if len(evidence) >= 6:
+            break
+
+    if not categories and harms == "Not in Text":
+        return "Not in Text"
+    ev = ", ".join(evidence) if evidence else "pattern matches in text"
+    cats_str = ", ".join(categories) if categories else "-"
+    return f"Matched category patterns ({cats_str}) with evidence markers: {ev}."
+
+# --------------------------------------------------
+# 8) Severity heuristic (deterministic, conservative)
+# --------------------------------------------------
+def infer_severity(text: str, categories: List[str]) -> Tuple[str, str]:
+    t = (text or "").lower()
+
+    # critical triggers
+    if any(k in t for k in ["killed", "deaths", "fatalities", "mass detention", "crimes against humanity"]):
+        return "critical", "Mentions deaths / severe violence or mass abuse."
+
+    if any(k in t for k in ["forced labour", "forced labor", "modern slavery", "child labour", "child labor"]):
+        # child/forced labour often treated high severity
+        return "critical", "Mentions child labour or forced labour / modern slavery."
+
+    # major triggers
+    if any(k in t for k in ["toxic", "cyanide", "mercury", "arsenic", "tailings", "dam failure", "spill", "contamination"]) and any(c in categories for c in ["F","J","K","L","M"]):
+        return "major", "Mentions significant pollution/contamination indicators."
+
+    if any(k in t for k in ["displacement", "relocation", "evicted", "land grabbing"]):
+        return "major", "Mentions displacement/land-rights impacts."
+
+    # moderate triggers
+    if any(k in t for k in ["unsafe", "injury", "accident", "hazardous"]):
+        return "moderate", "Mentions workplace safety risks or injuries."
+
+    if any(k in t for k in ["discrimination", "union", "strike", "union-busting", "collective bargaining"]):
+        return "moderate", "Mentions labour-rights / discrimination indicators."
+
+    # minor if only weak signals
+    if categories:
+        return "minor", "Category patterns matched but without strong severity indicators."
+
+    return "Not in Text", "Not in Text"
+
+
+# --------------------------------------------------
+# 9) Orchestrate one-link analysis
+# --------------------------------------------------
+def analyse_link(url: str, material_name: str) -> List[str]:
+    html = fetch_html(url)
+    text = html_to_text(html)
+
+    # Material relevance (deterministic gate but NOT too strict):
+    # Require at least ONE of:
+    # - material appears in text
+    # - OR the page mentions mining/smelting/refining + risk terms
+    t_low = (text or "").lower()
+    mat_low = (material_name or "").lower()
+
+    has_material = (mat_low in t_low)
+    has_supply_terms = any(w in t_low for w in ["mining", "mine", "smelting", "smelter", "refining", "refinery", "extraction", "processing", "supply chain"])
+    has_risk_signal = bool(find_categories(text)) or infer_harms(text) != "Not in Text"
+
+    if not (has_material or (has_supply_terms and has_risk_signal)):
+        # deterministic reject (still no hallucination)
+        raise RuntimeError("material_gate_failed")
+
+    cats = find_categories(text)
+    cats_expanded = expand_categories(cats)
+    harms = infer_harms(text)
+    begruendung = build_justification(text, cats, harms)
+    years = extract_years(text)
+    countries = extract_countries(text)
+    locations = extract_locations_spacy(text)  # may be Not in Text
+    stage = extract_stage(text)
+    companies = extract_companies(text)
+    groups = extract_affected_groups(text)
+    min_people, min_reason = extract_min_people(text)
+    severity, severity_reason = infer_severity(text, cats)
+
+    # Ensure no newlines / keep CSV clean
+    def norm(x: str) -> str:
+        return (x or "").replace("\n", " ").replace("\r", " ").strip()
+
+    return [
+        norm(cats_expanded) or "Not in Text",
+        norm(harms) or "Not in Text",
+        norm(begruendung) or "Not in Text",
+        norm(years) or "Not in Text",
+        norm(countries) or "Not in Text",
+        norm(locations) or "Not in Text",
+        norm(stage) or "Not in Text",
+        norm(companies) or "Not in Text",
+        norm(groups) or "Not in Text",
+        norm(min_people) or "Not in Text",
+        norm(min_reason) or "Not in Text",
+        norm(severity) or "Not in Text",
+        norm(severity_reason) or "Not in Text",
+    ]
+
+
+# --------------------------------------------------
+# 10) Main
+# --------------------------------------------------
+if __name__ == "__main__":
+    lese_einstellungen()
+    print(f"SETTINGS:\n  rohst     = {rohst}\n  rawm      = {rawm}\n  max_datum = {max_datum}")
+    print(f"READABILITY_AVAILABLE={READABILITY_AVAILABLE} | SPACY_AVAILABLE={SPACY_AVAILABLE} | NLP_LOADED={bool(NLP)}")
+
+    links = lese_links_aus_scrape_csv(rohst)
+    print("Links gefunden:", len(links))
+
+    rows = []
+    failed = []
+
+    for i, link in enumerate(links, start=1):
+        print(f"[{i}/{len(links)}] analysiere: {link}")
+        try:
+            analysed = analyse_link(link, rawm)
+            rows.append([link] + analysed)
+            print("  ✅ done")
+        except Exception as e:
+            print("  ❌ error:", str(e))
+            failed.append([link, str(e)])
+
+    schreibe_analyse_csv(rohst, rows)
+
+    if failed:
+        fail_path = OUTPUT_DIR / f"fehlgeschlagene_urls_analyse_{rohst}.csv"
+        with fail_path.open("w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f, delimiter=";")
+            w.writerow(["link", "error"])
+            for u, err in failed:
+                w.writerow([u, err])
+        print(f"⚠️ Fehlgeschlagen: {len(failed)} → {fail_path}")
