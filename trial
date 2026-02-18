@@ -1,15 +1,97 @@
-import os
-from openai import OpenAI
+---------------------------------------------------------------------------
+AuthenticationError                       Traceback (most recent call last)
+Cell In[1], line 9
+      4 # If you haven't set it in the environment yet, temporarily paste here:
+      5 # os.environ["OPENAI_API_KEY"] = "sk-PASTE_YOUR_KEY"
+      7 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+----> 9 resp = client.chat.completions.create(
+     10     model="gpt-4o-mini",
+     11     messages=[{"role": "user", "content": "Say only: ok"}],
+     12     temperature=0,
+     13 )
+     15 print(resp.choices[0].message.content)
 
-# If you haven't set it in the environment yet, temporarily paste here:
-# os.environ["OPENAI_API_KEY"] = "sk-PASTE_YOUR_KEY"
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\openai\_utils\_utils.py:286, in required_args.<locals>.inner.<locals>.wrapper(*args, **kwargs)
+    284             msg = f"Missing required argument: {quote(missing[0])}"
+    285     raise TypeError(msg)
+--> 286 return func(*args, **kwargs)
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\openai\resources\chat\completions\completions.py:1192, in Completions.create(self, messages, model, audio, frequency_penalty, function_call, functions, logit_bias, logprobs, max_completion_tokens, max_tokens, metadata, modalities, n, parallel_tool_calls, prediction, presence_penalty, prompt_cache_key, prompt_cache_retention, reasoning_effort, response_format, safety_identifier, seed, service_tier, stop, store, stream, stream_options, temperature, tool_choice, tools, top_logprobs, top_p, user, verbosity, web_search_options, extra_headers, extra_query, extra_body, timeout)
+   1145 @required_args(["messages", "model"], ["messages", "model", "stream"])
+   1146 def create(
+   1147     self,
+   (...)   1189     timeout: float | httpx.Timeout | None | NotGiven = not_given,
+   1190 ) -> ChatCompletion | Stream[ChatCompletionChunk]:
+   1191     validate_response_format(response_format)
+-> 1192     return self._post(
+   1193         "/chat/completions",
+   1194         body=maybe_transform(
+   1195             {
+   1196                 "messages": messages,
+   1197                 "model": model,
+   1198                 "audio": audio,
+   1199                 "frequency_penalty": frequency_penalty,
+   1200                 "function_call": function_call,
+   1201                 "functions": functions,
+   1202                 "logit_bias": logit_bias,
+   1203                 "logprobs": logprobs,
+   1204                 "max_completion_tokens": max_completion_tokens,
+   1205                 "max_tokens": max_tokens,
+   1206                 "metadata": metadata,
+   1207                 "modalities": modalities,
+   1208                 "n": n,
+   1209                 "parallel_tool_calls": parallel_tool_calls,
+   1210                 "prediction": prediction,
+   1211                 "presence_penalty": presence_penalty,
+   1212                 "prompt_cache_key": prompt_cache_key,
+   1213                 "prompt_cache_retention": prompt_cache_retention,
+   1214                 "reasoning_effort": reasoning_effort,
+   1215                 "response_format": response_format,
+   1216                 "safety_identifier": safety_identifier,
+   1217                 "seed": seed,
+   1218                 "service_tier": service_tier,
+   1219                 "stop": stop,
+   1220                 "store": store,
+   1221                 "stream": stream,
+   1222                 "stream_options": stream_options,
+   1223                 "temperature": temperature,
+   1224                 "tool_choice": tool_choice,
+   1225                 "tools": tools,
+   1226                 "top_logprobs": top_logprobs,
+   1227                 "top_p": top_p,
+   1228                 "user": user,
+   1229                 "verbosity": verbosity,
+   1230                 "web_search_options": web_search_options,
+   1231             },
+   1232             completion_create_params.CompletionCreateParamsStreaming
+   1233             if stream
+   1234             else completion_create_params.CompletionCreateParamsNonStreaming,
+   1235         ),
+   1236         options=make_request_options(
+   1237             extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body, timeout=timeout
+   1238         ),
+   1239         cast_to=ChatCompletion,
+   1240         stream=stream or False,
+   1241         stream_cls=Stream[ChatCompletionChunk],
+   1242     )
 
-resp = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role": "user", "content": "Say only: ok"}],
-    temperature=0,
-)
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\openai\_base_client.py:1297, in SyncAPIClient.post(self, path, cast_to, body, content, options, files, stream, stream_cls)
+   1288     warnings.warn(
+   1289         "Passing raw bytes as `body` is deprecated and will be removed in a future version. "
+   1290         "Please pass raw bytes via the `content` parameter instead.",
+   1291         DeprecationWarning,
+   1292         stacklevel=2,
+   1293     )
+   1294 opts = FinalRequestOptions.construct(
+   1295     method="post", url=path, json_data=body, content=content, files=to_httpx_files(files), **options
+   1296 )
+-> 1297 return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
 
-print(resp.choices[0].message.content)
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\openai\_base_client.py:1070, in SyncAPIClient.request(self, cast_to, options, stream, stream_cls)
+   1067             err.response.read()
+   1069         log.debug("Re-raising status error")
+-> 1070         raise self._make_status_error_from_response(err.response) from None
+   1072     break
+   1074 assert response is not None, "could not resolve response (should never happen)"
+
+AuthenticationError: Error code: 401 - {'error': {'message': 'Incorrect API key provided: de28cbf0************************b0c3. You can find your API key at https://platform.openai.com/account/api-keys.', 'type': 'invalid_request_error', 'param': None, 'code': 'invalid_api_key'}}
