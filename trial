@@ -8,25 +8,30 @@ writes: C:/Users/SHTANDO/Desktop/KI Risko/Analyse_Tabelle/analyse_tabelle_<rohst
 import os
 import csv
 import random
+import time
 from pathlib import Path
+
 import openai
 from bs4 import BeautifulSoup
+
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+
 # --------------------------------------------------
 # 0) Paths
 # --------------------------------------------------
 PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
 SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
-SCRAPED_DIR = PROJECT_ROOT / "gescrapte_Artikel-Links"
-OUTPUT_DIR = PROJECT_ROOT / "Analyse_Tabelle"
+SCRAPED_DIR  = PROJECT_ROOT / "gescrapte_Artikel-Links"
+OUTPUT_DIR   = PROJECT_ROOT / "Analyse_Tabelle"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 WRITE_DEBUG = True  # keep rows even if all “Not in Text”
+MAX_TEST_LINKS = 20  # keep your test sample size (change if needed)
 
 # --------------------------------------------------
 # 1) OpenAI setup
@@ -48,30 +53,45 @@ def lese_einstellungen():
     settings_path = SETTINGS_DIR / "Einstellungen_Analyse.csv"
     with settings_path.open("r", encoding="utf-8-sig") as f:
         rows = list(csv.reader(f, delimiter=","))
+
     def get_row(idx, default=""):
         return rows[idx][0].strip() if len(rows) > idx and len(rows[idx]) > 0 else default
+
     rohst        = get_row(5, "Stahl")
     rawm         = get_row(8, "Steel")
     max_datum    = get_row(11, "20.11.2020")
     seitenumfang = int(get_row(14, "3") or "3")
 
+
 # --------------------------------------------------
-# 3) Chrome driver
+# 3) Chrome driver (ONE driver, reused)
 # --------------------------------------------------
-def make_driver():
+def make_driver() -> webdriver.Chrome:
     opts = Options()
+    # headless is more likely to be blocked; keep headless but make it more "realistic"
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--enable-javascript")
+    opts.add_argument("--window-size=1365,900")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    )
+
     try:
         return webdriver.Chrome(options=opts)
     except Exception:
+        # fallback older headless flag
         opts.add_argument("--headless")
         return webdriver.Chrome(options=opts)
 
+
 # --------------------------------------------------
-# 4) Extract article text
+# 4) Extract article text (robust)
 # --------------------------------------------------
 def extract_with_gpt(full_text: str, fallback: str = "") -> str:
     prompt = (
@@ -91,31 +111,83 @@ def extract_with_gpt(full_text: str, fallback: str = "") -> str:
     except Exception:
         return fallback or full_text
 
-def url_zu_artikeltext(url: str) -> str:
-    d = make_driver()
-    try:
-        d.get(url)
-        try:
-            WebDriverWait(d, 5).until(EC.presence_of_element_located((By.TAG_NAME, "article")))
-        except Exception:
-            pass
-        html = d.page_source
-    finally:
-        try: d.quit()
-        except Exception: pass
 
+def _looks_blocked(text: str) -> bool:
+    t = (text or "").lower()
+    block_signals = [
+        "enable javascript",
+        "access denied",
+        "forbidden",
+        "not authorized",
+        "verify you are human",
+        "captcha",
+        "unusual traffic",
+        "bot detection",
+        "cloudflare",
+        "akamai",
+        "incapsula",
+        "please turn on cookies",
+        "consent",
+    ]
+    return any(s in t for s in block_signals)
+
+
+def url_zu_artikeltext(driver: webdriver.Chrome, url: str) -> str:
+    """
+    Uses ONE shared driver. Returns extracted text or raises RuntimeError with reason.
+    """
+    driver.set_page_load_timeout(25)
+
+    try:
+        driver.get(url)
+    except Exception as e:
+        raise RuntimeError(f"page_load_failed: {e}")
+
+    # wait a bit for the DOM; many pages won't have <article>
+    try:
+        WebDriverWait(driver, 12).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+    except Exception:
+        pass
+
+    html = driver.page_source or ""
     soup = BeautifulSoup(html, "html.parser")
+
+    # quick block detection
+    visible_text = soup.get_text(" ", strip=True)
+    if _looks_blocked(visible_text):
+        raise RuntimeError("blocked_or_captcha")
+
+    # try <article> first
     art = soup.find("article")
     if art:
-        return art.get_text(separator="\n", strip=True)
+        txt = art.get_text(separator="\n", strip=True)
+        if len(txt) >= 400:  # heuristic: real body text
+            return txt
 
+    # fallback: main tag
+    main = soup.find("main")
+    if main:
+        txt = main.get_text(separator="\n", strip=True)
+        if len(txt) >= 400:
+            return extract_with_gpt(txt, txt)
+
+    # fallback: body text
     body = soup.find("body")
     if body:
-        text = body.get_text(separator="\n", strip=True)
-        return extract_with_gpt(text, text)
+        txt = body.get_text(separator="\n", strip=True)
+        if len(txt) < 200:
+            # too thin -> likely a paywall/blocked shell
+            raise RuntimeError("too_little_text_or_paywall")
+        return extract_with_gpt(txt, txt)
 
-    text = soup.get_text(separator="\n", strip=True)
-    return extract_with_gpt(text, text)
+    # last resort
+    txt = soup.get_text(separator="\n", strip=True)
+    if len(txt) < 200:
+        raise RuntimeError("too_little_text_or_empty")
+    return extract_with_gpt(txt, txt)
+
 
 # --------------------------------------------------
 # 5) GPT analysis with category codes (with labels)
@@ -137,10 +209,6 @@ RISIKOKATEGORIEN = {
 }
 
 def expand_categories(raw_cats: str) -> str:
-    """
-    Converts e.g. 'A, F, J' → 'A (Working conditions), F (Environmental risks with impact on human rights), J (Water)'
-    Keeps order and skips duplicates.
-    """
     if not raw_cats or raw_cats.lower().startswith("not in text"):
         return raw_cats
 
@@ -150,10 +218,7 @@ def expand_categories(raw_cats: str) -> str:
         if p not in seen:
             seen.add(p)
             label = RISIKOKATEGORIEN.get(p, "")
-            if label:
-                expanded.append(f"{p} ({label})")
-            else:
-                expanded.append(p)
+            expanded.append(f"{p} ({label})" if label else p)
     return ", ".join(expanded)
 
 
@@ -190,14 +255,13 @@ Artikel:
     txt = resp.choices[0].message.content.strip()
     lines = [ln.strip() for ln in txt.split("\n") if ln.strip()]
 
-    # fill missing lines if GPT returned fewer
     if len(lines) < 13:
         lines += ["Not in Text"] * (13 - len(lines))
     lines = lines[:13]
 
-    # expand category names in line 1
     lines[0] = expand_categories(lines[0])
     return lines
+
 
 # --------------------------------------------------
 # 6) CSV helpers
@@ -206,6 +270,7 @@ def lese_links_aus_scrape_csv(rohstoff: str) -> list[str]:
     fpath = SCRAPED_DIR / f"gescrapte_links_{rohstoff}.csv"
     if not fpath.exists():
         raise FileNotFoundError(f"Scrape CSV not found: {fpath}")
+
     links = []
     with fpath.open("r", encoding="utf-8-sig") as f:
         r = csv.reader(f, delimiter=";")
@@ -213,7 +278,10 @@ def lese_links_aus_scrape_csv(rohstoff: str) -> list[str]:
         for row in r:
             if row and row[0].strip():
                 links.append(row[0].strip())
+
+    # de-dup preserve order
     return list(dict.fromkeys(links))
+
 
 def schreibe_analyse_csv(rohstoff: str, daten_zeilen: list[list[str]]):
     out_path = OUTPUT_DIR / f"analyse_tabelle_{rohstoff}.csv"
@@ -236,7 +304,6 @@ def schreibe_analyse_csv(rohstoff: str, daten_zeilen: list[list[str]]):
             "Begründung Schwere",
         ])
         for row in daten_zeilen:
-            # Skip rows where all fields are "Not in Text"
             if not WRITE_DEBUG:
                 all_not = all(
                     (isinstance(x, str) and x.strip().lower() == "not in text")
@@ -245,7 +312,9 @@ def schreibe_analyse_csv(rohstoff: str, daten_zeilen: list[list[str]]):
                 if all_not:
                     continue
             w.writerow(row)
+
     print(f"✅ Analyse geschrieben nach: {out_path}")
+
 
 # --------------------------------------------------
 # 7) Main process
@@ -257,35 +326,48 @@ if __name__ == "__main__":
     links = lese_links_aus_scrape_csv(rohst)
     print("Links gefunden:", len(links))
 
-    # Pick 20 random links for test
-    test_links = random.sample(links, min(20, len(links)))
+    # TEST SAMPLE (unchanged logic, but less random failures if you sort by domain later)
+    test_links = random.sample(links, min(MAX_TEST_LINKS, len(links)))
     print(f"Wir testen diese {len(test_links)} zufälligen Links:")
     for l in test_links:
         print(" -", l)
 
     rows, failed = [], []
 
-    for i, link in enumerate(test_links, start=1):
-        print(f"[{i}/{len(test_links)}] analysiere: {link}")
+    driver = make_driver()
+    try:
+        for i, link in enumerate(test_links, start=1):
+            print(f"\n[{i}/{len(test_links)}] analysiere: {link}")
+            try:
+                artikel = url_zu_artikeltext(driver, link)
+                analysed = analyse_artikel(rawm, artikel, temperature=0.1)
+
+                cleaned = [x.replace("\n", " ").replace("\r", " ").strip(" -") for x in analysed]
+                rows.append([link] + cleaned)
+                print("  ✅ done")
+
+            except Exception as e:
+                reason = str(e)
+                print("  ❌ error:", reason)
+                failed.append([link, reason])
+
+            # small pause helps avoid blocks
+            time.sleep(1.2)
+
+    finally:
         try:
-            artikel = url_zu_artikeltext(link)
-            analysed = analyse_artikel(rawm, artikel, temperature=0.1)
-            # Clean and normalize all text values
-            cleaned = [x.replace("\n", " ").replace("\r", " ").strip(" -") for x in analysed]
-            rows.append([link] + cleaned)
-            print("  ✅ done")
-        except Exception as e:
-            print("  ❌ error:", e)
-            failed.append(link)
+            driver.quit()
+        except Exception:
+            pass
 
     schreibe_analyse_csv(rohst, rows)
 
-    # Write failed URLs
+    # Write failed URLs + reason
     if failed:
         fail_path = OUTPUT_DIR / f"fehlgeschlagene_urls_analyse_{rohst}.csv"
         with fail_path.open("w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f, delimiter=";")
-            w.writerow(["link"])
-            for u in failed:
-                w.writerow([u])
+            w.writerow(["link", "reason"])
+            for u, r in failed:
+                w.writerow([u, r])
         print(f"⚠️ Fehlgeschlagen: {len(failed)} → {fail_path}")
