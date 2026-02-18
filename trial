@@ -6,6 +6,14 @@ print("status:", r.status_code)
 print("server:", r.headers.get("server"))
 print("body_snip:", r.text[:120])
 
+
+status: 404
+server: None
+body_snip: {
+  "message":"no Route matched with those values",
+  "request_id":"6cc8442aa285326113fce62a0556582c"
+}
+
 import os
 from openai import AzureOpenAI
 
