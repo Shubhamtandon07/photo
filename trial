@@ -1,373 +1,48 @@
-# -*- coding: utf-8 -*-
-"""
-ANALYSE-SKRIPT mit Risikokategorien (A–M)
-reads:  C:/Users/SHTANDO/Desktop/KI Risko/gescrapte_Artikel-Links/gescrapte_links_<rohst>.csv
-writes: C:/Users/SHTANDO/Desktop/KI Risko/Analyse_Tabelle/analyse_tabelle_<rohst>.csv
-"""
+SETTINGS:
+  rohst     = Neodym
+  rawm      = Neodymium
+  max_datum = 20.11.2020
+Links gefunden: 10
+Wir testen diese 10 zufälligen Links:
+ - https://www.morethansustainability.com/research-portfolio/neodymium-and-praseodymium
+ - https://www.supermagnete.de/eng/safety-neodymium
+ - https://korhogominerals.com/the-global-pursuit-of-neodymium-mining-politics-and-economics/
+ - https://korhogominerals.com/securing-a-sustainable-future-the-environmental-ethics-of-neodymium-mining/
+ - https://metalsgems.com/neodymium-mining-in-china-challenges/
+ - https://ymagnetics.com/neodymium-magnet-production-mining-sintering-shaping/
+ - https://microgridmedia.com/the-flaw-of-chinese-wind-turbines-hidden-radiation-risks-in-neodymium-production/
+ - https://korhogominerals.com/are-neodymium-magnets-illegal/
+ - https://briandcolwell.com/a-history-of-neodymium/
+ - https://rareearthexchanges.com/news/neodymium-supply-chain/
 
-import os
-import csv
-import random
-import time
-from pathlib import Path
+[1/10] analysiere: https://www.morethansustainability.com/research-portfolio/neodymium-and-praseodymium
+  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
 
-import openai
-from bs4 import BeautifulSoup
+[2/10] analysiere: https://www.supermagnete.de/eng/safety-neodymium
+  ❌ error: blocked_or_captcha
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+[3/10] analysiere: https://korhogominerals.com/the-global-pursuit-of-neodymium-mining-politics-and-economics/
+  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
 
+[4/10] analysiere: https://korhogominerals.com/securing-a-sustainable-future-the-environmental-ethics-of-neodymium-mining/
+  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
 
-# --------------------------------------------------
-# 0) Paths
-# --------------------------------------------------
-PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
-SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
-SCRAPED_DIR  = PROJECT_ROOT / "gescrapte_Artikel-Links"
-OUTPUT_DIR   = PROJECT_ROOT / "Analyse_Tabelle"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+[5/10] analysiere: https://metalsgems.com/neodymium-mining-in-china-challenges/
+  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
 
-WRITE_DEBUG = True  # keep rows even if all “Not in Text”
-MAX_TEST_LINKS = 20  # keep your test sample size (change if needed)
+[6/10] analysiere: https://ymagnetics.com/neodymium-magnet-production-mining-sintering-shaping/
+  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
 
-# --------------------------------------------------
-# 1) OpenAI setup
-# --------------------------------------------------
-client = openai.AzureOpenAI(
-    api_version="2024-06-01",
-    azure_endpoint="https://genai-nexus.api.corpinter.net/apikey/",
-    api_key=os.getenv("OPENAI_API_KEY"),
-)
+[7/10] analysiere: https://microgridmedia.com/the-flaw-of-chinese-wind-turbines-hidden-radiation-risks-in-neodymium-production/
+  ❌ error: blocked_or_captcha
 
-# --------------------------------------------------
-# 2) Read settings
-# --------------------------------------------------
-rohst = rawm = max_datum = None
-seitenumfang = 3
+[8/10] analysiere: https://korhogominerals.com/are-neodymium-magnets-illegal/
+  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
 
-def lese_einstellungen():
-    global rohst, rawm, max_datum, seitenumfang
-    settings_path = SETTINGS_DIR / "Einstellungen_Analyse.csv"
-    with settings_path.open("r", encoding="utf-8-sig") as f:
-        rows = list(csv.reader(f, delimiter=","))
+[9/10] analysiere: https://briandcolwell.com/a-history-of-neodymium/
+  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
 
-    def get_row(idx, default=""):
-        return rows[idx][0].strip() if len(rows) > idx and len(rows[idx]) > 0 else default
-
-    rohst        = get_row(5, "Stahl")
-    rawm         = get_row(8, "Steel")
-    max_datum    = get_row(11, "20.11.2020")
-    seitenumfang = int(get_row(14, "3") or "3")
-
-
-# --------------------------------------------------
-# 3) Chrome driver (ONE driver, reused)
-# --------------------------------------------------
-def make_driver() -> webdriver.Chrome:
-    opts = Options()
-    # headless is more likely to be blocked; keep headless but make it more "realistic"
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--enable-javascript")
-    opts.add_argument("--window-size=1365,900")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    )
-
-    try:
-        return webdriver.Chrome(options=opts)
-    except Exception:
-        # fallback older headless flag
-        opts.add_argument("--headless")
-        return webdriver.Chrome(options=opts)
-
-
-# --------------------------------------------------
-# 4) Extract article text (robust)
-# --------------------------------------------------
-def extract_with_gpt(full_text: str, fallback: str = "") -> str:
-    prompt = (
-        "Extract only the main news/article body from this webpage text. "
-        "Ignore navigation, ads, cookie banners, and unrelated content.\n\n" + full_text
-    )
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You extract clean article text from messy HTML."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception:
-        return fallback or full_text
-
-
-def _looks_blocked(text: str) -> bool:
-    t = (text or "").lower()
-    block_signals = [
-        "enable javascript",
-        "access denied",
-        "forbidden",
-        "not authorized",
-        "verify you are human",
-        "captcha",
-        "unusual traffic",
-        "bot detection",
-        "cloudflare",
-        "akamai",
-        "incapsula",
-        "please turn on cookies",
-        "consent",
-    ]
-    return any(s in t for s in block_signals)
-
-
-def url_zu_artikeltext(driver: webdriver.Chrome, url: str) -> str:
-    """
-    Uses ONE shared driver. Returns extracted text or raises RuntimeError with reason.
-    """
-    driver.set_page_load_timeout(25)
-
-    try:
-        driver.get(url)
-    except Exception as e:
-        raise RuntimeError(f"page_load_failed: {e}")
-
-    # wait a bit for the DOM; many pages won't have <article>
-    try:
-        WebDriverWait(driver, 12).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-    except Exception:
-        pass
-
-    html = driver.page_source or ""
-    soup = BeautifulSoup(html, "html.parser")
-
-    # quick block detection
-    visible_text = soup.get_text(" ", strip=True)
-    if _looks_blocked(visible_text):
-        raise RuntimeError("blocked_or_captcha")
-
-    # try <article> first
-    art = soup.find("article")
-    if art:
-        txt = art.get_text(separator="\n", strip=True)
-        if len(txt) >= 400:  # heuristic: real body text
-            return txt
-
-    # fallback: main tag
-    main = soup.find("main")
-    if main:
-        txt = main.get_text(separator="\n", strip=True)
-        if len(txt) >= 400:
-            return extract_with_gpt(txt, txt)
-
-    # fallback: body text
-    body = soup.find("body")
-    if body:
-        txt = body.get_text(separator="\n", strip=True)
-        if len(txt) < 200:
-            # too thin -> likely a paywall/blocked shell
-            raise RuntimeError("too_little_text_or_paywall")
-        return extract_with_gpt(txt, txt)
-
-    # last resort
-    txt = soup.get_text(separator="\n", strip=True)
-    if len(txt) < 200:
-        raise RuntimeError("too_little_text_or_empty")
-    return extract_with_gpt(txt, txt)
-
-
-# --------------------------------------------------
-# 5) GPT analysis with category codes (with labels)
-# --------------------------------------------------
-RISIKOKATEGORIEN = {
-    "A": "Working conditions, including occupational health and safety",
-    "B": "Child labour",
-    "C": "Modern slavery, including forced labour",
-    "D": "Community and indigenous peoples’ rights",
-    "E": "Excessive violence by private and public security forces",
-    "F": "Environmental risks with impact on human rights",
-    "G": "Business conduct in Conflict and High Risk Areas",
-    "H": "Serious human rights abuses",
-    "I": "Biodiversity",
-    "J": "Water",
-    "K": "Air",
-    "L": "Soil",
-    "M": "Waste, hazardous substances, and plant safety",
-}
-
-def expand_categories(raw_cats: str) -> str:
-    if not raw_cats or raw_cats.lower().startswith("not in text"):
-        return raw_cats
-
-    parts = [p.strip().upper() for p in raw_cats.replace(";", ",").split(",") if p.strip()]
-    seen, expanded = set(), []
-    for p in parts:
-        if p not in seen:
-            seen.add(p)
-            label = RISIKOKATEGORIEN.get(p, "")
-            expanded.append(f"{p} ({label})" if label else p)
-    return ", ".join(expanded)
-
-
-def analyse_artikel(rohstoff_name: str, artikeltext: str, temperature: float = 0.1) -> list[str]:
-    prompt = f"""
-Analysiere den folgenden Zeitungsartikel über den Rohstoff "{rohstoff_name}" 
-und beantworte GENAU 13 Punkte. Wenn eine Information fehlt, schreibe "Not in Text".
-
-1) Zutreffende Risikokategorien (Buchstaben A–M, z. B. "A, F, J")
-2) Arten der Menschenrechts-/Umweltschädigungen
-3) Kurze Begründung (max. 4 Sätze)
-4) Jahr(e)
-5) Land/Länder
-6) Ort(e)
-7) Stufe der Rohstoffgewinnung
-8) Involvierte Unternehmen
-9) Betroffene Personengruppen/Ökosysteme
-10) Mindestzahl der betroffenen Personen (Integer)
-11) Begründung für die Mindestzahl (1–2 Sätze)
-12) Schwere (minor/moderate/major/critical)
-13) Kurze Begründung für die Schwere
-
-Artikel:
-{artikeltext}
-"""
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": "Du bist ein Menschenrechts- und Nachhaltigkeitsexperte."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=temperature
-    )
-    txt = resp.choices[0].message.content.strip()
-    lines = [ln.strip() for ln in txt.split("\n") if ln.strip()]
-
-    if len(lines) < 13:
-        lines += ["Not in Text"] * (13 - len(lines))
-    lines = lines[:13]
-
-    lines[0] = expand_categories(lines[0])
-    return lines
-
-
-# --------------------------------------------------
-# 6) CSV helpers
-# --------------------------------------------------
-def lese_links_aus_scrape_csv(rohstoff: str) -> list[str]:
-    fpath = SCRAPED_DIR / f"gescrapte_links_{rohstoff}.csv"
-    if not fpath.exists():
-        raise FileNotFoundError(f"Scrape CSV not found: {fpath}")
-
-    links = []
-    with fpath.open("r", encoding="utf-8-sig") as f:
-        r = csv.reader(f, delimiter=";")
-        next(r, None)
-        for row in r:
-            if row and row[0].strip():
-                links.append(row[0].strip())
-
-    # de-dup preserve order
-    return list(dict.fromkeys(links))
-
-
-def schreibe_analyse_csv(rohstoff: str, daten_zeilen: list[list[str]]):
-    out_path = OUTPUT_DIR / f"analyse_tabelle_{rohstoff}.csv"
-    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f, delimiter=";")
-        w.writerow([
-            "link",
-            "Risikokategorien (A–M)",
-            "Arten der Menschenrechts-/Umweltschädigungen",
-            "Begründung",
-            "Jahr(e)",
-            "Land/Länder",
-            "Ort(e)",
-            "Stufe der Rohstoffgewinnung",
-            "Involvierte Unternehmen",
-            "Betroffene Personengruppen/Ökosysteme",
-            "Mindestzahl der betroffenen Personen",
-            "Begründung Mindestzahl",
-            "Schwere",
-            "Begründung Schwere",
-        ])
-        for row in daten_zeilen:
-            if not WRITE_DEBUG:
-                all_not = all(
-                    (isinstance(x, str) and x.strip().lower() == "not in text")
-                    for x in row[1:]
-                )
-                if all_not:
-                    continue
-            w.writerow(row)
-
-    print(f"✅ Analyse geschrieben nach: {out_path}")
-
-
-# --------------------------------------------------
-# 7) Main process
-# --------------------------------------------------
-if __name__ == "__main__":
-    lese_einstellungen()
-    print(f"SETTINGS:\n  rohst     = {rohst}\n  rawm      = {rawm}\n  max_datum = {max_datum}")
-
-    links = lese_links_aus_scrape_csv(rohst)
-    print("Links gefunden:", len(links))
-
-    # TEST SAMPLE (unchanged logic, but less random failures if you sort by domain later)
-    test_links = random.sample(links, min(MAX_TEST_LINKS, len(links)))
-    print(f"Wir testen diese {len(test_links)} zufälligen Links:")
-    for l in test_links:
-        print(" -", l)
-
-    rows, failed = [], []
-
-    driver = make_driver()
-    try:
-        for i, link in enumerate(test_links, start=1):
-            print(f"\n[{i}/{len(test_links)}] analysiere: {link}")
-            try:
-                artikel = url_zu_artikeltext(driver, link)
-                analysed = analyse_artikel(rawm, artikel, temperature=0.1)
-
-                cleaned = [x.replace("\n", " ").replace("\r", " ").strip(" -") for x in analysed]
-                rows.append([link] + cleaned)
-                print("  ✅ done")
-
-            except Exception as e:
-                reason = str(e)
-                print("  ❌ error:", reason)
-                failed.append([link, reason])
-
-            # small pause helps avoid blocks
-            time.sleep(1.2)
-
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-
-    schreibe_analyse_csv(rohst, rows)
-
-    # Write failed URLs + reason
-    if failed:
-        fail_path = OUTPUT_DIR / f"fehlgeschlagene_urls_analyse_{rohst}.csv"
-        with fail_path.open("w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f, delimiter=";")
-            w.writerow(["link", "reason"])
-            for u, r in failed:
-                w.writerow([u, r])
-        print(f"⚠️ Fehlgeschlagen: {len(failed)} → {fail_path}")
+[10/10] analysiere: https://rareearthexchanges.com/news/neodymium-supply-chain/
+  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
+✅ Analyse geschrieben nach: C:\Users\SHTANDO\Desktop\KI Risko\Analyse_Tabelle\analyse_tabelle_Neodym.csv
+⚠️ Fehlgeschlagen: 10 → C:\Users\SHTANDO\Desktop\KI Risko\Analyse_Tabelle\fehlgeschlagene_urls_analyse_Neodym.csv
