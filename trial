@@ -1,3 +1,6 @@
+!pip install readability-lxml spacy
+!python -m spacy download en_core_web_sm
+
 # -*- coding: utf-8 -*-
 """
 DETERMINISTIC ANALYSE-SKRIPT (NO LLM)
