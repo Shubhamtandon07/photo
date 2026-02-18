@@ -1,5 +1,30 @@
-import socket
-host = "genai-nexus.api.corpinter.net"
-print(socket.gethostbyname(host))
+import requests
 
-18.156.207.124
+url = "https://genai-nexus.api.corpinter.net/apikey/"
+r = requests.get(url, timeout=15)
+print("status:", r.status_code)
+print("server:", r.headers.get("server"))
+print("body_snip:", r.text[:120])
+
+import os
+from openai import AzureOpenAI
+
+AZURE_ENDPOINT = "https://genai-nexus.api.corpinter.net/apikey/"
+API_VERSION = "2024-06-01"
+API_KEY = os.getenv("OPENAI_API_KEY")  # should be set already
+
+client = AzureOpenAI(
+    azure_endpoint=AZURE_ENDPOINT,
+    api_key=API_KEY,
+    api_version=API_VERSION,
+)
+
+DEPLOYMENT = "PUT_YOUR_DEPLOYMENT_NAME_HERE"  # e.g. gpt4o-prod (from internal docs/portal)
+
+resp = client.chat.completions.create(
+    model=DEPLOYMENT,
+    messages=[{"role": "user", "content": "Say only: ok"}],
+    temperature=0,
+)
+
+print(resp.choices[0].message.content)
