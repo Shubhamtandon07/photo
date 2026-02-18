@@ -3,44 +3,27 @@ import requests
 host = "https://genai-nexus.api.corpinter.net"
 
 paths = [
-    "/",                      # sometimes 200/302
-    "/openai",                # sometimes 404/401
-    "/openai/",               
-    "/openai/deployments",    # often 401/404
-    "/v1",                    
-    "/v1/",                   
-    "/apikey",                # your current
-    "/apikey/",               
+    "/docs", "/swagger", "/swagger/", "/swagger/index.html",
+    "/openapi.json", "/api-docs", "/redoc",
+    "/health", "/healthz", "/status", "/version",
+    "/api", "/api/", "/api/v1", "/api/v1/",
+    "/nexus", "/nexus/", "/genai", "/genai/",
+    "/proxy", "/proxy/", "/gateway", "/gateway/",
+    "/openai-proxy", "/openai-proxy/",
+    "/azure", "/azure/", "/azureopenai", "/azureopenai/",
+    "/aoai", "/aoai/",
+    "/chat", "/chat/", "/completions", "/completions/",
 ]
+
+methods = ["GET", "HEAD", "OPTIONS"]
 
 for p in paths:
     url = host + p
-    try:
-        r = requests.get(url, timeout=10)
-        print(f"{p:22} -> {r.status_code}  {r.text[:60].replace('\\n',' ')}")
-    except Exception as e:
-        print(f"{p:22} -> ERROR {e}")
-/                      -> 404  {
-  "message":"no Route matched with those values",
-  "reque
-/openai                -> 404  {
-  "message":"no Route matched with those values",
-  "reque
-/openai/               -> 404  {
-  "message":"no Route matched with those values",
-  "reque
-/openai/deployments    -> 404  {
-  "message":"no Route matched with those values",
-  "reque
-/v1                    -> 404  {
-  "message":"no Route matched with those values",
-  "reque
-/v1/                   -> 404  {
-  "message":"no Route matched with those values",
-  "reque
-/apikey                -> 404  {
-  "message":"no Route matched with those values",
-  "reque
-/apikey/               -> 404  {
-  "message":"no Route matched with those values",
-  "reque
+    for m in methods:
+        try:
+            r = requests.request(m, url, timeout=10, allow_redirects=True)
+            code = r.status_code
+            if code != 404:
+                print(f"{m:7} {p:25} -> {code}  server={r.headers.get('server')}  len={len(r.text)}")
+        except Exception as e:
+            pass
