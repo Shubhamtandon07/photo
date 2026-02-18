@@ -1,4 +1,484 @@
-Cell In[2], line 2
-    """
-    ^
-SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes in position 102-103: truncated \UXXXXXXXX escape
+# -*- coding: utf-8 -*-
+# ============================================================
+# KI Risiko – HIGH-RECALL scraper (Unicode-safe, no GPT)
+# ============================================================
+# Reads (from):
+#   C:/Users/SHTANDO/Desktop/KI Risko/Textdoks_für_Einstellungen_der_Suche/
+#       Einstellungen_Analyse.csv
+#       Bekannte_Seiten.csv
+#       Schlagwörter.csv
+#
+# Writes (to):
+#   C:/Users/SHTANDO/Desktop/KI Risko/gescrapte_Artikel-Links/
+#       gescrapte_links_<rohst>.csv
+#
+# What it does:
+# 1) Site phase (HIGH RECALL):
+#    - Searches each of YOUR known sites + extra trustworthy sites (added below)
+#    - Uses broad HR/ENV risk queries that always include the selected material (rawm)
+#    - Minimal filtering (only removes junk sources like PDFs/social/jobs and requires material mention)
+#    - No hard per-site limit (collect as many as exist)
+#
+# 2) Fallback phase (if too few results):
+#    - If after site phase total unique articles < MIN_RESULTS_BEFORE_FALLBACK,
+#      it searches the whole web (no site restriction) until TARGET_TOTAL_RESULTS reached.
+#
+# Progress:
+# - Prints running total so you can see if it’s collecting or rejecting everything.
+#
+# Notes:
+# - This script does NOT use GPT or your OpenAI key.
+# - Analysis script is where strict filtering should happen.
+# ============================================================
+
+import csv
+import time
+import re
+from pathlib import Path
+from urllib.parse import quote_plus, urlparse
+
+import dateparser
+from bs4 import BeautifulSoup
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+
+# ============================================================
+# 1) PATHS / CONFIG  (FORWARD SLASHES ONLY => no unicodeescape issues)
+# ============================================================
+PROJECT_ROOT = Path("C:/Users/SHTANDO/Desktop/KI Risko")
+
+SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
+SCRAPED_DIR  = PROJECT_ROOT / "gescrapte_Artikel-Links"
+SCRAPED_DIR.mkdir(parents=True, exist_ok=True)
+
+EINSTELLUNGEN_CSV    = SETTINGS_DIR / "Einstellungen_Analyse.csv"
+BEKANNTE_SEITEN_CSV  = SETTINGS_DIR / "Bekannte_Seiten.csv"
+SCHLAGWORT_CSV       = SETTINGS_DIR / "Schlagwörter.csv"
+
+OUTPUT_CSV = None  # set after reading settings
+
+HEADLESS = False
+MAX_DDG_PAGES = 3                 # more pages => more recall
+SLEEP_BETWEEN_QUERIES = (1.5, 3)  # small random sleep range
+SLEEP_BETWEEN_SITES = (1.0, 2.0)
+
+MIN_RESULTS_BEFORE_FALLBACK = 5   # if less than this after site phase => fallback
+TARGET_TOTAL_RESULTS = 10         # stop fallback when total unique articles reach this
+
+# Minimal “junk” blocking (keep recall high but avoid useless sources)
+BLOCKED_DOMAINS_CONTAINS = [
+    "facebook.com", "m.facebook.com",
+    "youtube.com", "youtu.be",
+    "instagram.com",
+    "tiktok.com",
+    "twitter.com", "x.com",
+    "pinterest.",
+    "reddit.com",                 # optional; remove if you want reddit
+]
+
+BLOCKED_PATH_HINTS = [
+    "/jobs", "/job", "/career", "/careers", "/stellenangebote",
+    "/investor", "/investors", "/ir", "/investor-relations",
+    "/pricing", "/price", "/shop", "/store",
+]
+
+BLOCKED_EXTENSIONS = (".pdf", ".doc", ".docx", ".ppt", ".pptx")
+
+
+# ============================================================
+# 2) RISK TERMS (include your requested additions)
+# ============================================================
+RISK_TERMS_BASE = [
+    # core HR
+    "human rights", "violation", "abuse",
+    "forced labour", "forced labor",
+    "child labour", "child labor",
+    "underage workers", "modern slavery",
+    "unsafe working conditions", "hazardous work", "worker exploitation",
+    # discrimination & unions
+    "discrimination", "age discrimination", "racial discrimination", "religious discrimination",
+    "trade union", "trade union freedoms", "union rights", "union busting", "collective bargaining",
+    # env linked to HR
+    "pollution", "environmental damage", "contamination", "toxic waste", "spill",
+    "deforestation",
+    # indirect indicators
+    "illegal mining", "labour strike", "labor strike",
+    "community conflict", "protest", "violence",
+]
+
+
+# ============================================================
+# 3) EXTRA TRUSTWORTHY SITES (added on top of your CSV list)
+# ============================================================
+EXTRA_TRUSTED_SITES = [
+    # NGOs / watchdogs
+    "humanrightswatch.org",
+    "amnesty.org",
+    "business-humanrights.org",
+    "ohchr.org",
+    "ilo.org",
+    "oecd.org",
+    "worldbank.org",
+    "globalwitness.org",
+    "transparency.org",
+    "eia-international.org",
+    "earthworks.org",
+    "raid-uk.org",
+
+    # major news / wires (not perfect, but useful)
+    "reuters.com",
+    "apnews.com",
+    "theguardian.com",
+    "bbc.com",
+    "dw.com",
+    "ft.com",
+    "wsj.com",
+    "nytimes.com",
+]
+
+
+# ============================================================
+# 4) READ SETTINGS + CSV LISTS
+# ============================================================
+rohst = rawm = max_datum_str = None
+
+def read_settings():
+    global rohst, rawm, max_datum_str, OUTPUT_CSV
+    if not EINSTELLUNGEN_CSV.exists():
+        raise FileNotFoundError(f"Missing: {EINSTELLUNGEN_CSV}")
+
+    with EINSTELLUNGEN_CSV.open("r", encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.reader(f, delimiter=","))
+
+    def safe_get(i, default=""):
+        if len(rows) > i and rows[i] and rows[i][0].strip():
+            return rows[i][0].strip()
+        return default
+
+    rohst = safe_get(5, "Stahl")
+    rawm  = safe_get(8, "Steel")
+    max_datum_str = safe_get(11, "20.11.2020")
+
+    OUTPUT_CSV = SCRAPED_DIR / f"gescrapte_links_{rohst}.csv"
+
+    max_date = dateparser.parse(max_datum_str, languages=["de", "en"])
+    max_date = max_date.date() if max_date else None
+
+    print("SETTINGS:")
+    print(f"  rohst     = {rohst}")
+    print(f"  rawm      = {rawm}")
+    print(f"  max_datum = {max_datum_str}  (parsed={max_date})")
+    print(f"  output    = {OUTPUT_CSV}")
+    return max_date
+
+
+def read_flat_list(path: Path) -> list[str]:
+    if not path.exists():
+        print(f"⚠️ Missing list file: {path} -> []")
+        return []
+    items = []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        for row in csv.reader(f):
+            for cell in row:
+                v = (cell or "").strip()
+                if v:
+                    items.append(v)
+    # dedupe keep order
+    return list(dict.fromkeys(items))
+
+
+def normalize_domain(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"^https?://", "", s)
+    s = s.split("/")[0]
+    s = s.replace("www.", "")
+    return s
+
+
+# ============================================================
+# 5) SELENIUM
+# ============================================================
+def make_driver():
+    opts = Options()
+    if HEADLESS:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--enable-javascript")
+    opts.add_argument("--start-maximized")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    return webdriver.Chrome(options=opts)
+
+
+# ============================================================
+# 6) QUERY BUILDING
+# ============================================================
+def ddg_url(q: str) -> str:
+    return "https://duckduckgo.com/?q=" + quote_plus(q) + "&ia=web"
+
+def build_site_queries(domain: str, material: str, keywords: list[str]) -> list[str]:
+    # Use material ALWAYS (your strict requirement), but keep broad.
+    # No quotes, no OR.
+    base = [
+        f"site:{domain} {material} human rights",
+        f"site:{domain} {material} violation abuse",
+        f"site:{domain} {material} forced labour child labour",
+        f"site:{domain} {material} discrimination trade union",
+        f"site:{domain} {material} pollution contamination spill",
+        f"site:{domain} {material} unsafe working conditions hazardous",
+        f"site:{domain} {material} community conflict protest violence",
+    ]
+
+    # Add a few of your Schlagwörter too (clean + => space)
+    extra = []
+    for sw in keywords[:6]:
+        sw_clean = sw.replace("+", " ").strip()
+        if sw_clean:
+            extra.append(f"site:{domain} {material} {sw_clean}")
+
+    # Dedupe keep order
+    return list(dict.fromkeys(base + extra))
+
+def build_web_queries(material: str) -> list[str]:
+    # Fallback: whole web, still require material + risk terms.
+    return [
+        f"{material} human rights violation abuse",
+        f"{material} forced labour child labour underage workers",
+        f"{material} discrimination race religion age trade union freedoms",
+        f"{material} unsafe working conditions hazardous work worker exploitation",
+        f"{material} pollution contamination toxic waste spill environmental damage",
+        f"{material} community conflict protest violence displacement",
+        f"{material} illegal mining labour strike union busting",
+    ]
+
+
+# ============================================================
+# 7) DUCKDUCKGO RESULT SCRAPING
+# ============================================================
+def scrape_ddg(driver, search_url: str, max_pages: int) -> list[dict]:
+    items = []
+    driver.get(search_url)
+    time.sleep(2.5)
+
+    pages_seen = 0
+    while pages_seen < max_pages:
+        html = driver.page_source.lower()
+        if "filter löschen" in html or "try again" in html:
+            # don't wait forever; just abandon this query
+            return items
+
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'article[data-testid="result"]'))
+            )
+        except Exception:
+            return items
+
+        cards = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="result"]')
+        for c in cards:
+            try:
+                a = c.find_element(By.CSS_SELECTOR, "a[data-testid='result-title-a']")
+                url = a.get_attribute("href") or ""
+                title = a.text.strip()
+            except Exception:
+                continue
+
+            if not url or "duckduckgo.com" in url:
+                continue
+
+            snippet = ""
+            try:
+                snippet = c.find_element(By.CSS_SELECTOR, "div[data-testid='result-snippet']").text.strip()
+            except Exception:
+                pass
+
+            date_txt = ""
+            try:
+                date_txt = c.find_element(By.CSS_SELECTOR, "span.MILR5XIVy9h75WrLvKiq").text.strip()
+            except Exception:
+                pass
+
+            items.append({"url": url, "title": title, "snippet": snippet, "date": date_txt})
+
+        # More results
+        try:
+            more = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "#more-results")))
+            driver.execute_script("arguments[0].scrollIntoView(true);", more)
+            time.sleep(0.8)
+            more.click()
+            pages_seen += 1
+            time.sleep(1.2)
+        except Exception:
+            break
+
+    return items
+
+
+# ============================================================
+# 8) MINIMAL FILTERS (keep recall high)
+# ============================================================
+def is_blocked(url: str) -> bool:
+    u = url.lower()
+    if u.endswith(BLOCKED_EXTENSIONS):
+        return True
+
+    parsed = urlparse(url)
+    domain = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+
+    for bad in BLOCKED_DOMAINS_CONTAINS:
+        if bad in domain:
+            return True
+
+    for hint in BLOCKED_PATH_HINTS:
+        if hint in path:
+            return True
+
+    return False
+
+
+def material_in_text(material: str, title: str, snippet: str) -> bool:
+    # Require the selected material to appear in title/snippet (your strict requirement)
+    m = (material or "").strip().lower()
+    if not m:
+        return False
+    text = f"{title} {snippet}".lower()
+    return m in text
+
+
+def date_ok(date_txt: str, min_date) -> bool:
+    if min_date is None:
+        return True
+    if not date_txt:
+        return True
+    dt = dateparser.parse(date_txt, languages=["de", "en"])
+    if not dt:
+        return True
+    return dt.date() >= min_date
+
+
+# ============================================================
+# 9) CSV WRITING
+# ============================================================
+def write_header(path: Path):
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(["url", "date", "site", "query", "title", "snippet"])
+
+def append_row(path: Path, row: list[str]):
+    with path.open("a", newline="", encoding="utf-8-sig") as f:
+        csv.writer(f, delimiter=";").writerow(row)
+
+
+# ============================================================
+# 10) MAIN
+# ============================================================
+if __name__ == "__main__":
+    min_date = read_settings()
+
+    user_sites = [normalize_domain(s) for s in read_flat_list(BEKANNTE_SEITEN_CSV)]
+    user_sites = [s for s in user_sites if s]
+
+    keywords = read_flat_list(SCHLAGWORT_CSV)
+
+    extra_sites = [normalize_domain(s) for s in EXTRA_TRUSTED_SITES]
+    all_sites = list(dict.fromkeys(user_sites + extra_sites))
+
+    print(f"\nSites from your CSV: {len(user_sites)}")
+    print(f"Extra trusted sites: {len(extra_sites)}")
+    print(f"Total sites checked: {len(all_sites)}")
+
+    write_header(OUTPUT_CSV)
+
+    driver = make_driver()
+    global_seen = set()
+    total_collected = 0
+
+    try:
+        # -------------------------
+        # Phase 1: Site-based search
+        # -------------------------
+        for si, site in enumerate(all_sites, start=1):
+            print(f"\n[{si}/{len(all_sites)}] Site: {site}")
+
+            queries = build_site_queries(site, rawm, keywords)
+            print(f"  Queries: {len(queries)} | Collected so far: {total_collected}")
+
+            for qi, q in enumerate(queries, start=1):
+                search_url = ddg_url(q)
+                results = scrape_ddg(driver, search_url, MAX_DDG_PAGES)
+
+                accepted_this_query = 0
+                for r in results:
+                    url = r["url"]
+                    if not url or url in global_seen:
+                        continue
+                    if is_blocked(url):
+                        continue
+                    if not material_in_text(rawm, r["title"], r["snippet"]):
+                        continue
+                    if not date_ok(r["date"], min_date):
+                        continue
+
+                    global_seen.add(url)
+                    append_row(OUTPUT_CSV, [url, r["date"], site, q, r["title"], r["snippet"]])
+                    total_collected += 1
+                    accepted_this_query += 1
+
+                print(f"    Query {qi}/{len(queries)} -> results={len(results)} accepted={accepted_this_query} total={total_collected}")
+
+                # light sleep
+                time.sleep(1.8)
+
+        # -------------------------
+        # Phase 2: Fallback (whole web)
+        # -------------------------
+        if total_collected < MIN_RESULTS_BEFORE_FALLBACK:
+            print(f"\n⚠️ Only {total_collected} articles after site phase (<{MIN_RESULTS_BEFORE_FALLBACK}).")
+            print("➡️ Starting fallback: whole-web search until total reaches", TARGET_TOTAL_RESULTS)
+
+            web_queries = build_web_queries(rawm)
+            for qi, q in enumerate(web_queries, start=1):
+                if total_collected >= TARGET_TOTAL_RESULTS:
+                    break
+
+                search_url = ddg_url(q)
+                results = scrape_ddg(driver, search_url, MAX_DDG_PAGES)
+
+                accepted_this_query = 0
+                for r in results:
+                    if total_collected >= TARGET_TOTAL_RESULTS:
+                        break
+
+                    url = r["url"]
+                    if not url or url in global_seen:
+                        continue
+                    if is_blocked(url):
+                        continue
+                    if not material_in_text(rawm, r["title"], r["snippet"]):
+                        continue
+                    if not date_ok(r["date"], min_date):
+                        continue
+
+                    global_seen.add(url)
+                    append_row(OUTPUT_CSV, [url, r["date"], "(web)", q, r["title"], r["snippet"]])
+                    total_collected += 1
+                    accepted_this_query += 1
+
+                print(f"  Fallback Query {qi}/{len(web_queries)} -> results={len(results)} accepted={accepted_this_query} total={total_collected}")
+                time.sleep(1.8)
+
+        print(f"\n✅ Done. Total unique articles collected: {total_collected}")
+        print(f"✅ Output written to: {OUTPUT_CSV}")
+
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
