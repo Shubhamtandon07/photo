@@ -1,6 +1,394 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # KI Risiko – Per-article executive summaries + ONE overall summary sheet
+# (NO LLM / NO Azure)
+# Reads:  C:/Users/SHTANDO/Desktop/KI Risko/Analyse_Tabelle/analyse_tabelle_<rohst>.csv
+# Writes: C:/Users/SHTANDO/Desktop/KI Risko/Executive_Summary_<rohst>/Executive_Summary_Artikelweise_<rohst>.xlsx
+# ============================================================
+
+import csv
+import re
+from pathlib import Path
+from collections import Counter
+
+from openpyxl import Workbook
+
+
+# -----------------------------
+# 1) Paths
+# -----------------------------
+PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
+ANALYSE_DIR = PROJECT_ROOT / "Analyse_Tabelle"
+SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
+EINSTELLUNGEN_CSV = SETTINGS_DIR / "Einstellungen_Analyse.csv"
+
+
+# -----------------------------
+# 2) Read settings (rohst/rawm)
+# -----------------------------
+rohst = rawm = None
+
+def lese_einstellungen():
+    global rohst, rawm
+    with EINSTELLUNGEN_CSV.open("r", encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.reader(f, delimiter=","))
+
+    rohst = rows[5][0].strip()
+    rawm = rows[8][0].strip()
+    print(f"Loaded settings → rohst={rohst}, rawm={rawm}")
+
+
+# -----------------------------
+# 3) Load analyse_tabelle_<rohst>.csv
+# -----------------------------
+def lade_analyse_tabelle() -> tuple[list[str], list[list[str]]]:
+    analyse_path = ANALYSE_DIR / f"analyse_tabelle_{rohst}.csv"
+    if not analyse_path.exists():
+        raise FileNotFoundError(f"Analysis file not found: {analyse_path}")
+
+    with analyse_path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f, delimiter=";")
+        rows = list(reader)
+
+    if not rows:
+        raise ValueError(f"Analysis file is empty: {analyse_path}")
+
+    header = rows[0]
+    data_rows = rows[1:]
+    print(f"Loaded {len(data_rows)} analysed rows from: {analyse_path}")
+    return header, data_rows
+
+
+# -----------------------------
+# 4) Helpers
+# -----------------------------
+def get_cell(header: list[str], row: list[str], col: str, default: str = "Not in Text") -> str:
+    if col in header:
+        idx = header.index(col)
+        if idx < len(row):
+            v = (row[idx] or "").strip()
+            return v if v else default
+    return default
+
+def _split_values(cell: str) -> list[str]:
+    if not cell or cell.strip().lower() == "not in text":
+        return []
+    parts = re.split(r"[;,/|]+", cell)
+    return [p.strip() for p in parts if p.strip() and p.strip().lower() != "not in text"]
+
+def _clean_not_in_text(v: str) -> str:
+    if not v or v.strip().lower() == "not in text":
+        return ""
+    return v.strip()
+
+def _truncate_words(text: str, min_words: int = 110, max_words: int = 190) -> str:
+    words = text.split()
+    if len(words) <= max_words:
+        return text.strip()
+    return " ".join(words[:max_words]).strip()
+
+def _as_sentence_list(items: list[str], max_items: int = 5) -> str:
+    items = [i for i in items if i]
+    if not items:
+        return ""
+    items = items[:max_items]
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+def _severity_counts_to_text(sev_counts: dict) -> str:
+    if not sev_counts:
+        return ""
+    # stable ordering
+    order = ["minor", "moderate", "major", "critical"]
+    parts = []
+    for k in order:
+        if k in sev_counts:
+            parts.append(f"{k}: {sev_counts[k]}")
+    # include any unexpected keys too
+    for k, v in sev_counts.items():
+        if k not in order:
+            parts.append(f"{k}: {v}")
+    return "; ".join(parts)
+
+
+# -----------------------------
+# 5) Deterministic per-article summary
+# -----------------------------
+def deterministic_case_summary(header: list[str], row: list[str], raw_material: str) -> str:
+    link = get_cell(header, row, "link", "")
+    cats = _clean_not_in_text(get_cell(header, row, "Risikokategorien (A–M)"))
+    harms = _clean_not_in_text(get_cell(header, row, "Arten der Menschenrechts-/Umweltschädigungen"))
+    reason = _clean_not_in_text(get_cell(header, row, "Begründung"))
+    years = _clean_not_in_text(get_cell(header, row, "Jahr(e)"))
+    countries = _clean_not_in_text(get_cell(header, row, "Land/Länder"))
+    locations = _clean_not_in_text(get_cell(header, row, "Ort(e)"))
+    stage = _clean_not_in_text(get_cell(header, row, "Stufe der Rohstoffgewinnung"))
+    companies = _clean_not_in_text(get_cell(header, row, "Involvierte Unternehmen"))
+    groups = _clean_not_in_text(get_cell(header, row, "Betroffene Personengruppen/Ökosysteme"))
+    min_people = _clean_not_in_text(get_cell(header, row, "Mindestzahl der betroffenen Personen"))
+    min_reason = _clean_not_in_text(get_cell(header, row, "Begründung Mindestzahl"))
+    severity = _clean_not_in_text(get_cell(header, row, "Schwere"))
+    severity_reason = _clean_not_in_text(get_cell(header, row, "Begründung Schwere"))
+
+    # Build a factual narrative without inventing anything
+    p1_bits = []
+    p1_bits.append(f"This case concerns human-rights and/or environmental risks linked to {raw_material}.")
+    if years:
+        p1_bits.append(f"The relevant time reference in the source is {years}.")
+    if countries:
+        p1_bits.append(f"The geographic scope mentioned is {countries}.")
+    if locations:
+        p1_bits.append(f"Specific locations cited include {locations}.")
+
+    p2_bits = []
+    if cats:
+        p2_bits.append(f"Risk categories flagged: {cats}.")
+    if harms:
+        p2_bits.append(f"Described harms include: {harms}.")
+    if stage:
+        p2_bits.append(f"The supply-chain stage is described as: {stage}.")
+    if companies:
+        p2_bits.append(f"Companies referenced: {companies}.")
+    if groups:
+        p2_bits.append(f"Affected groups/ecosystems: {groups}.")
+
+    p3_bits = []
+    if min_people:
+        # keep neutral if not numeric
+        p3_bits.append(f"The minimum number of affected persons is recorded as: {min_people}.")
+    if min_reason:
+        p3_bits.append(f"Basis for this minimum: {min_reason}.")
+    if severity:
+        p3_bits.append(f"Severity is assessed as: {severity}.")
+    if severity_reason:
+        p3_bits.append(f"Rationale for severity: {severity_reason}.")
+    if reason:
+        p3_bits.append(f"Evidence/justification in the analysis: {reason}.")
+
+    paragraphs = []
+    paragraphs.append(" ".join(p1_bits))
+
+    if p2_bits:
+        paragraphs.append(" ".join(p2_bits))
+
+    if p3_bits:
+        paragraphs.append(" ".join(p3_bits))
+
+    text = "\n\n".join(paragraphs).strip()
+    text = _truncate_words(text)
+
+    if link:
+        text += f"\n\n[Article link: {link}]"
+    return text
+
+
+# -----------------------------
+# 6) Overall facts + deterministic overall summary
+# -----------------------------
+def compute_overall_facts(header: list[str], rows: list[list[str]]) -> dict:
+    countries = Counter()
+    years = Counter()
+    companies = Counter()
+    severities = Counter()
+    categories = Counter()
+    harms = Counter()
+
+    for row in rows:
+        for c in _split_values(get_cell(header, row, "Land/Länder", "")):
+            countries[c] += 1
+
+        y_raw = get_cell(header, row, "Jahr(e)", "")
+        for y in re.findall(r"\b(19\d{2}|20\d{2})\b", y_raw or ""):
+            years[y] += 1
+
+        for comp in _split_values(get_cell(header, row, "Involvierte Unternehmen", "")):
+            companies[comp] += 1
+
+        sev = get_cell(header, row, "Schwere", "").strip().lower()
+        if sev and sev != "not in text":
+            severities[sev] += 1
+
+        cat = get_cell(header, row, "Risikokategorien (A–M)", "")
+        if cat and cat.strip().lower() != "not in text":
+            for token in [t.strip() for t in cat.split(",") if t.strip()]:
+                categories[token] += 1
+
+        harm = get_cell(header, row, "Arten der Menschenrechts-/Umweltschädigungen", "")
+        for h in _split_values(harm):
+            harms[h] += 1
+
+    return {
+        "total_articles": len(rows),
+        "top_countries": countries.most_common(6),
+        "top_years": years.most_common(8),
+        "top_companies": companies.most_common(8),
+        "severity_counts": dict(severities),
+        "top_categories": categories.most_common(8),
+        "top_harms": harms.most_common(8),
+    }
+
+def deterministic_overall_summary(raw_material: str, facts: dict) -> str:
+    total = facts.get("total_articles", 0)
+
+    top_countries = [f"{n} ({c})" for n, c in facts.get("top_countries", [])]
+    top_years = [f"{n} ({c})" for n, c in facts.get("top_years", [])]
+    top_companies = [f"{n} ({c})" for n, c in facts.get("top_companies", [])]
+    top_categories = [f"{n} ({c})" for n, c in facts.get("top_categories", [])]
+    top_harms = [f"{n} ({c})" for n, c in facts.get("top_harms", [])]
+    sev_counts = facts.get("severity_counts", {})
+
+    parts = []
+    parts.append(
+        f"This overall summary consolidates {total} analysed cases related to human-rights and environmental risks in the {raw_material} context. "
+        f"It is generated deterministically from the analysis table (no external enrichment)."
+    )
+
+    if top_countries:
+        parts.append(f"The most frequently mentioned countries are: {_as_sentence_list(top_countries, 6)}.")
+    if top_years:
+        parts.append(f"The most frequently referenced years are: {_as_sentence_list(top_years, 8)}.")
+    if sev_counts:
+        parts.append(f"Severity distribution across cases: {_severity_counts_to_text(sev_counts)}.")
+    if top_categories:
+        parts.append(f"The most common risk-category tokens are: {_as_sentence_list(top_categories, 8)}.")
+    if top_harms:
+        parts.append(f"Recurring harm patterns include: {_as_sentence_list(top_harms, 6)}.")
+    if top_companies:
+        parts.append(f"Companies most frequently named (where present in the data): {_as_sentence_list(top_companies, 6)}.")
+
+    # keep within ~200–400 words
+    text = " ".join(parts).strip()
+    words = text.split()
+    if len(words) < 180 and total > 0:
+        text += " " + (
+            "Where fields are missing (\"Not in Text\"), they are intentionally not inferred. "
+            "Use the per-case sheets for traceable detail and the computed-facts block below for auditability."
+        )
+    # cap length
+    text = _truncate_words(text, min_words=180, max_words=380)
+    return text
+
+
+# -----------------------------
+# 7) Write Excel
+# -----------------------------
+def schreibe_excel_pro_artikel(header: list[str], rows: list[list[str]], rohstoff_name: str) -> Path:
+    exec_dir = PROJECT_ROOT / f"Executive_Summary_{rohstoff_name}"
+    exec_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = exec_dir / f"Executive_Summary_Artikelweise_{rohstoff_name}.xlsx"
+
+    wb = Workbook()
+    default_sheet = wb.active
+    wb.remove(default_sheet)
+
+    # --- per-article sheets ---
+    for idx, row in enumerate(rows, start=1):
+        sheet_name = f"Case_{idx}"
+        ws = wb.create_sheet(title=sheet_name[:31])
+
+        ws["A1"] = "Row index in analyse_tabelle"
+        ws["B1"] = idx + 1
+
+        excel_row = 3
+        for col_idx, col_name in enumerate(header, start=1):
+            value = row[col_idx - 1] if col_idx - 1 < len(row) else ""
+            ws.cell(row=excel_row, column=1).value = col_name
+            ws.cell(row=excel_row, column=2).value = value
+            excel_row += 1
+
+        print(f"Generating deterministic summary for article {idx}/{len(rows)}...")
+        summary_text = deterministic_case_summary(header, row, rawm)
+
+        excel_row += 1
+        ws.cell(row=excel_row, column=1).value = "Executive Summary"
+        ws.cell(row=excel_row, column=2).value = summary_text
+
+        ws.column_dimensions["A"].width = 45
+        ws.column_dimensions["B"].width = 120
+
+    # --- overall summary sheet ---
+    facts = compute_overall_facts(header, rows)
+    overall_text = deterministic_overall_summary(rawm, facts)
+
+    ws_overall = wb.create_sheet(title="Overall_Summary")
+    ws_overall["A1"] = "Overall Executive Summary (deterministic; 200–400 words target)"
+    ws_overall["A3"] = overall_text
+
+    # Traceability block
+    ws_overall["A5"] = "Computed facts (from analyse_tabelle)"
+    ws_overall["A6"] = "Total analysed articles"
+    ws_overall["B6"] = facts.get("total_articles")
+
+    ws_overall["A8"] = "Top countries (count)"
+    r = 9
+    for name, cnt in facts.get("top_countries", []):
+        ws_overall.cell(row=r, column=1).value = name
+        ws_overall.cell(row=r, column=2).value = cnt
+        r += 1
+
+    r += 1
+    ws_overall.cell(row=r, column=1).value = "Top years (count)"
+    r += 1
+    for name, cnt in facts.get("top_years", []):
+        ws_overall.cell(row=r, column=1).value = name
+        ws_overall.cell(row=r, column=2).value = cnt
+        r += 1
+
+    r += 1
+    ws_overall.cell(row=r, column=1).value = "Severity counts"
+    r += 1
+    for sev, cnt in (facts.get("severity_counts") or {}).items():
+        ws_overall.cell(row=r, column=1).value = sev
+        ws_overall.cell(row=r, column=2).value = cnt
+        r += 1
+
+    r += 1
+    ws_overall.cell(row=r, column=1).value = "Top category tokens (count)"
+    r += 1
+    for name, cnt in facts.get("top_categories", []):
+        ws_overall.cell(row=r, column=1).value = name
+        ws_overall.cell(row=r, column=2).value = cnt
+        r += 1
+
+    r += 1
+    ws_overall.cell(row=r, column=1).value = "Top harms (count)"
+    r += 1
+    for name, cnt in facts.get("top_harms", []):
+        ws_overall.cell(row=r, column=1).value = name
+        ws_overall.cell(row=r, column=2).value = cnt
+        r += 1
+
+    r += 1
+    ws_overall.cell(row=r, column=1).value = "Top companies (count)"
+    r += 1
+    for name, cnt in facts.get("top_companies", []):
+        ws_overall.cell(row=r, column=1).value = name
+        ws_overall.cell(row=r, column=2).value = cnt
+        r += 1
+
+    ws_overall.column_dimensions["A"].width = 55
+    ws_overall.column_dimensions["B"].width = 40
+
+    wb.save(out_path)
+    return out_path
+
+
+# -----------------------------
+# 8) Main
+# -----------------------------
+if __name__ == "__main__":
+    lese_einstellungen()
+    header, data_rows = lade_analyse_tabelle()
+
+    if not data_rows:
+        print("No data rows found in analysis table. Nothing to summarize.")
+    else:
+        out_file = schreibe_excel_pro_artikel(header, data_rows, rohst)
+        print(f"\n✅ Excel file written to:\n{out_file}")# -*- coding: utf-8 -*-
+# ============================================================
+# KI Risiko – Per-article executive summaries + ONE overall summary sheet
 # Reads:  C:\Users\SHTANDO\Desktop\KI Risko\Analyse_Tabelle\analyse_tabelle_<rohst>.csv
 # Writes: C:\Users\SHTANDO\Desktop\KI Risko\Executive_Summary_<rohst>\Executive_Summary_Artikelweise_<rohst>.xlsx
 #
