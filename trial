@@ -1,1 +1,3 @@
-https://<resource-name>.openai.azure.com/
+import socket
+host = "<resource-name>.openai.azure.com"
+print(socket.gethostbyname(host))
