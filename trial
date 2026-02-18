@@ -1,2 +1,15 @@
-Reachable ✅ | status = 401
-Tip: 401 is expected without auth.
+import os
+from openai import OpenAI
+
+# If you haven't set it in the environment yet, temporarily paste here:
+# os.environ["OPENAI_API_KEY"] = "sk-PASTE_YOUR_KEY"
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+resp = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "Say only: ok"}],
+    temperature=0,
+)
+
+print(resp.choices[0].message.content)
