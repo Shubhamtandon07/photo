@@ -1,38 +1,22 @@
 import requests
 
-url = "https://genai-nexus.api.corpinter.net/apikey/"
-r = requests.get(url, timeout=15)
-print("status:", r.status_code)
-print("server:", r.headers.get("server"))
-print("body_snip:", r.text[:120])
+host = "https://genai-nexus.api.corpinter.net"
 
+paths = [
+    "/",                      # sometimes 200/302
+    "/openai",                # sometimes 404/401
+    "/openai/",               
+    "/openai/deployments",    # often 401/404
+    "/v1",                    
+    "/v1/",                   
+    "/apikey",                # your current
+    "/apikey/",               
+]
 
-status: 404
-server: None
-body_snip: {
-  "message":"no Route matched with those values",
-  "request_id":"6cc8442aa285326113fce62a0556582c"
-}
-
-import os
-from openai import AzureOpenAI
-
-AZURE_ENDPOINT = "https://genai-nexus.api.corpinter.net/apikey/"
-API_VERSION = "2024-06-01"
-API_KEY = os.getenv("OPENAI_API_KEY")  # should be set already
-
-client = AzureOpenAI(
-    azure_endpoint=AZURE_ENDPOINT,
-    api_key=API_KEY,
-    api_version=API_VERSION,
-)
-
-DEPLOYMENT = "PUT_YOUR_DEPLOYMENT_NAME_HERE"  # e.g. gpt4o-prod (from internal docs/portal)
-
-resp = client.chat.completions.create(
-    model=DEPLOYMENT,
-    messages=[{"role": "user", "content": "Say only: ok"}],
-    temperature=0,
-)
-
-print(resp.choices[0].message.content)
+for p in paths:
+    url = host + p
+    try:
+        r = requests.get(url, timeout=10)
+        print(f"{p:22} -> {r.status_code}  {r.text[:60].replace('\\n',' ')}")
+    except Exception as e:
+        print(f"{p:22} -> ERROR {e}")
