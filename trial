@@ -20,3 +20,27 @@ for p in paths:
         print(f"{p:22} -> {r.status_code}  {r.text[:60].replace('\\n',' ')}")
     except Exception as e:
         print(f"{p:22} -> ERROR {e}")
+/                      -> 404  {
+  "message":"no Route matched with those values",
+  "reque
+/openai                -> 404  {
+  "message":"no Route matched with those values",
+  "reque
+/openai/               -> 404  {
+  "message":"no Route matched with those values",
+  "reque
+/openai/deployments    -> 404  {
+  "message":"no Route matched with those values",
+  "reque
+/v1                    -> 404  {
+  "message":"no Route matched with those values",
+  "reque
+/v1/                   -> 404  {
+  "message":"no Route matched with those values",
+  "reque
+/apikey                -> 404  {
+  "message":"no Route matched with those values",
+  "reque
+/apikey/               -> 404  {
+  "message":"no Route matched with those values",
+  "reque
