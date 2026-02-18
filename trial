@@ -1,48 +1,6 @@
-SETTINGS:
-  rohst     = Neodym
-  rawm      = Neodymium
-  max_datum = 20.11.2020
-Links gefunden: 10
-Wir testen diese 10 zufälligen Links:
- - https://www.morethansustainability.com/research-portfolio/neodymium-and-praseodymium
- - https://www.supermagnete.de/eng/safety-neodymium
- - https://korhogominerals.com/the-global-pursuit-of-neodymium-mining-politics-and-economics/
- - https://korhogominerals.com/securing-a-sustainable-future-the-environmental-ethics-of-neodymium-mining/
- - https://metalsgems.com/neodymium-mining-in-china-challenges/
- - https://ymagnetics.com/neodymium-magnet-production-mining-sintering-shaping/
- - https://microgridmedia.com/the-flaw-of-chinese-wind-turbines-hidden-radiation-risks-in-neodymium-production/
- - https://korhogominerals.com/are-neodymium-magnets-illegal/
- - https://briandcolwell.com/a-history-of-neodymium/
- - https://rareearthexchanges.com/news/neodymium-supply-chain/
+import os
 
-[1/10] analysiere: https://www.morethansustainability.com/research-portfolio/neodymium-and-praseodymium
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-
-[2/10] analysiere: https://www.supermagnete.de/eng/safety-neodymium
-  ❌ error: blocked_or_captcha
-
-[3/10] analysiere: https://korhogominerals.com/the-global-pursuit-of-neodymium-mining-politics-and-economics/
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-
-[4/10] analysiere: https://korhogominerals.com/securing-a-sustainable-future-the-environmental-ethics-of-neodymium-mining/
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-
-[5/10] analysiere: https://metalsgems.com/neodymium-mining-in-china-challenges/
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-
-[6/10] analysiere: https://ymagnetics.com/neodymium-magnet-production-mining-sintering-shaping/
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-
-[7/10] analysiere: https://microgridmedia.com/the-flaw-of-chinese-wind-turbines-hidden-radiation-risks-in-neodymium-production/
-  ❌ error: blocked_or_captcha
-
-[8/10] analysiere: https://korhogominerals.com/are-neodymium-magnets-illegal/
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-
-[9/10] analysiere: https://briandcolwell.com/a-history-of-neodymium/
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-
-[10/10] analysiere: https://rareearthexchanges.com/news/neodymium-supply-chain/
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-✅ Analyse geschrieben nach: C:\Users\SHTANDO\Desktop\KI Risko\Analyse_Tabelle\analyse_tabelle_Neodym.csv
-⚠️ Fehlgeschlagen: 10 → C:\Users\SHTANDO\Desktop\KI Risko\Analyse_Tabelle\fehlgeschlagene_urls_analyse_Neodym.csv
+k = os.getenv("OPENAI_API_KEY")
+print("OPENAI_API_KEY present:", bool(k))
+print("Length:", 0 if not k else len(k))
+print("Starts with:", "" if not k else k[:5])
