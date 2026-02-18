@@ -1,3 +1,10 @@
-OPENAI_API_KEY present: True
-Length: 36
-Starts with: de28c
+api_key = os.getenv("OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_API_KEY")
+
+client = openai.AzureOpenAI(
+    api_version="2024-06-01",
+    azure_endpoint="https://genai-nexus.api.corpinter.net/apikey/",
+    api_key=api_key,
+)
+
+import os
+os.environ["OPENAI_API_KEY"] = "PASTE_YOUR_KEY_HERE"
