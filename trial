@@ -1,20 +1,239 @@
-import os
-from openai import AzureOpenAI
+---------------------------------------------------------------------------
+ConnectError                              Traceback (most recent call last)
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpx\_transports\default.py:101, in map_httpcore_exceptions()
+    100 try:
+--> 101     yield
+    102 except Exception as exc:
 
-AZURE_ENDPOINT = "https://<your-resource-name>.openai.azure.com/"
-API_KEY = os.getenv("OPENAI_API_KEY")  # or paste temporarily
-API_VERSION = "2024-06-01"
-DEPLOYMENT = "<your-deployment-name>"  # from Azure Portal Deployments
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpx\_transports\default.py:250, in HTTPTransport.handle_request(self, request)
+    249 with map_httpcore_exceptions():
+--> 250     resp = self._pool.handle_request(req)
+    252 assert isinstance(resp.stream, typing.Iterable)
 
-client = AzureOpenAI(
-    azure_endpoint=AZURE_ENDPOINT,
-    api_key=API_KEY,
-    api_version=API_VERSION,
-)
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpcore\_sync\connection_pool.py:256, in ConnectionPool.handle_request(self, request)
+    255     self._close_connections(closing)
+--> 256     raise exc from None
+    258 # Return the response. Note that in this case we still have to manage
+    259 # the point at which the response is closed.
 
-resp = client.chat.completions.create(
-    model=DEPLOYMENT,
-    messages=[{"role": "user", "content": "Say 'ok'."}],
-    temperature=0,
-)
-print(resp.choices[0].message.content)
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpcore\_sync\connection_pool.py:236, in ConnectionPool.handle_request(self, request)
+    234 try:
+    235     # Send the request on the assigned connection.
+--> 236     response = connection.handle_request(
+    237         pool_request.request
+    238     )
+    239 except ConnectionNotAvailable:
+    240     # In some cases a connection may initially be available to
+    241     # handle a request, but then become unavailable.
+    242     #
+    243     # In this case we clear the connection and try again.
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpcore\_sync\connection.py:101, in HTTPConnection.handle_request(self, request)
+    100     self._connect_failed = True
+--> 101     raise exc
+    103 return self._connection.handle_request(request)
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpcore\_sync\connection.py:78, in HTTPConnection.handle_request(self, request)
+     77 if self._connection is None:
+---> 78     stream = self._connect(request)
+     80     ssl_object = stream.get_extra_info("ssl_object")
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpcore\_sync\connection.py:124, in HTTPConnection._connect(self, request)
+    123 with Trace("connect_tcp", logger, request, kwargs) as trace:
+--> 124     stream = self._network_backend.connect_tcp(**kwargs)
+    125     trace.return_value = stream
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpcore\_backends\sync.py:207, in SyncBackend.connect_tcp(self, host, port, timeout, local_address, socket_options)
+    202 exc_map: ExceptionMapping = {
+    203     socket.timeout: ConnectTimeout,
+    204     OSError: ConnectError,
+    205 }
+--> 207 with map_exceptions(exc_map):
+    208     sock = socket.create_connection(
+    209         address,
+    210         timeout,
+    211         source_address=source_address,
+    212     )
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\contextlib.py:162, in _GeneratorContextManager.__exit__(self, typ, value, traceback)
+    161 try:
+--> 162     self.gen.throw(value)
+    163 except StopIteration as exc:
+    164     # Suppress StopIteration *unless* it's the same exception that
+    165     # was passed to throw().  This prevents a StopIteration
+    166     # raised inside the "with" statement from being suppressed.
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpcore\_exceptions.py:14, in map_exceptions(map)
+     13     if isinstance(exc, from_exc):
+---> 14         raise to_exc(exc) from exc
+     15 raise
+
+ConnectError: [Errno 11001] getaddrinfo failed
+
+The above exception was the direct cause of the following exception:
+
+ConnectError                              Traceback (most recent call last)
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\openai\_base_client.py:982, in SyncAPIClient.request(self, cast_to, options, stream, stream_cls)
+    981 try:
+--> 982     response = self._client.send(
+    983         request,
+    984         stream=stream or self._should_stream_response_body(request=request),
+    985         **kwargs,
+    986     )
+    987 except httpx.TimeoutException as err:
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpx\_client.py:914, in Client.send(self, request, stream, auth, follow_redirects)
+    912 auth = self._build_request_auth(request, auth)
+--> 914 response = self._send_handling_auth(
+    915     request,
+    916     auth=auth,
+    917     follow_redirects=follow_redirects,
+    918     history=[],
+    919 )
+    920 try:
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpx\_client.py:942, in Client._send_handling_auth(self, request, auth, follow_redirects, history)
+    941 while True:
+--> 942     response = self._send_handling_redirects(
+    943         request,
+    944         follow_redirects=follow_redirects,
+    945         history=history,
+    946     )
+    947     try:
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpx\_client.py:979, in Client._send_handling_redirects(self, request, follow_redirects, history)
+    977     hook(request)
+--> 979 response = self._send_single_request(request)
+    980 try:
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpx\_client.py:1014, in Client._send_single_request(self, request)
+   1013 with request_context(request=request):
+-> 1014     response = transport.handle_request(request)
+   1016 assert isinstance(response.stream, SyncByteStream)
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpx\_transports\default.py:249, in HTTPTransport.handle_request(self, request)
+    237 req = httpcore.Request(
+    238     method=request.method,
+    239     url=httpcore.URL(
+   (...)    247     extensions=request.extensions,
+    248 )
+--> 249 with map_httpcore_exceptions():
+    250     resp = self._pool.handle_request(req)
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\contextlib.py:162, in _GeneratorContextManager.__exit__(self, typ, value, traceback)
+    161 try:
+--> 162     self.gen.throw(value)
+    163 except StopIteration as exc:
+    164     # Suppress StopIteration *unless* it's the same exception that
+    165     # was passed to throw().  This prevents a StopIteration
+    166     # raised inside the "with" statement from being suppressed.
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\httpx\_transports\default.py:118, in map_httpcore_exceptions()
+    117 message = str(exc)
+--> 118 raise mapped_exc(message) from exc
+
+ConnectError: [Errno 11001] getaddrinfo failed
+
+The above exception was the direct cause of the following exception:
+
+APIConnectionError                        Traceback (most recent call last)
+Cell In[1], line 15
+      7 DEPLOYMENT = "<your-deployment-name>"  # from Azure Portal Deployments
+      9 client = AzureOpenAI(
+     10     azure_endpoint=AZURE_ENDPOINT,
+     11     api_key=API_KEY,
+     12     api_version=API_VERSION,
+     13 )
+---> 15 resp = client.chat.completions.create(
+     16     model=DEPLOYMENT,
+     17     messages=[{"role": "user", "content": "Say 'ok'."}],
+     18     temperature=0,
+     19 )
+     20 print(resp.choices[0].message.content)
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\openai\_utils\_utils.py:286, in required_args.<locals>.inner.<locals>.wrapper(*args, **kwargs)
+    284             msg = f"Missing required argument: {quote(missing[0])}"
+    285     raise TypeError(msg)
+--> 286 return func(*args, **kwargs)
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\openai\resources\chat\completions\completions.py:1156, in Completions.create(self, messages, model, audio, frequency_penalty, function_call, functions, logit_bias, logprobs, max_completion_tokens, max_tokens, metadata, modalities, n, parallel_tool_calls, prediction, presence_penalty, prompt_cache_key, reasoning_effort, response_format, safety_identifier, seed, service_tier, stop, store, stream, stream_options, temperature, tool_choice, tools, top_logprobs, top_p, user, verbosity, web_search_options, extra_headers, extra_query, extra_body, timeout)
+   1110 @required_args(["messages", "model"], ["messages", "model", "stream"])
+   1111 def create(
+   1112     self,
+   (...)   1153     timeout: float | httpx.Timeout | None | NotGiven = not_given,
+   1154 ) -> ChatCompletion | Stream[ChatCompletionChunk]:
+   1155     validate_response_format(response_format)
+-> 1156     return self._post(
+   1157         "/chat/completions",
+   1158         body=maybe_transform(
+   1159             {
+   1160                 "messages": messages,
+   1161                 "model": model,
+   1162                 "audio": audio,
+   1163                 "frequency_penalty": frequency_penalty,
+   1164                 "function_call": function_call,
+   1165                 "functions": functions,
+   1166                 "logit_bias": logit_bias,
+   1167                 "logprobs": logprobs,
+   1168                 "max_completion_tokens": max_completion_tokens,
+   1169                 "max_tokens": max_tokens,
+   1170                 "metadata": metadata,
+   1171                 "modalities": modalities,
+   1172                 "n": n,
+   1173                 "parallel_tool_calls": parallel_tool_calls,
+   1174                 "prediction": prediction,
+   1175                 "presence_penalty": presence_penalty,
+   1176                 "prompt_cache_key": prompt_cache_key,
+   1177                 "reasoning_effort": reasoning_effort,
+   1178                 "response_format": response_format,
+   1179                 "safety_identifier": safety_identifier,
+   1180                 "seed": seed,
+   1181                 "service_tier": service_tier,
+   1182                 "stop": stop,
+   1183                 "store": store,
+   1184                 "stream": stream,
+   1185                 "stream_options": stream_options,
+   1186                 "temperature": temperature,
+   1187                 "tool_choice": tool_choice,
+   1188                 "tools": tools,
+   1189                 "top_logprobs": top_logprobs,
+   1190                 "top_p": top_p,
+   1191                 "user": user,
+   1192                 "verbosity": verbosity,
+   1193                 "web_search_options": web_search_options,
+   1194             },
+   1195             completion_create_params.CompletionCreateParamsStreaming
+   1196             if stream
+   1197             else completion_create_params.CompletionCreateParamsNonStreaming,
+   1198         ),
+   1199         options=make_request_options(
+   1200             extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body, timeout=timeout
+   1201         ),
+   1202         cast_to=ChatCompletion,
+   1203         stream=stream or False,
+   1204         stream_cls=Stream[ChatCompletionChunk],
+   1205     )
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\openai\_base_client.py:1259, in SyncAPIClient.post(self, path, cast_to, body, options, files, stream, stream_cls)
+   1245 def post(
+   1246     self,
+   1247     path: str,
+   (...)   1254     stream_cls: type[_StreamT] | None = None,
+   1255 ) -> ResponseT | _StreamT:
+   1256     opts = FinalRequestOptions.construct(
+   1257         method="post", url=path, json_data=body, files=to_httpx_files(files), **options
+   1258     )
+-> 1259     return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+
+File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\site-packages\openai\_base_client.py:1014, in SyncAPIClient.request(self, cast_to, options, stream, stream_cls)
+   1011         continue
+   1013     log.debug("Raising connection error")
+-> 1014     raise APIConnectionError(request=request) from err
+   1016 log.debug(
+   1017     'HTTP Response: %s %s "%i %s" %s',
+   1018     request.method,
+   (...)   1022     response.headers,
+   1023 )
+   1024 log.debug("request_id: %s", response.headers.get("x-request-id"))
+
+APIConnectionError: Connection error.
