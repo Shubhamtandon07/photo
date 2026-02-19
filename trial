@@ -137,10 +137,6 @@ RISIKOKATEGORIEN = {
 }
 
 def expand_categories(raw_cats: str) -> str:
-    """
-    Converts e.g. 'A, F, J' → 'A (Working conditions), F (Environmental risks with impact on human rights), J (Water)'
-    Keeps order and skips duplicates.
-    """
     if not raw_cats or raw_cats.lower().startswith("not in text"):
         return raw_cats
 
@@ -189,12 +185,10 @@ Artikel:
     txt = resp.choices[0].message.content.strip()
     lines = [ln.strip() for ln in txt.split("\n") if ln.strip()]
 
-    # fill missing lines if GPT returned fewer
     if len(lines) < 13:
         lines += ["Not in Text"] * (13 - len(lines))
     lines = lines[:13]
 
-    # expand category names in line 1
     lines[0] = expand_categories(lines[0])
     return lines
 
@@ -235,7 +229,6 @@ def schreibe_analyse_csv(rohstoff: str, daten_zeilen: list[list[str]]):
             "Begründung Schwere",
         ])
         for row in daten_zeilen:
-            # Skip rows where all fields are "Not in Text"
             if not WRITE_DEBUG:
                 all_not = all(
                     (isinstance(x, str) and x.strip().lower() == "not in text")
@@ -256,11 +249,9 @@ if __name__ == "__main__":
     links = lese_links_aus_scrape_csv(rohst)
     print("Links gefunden:", len(links))
 
-    # Pick 20 random links for test
-    test_links = random.sample(links, min(20, len(links)))
-    print(f"Wir testen diese {len(test_links)} zufälligen Links:")
-    for l in test_links:
-        print(" -", l)
+    # Analyse ALL links (no sampling)
+    test_links = links
+    print(f"Wir analysieren ALLE {len(test_links)} Links.")
 
     rows, failed = [], []
 
@@ -269,16 +260,12 @@ if __name__ == "__main__":
         try:
             artikel = url_zu_artikeltext(link)
 
-            # =========================================================
-            # ✅ MANDATORY MATERIAL GATE (ONLY CHANGE)
-            # Skip if required material is NOT in the extracted body text
-            # =========================================================
+            # ✅ MANDATORY MATERIAL GATE
             if rawm and rawm.strip() and (rawm.lower() not in (artikel or "").lower()):
                 print("  ⛔ skipped (required material not in body text)")
                 continue
 
             analysed = analyse_artikel(rawm, artikel, temperature=0.1)
-            # Clean and normalize all text values
             cleaned = [x.replace("\n", " ").replace("\r", " ").strip(" -") for x in analysed]
             rows.append([link] + cleaned)
             print("  ✅ done")
@@ -288,7 +275,6 @@ if __name__ == "__main__":
 
     schreibe_analyse_csv(rohst, rows)
 
-    # Write failed URLs
     if failed:
         fail_path = OUTPUT_DIR / f"fehlgeschlagene_urls_analyse_{rohst}.csv"
         with fail_path.open("w", newline="", encoding="utf-8-sig") as f:
