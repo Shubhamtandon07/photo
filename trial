@@ -1,269 +1,558 @@
-SETTINGS:
-  rohst     = Neodym
-  rawm      = neodymium
-  max_datum = 20.11.2020
-Links gefunden: 1500
-Wir analysieren ALLE 1500 Links.
-[1/1500] analysiere: https://news.mongabay.com/2024/02/indonesian-nickel-project-harms-environment-and-human-rights-report-says/
-  ⛔ skipped (required material not in body text)
-[2/1500] analysiere: https://news.mongabay.com/2022/05/scheme-to-stop-conflict-minerals-fails-to-end-child-labor-in-drc-report-says/
-  ⛔ skipped (required material not in body text)
-[3/1500] analysiere: https://news.mongabay.com/2025/05/indigenous-bajo-suffer-child-deaths-toxic-sludge-amid-green-energy-push/
-  ⛔ skipped (required material not in body text)
-[4/1500] analysiere: https://news.mongabay.com/2025/07/nickel-boom-on-an-indonesian-island-brings-toxic-seas-lost-incomes-report-says/
-  ⛔ skipped (required material not in body text)
-[5/1500] analysiere: https://news.mongabay.com/2025/06/bumble-bee-asks-court-to-dismiss-lawsuit-alleging-forced-labor-in-tuna-supply-chain/
-  ⛔ skipped (required material not in body text)
-[6/1500] analysiere: https://news.mongabay.com/2022/03/climate-positive-high-tech-metals-are-polluting-earth-but-solutions-await/
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-[7/1500] analysiere: https://news.mongabay.com/2023/12/reports-allege-abuses-by-glencore-in-peru-and-colombia-and-the-banks-funding-them/
-  ⛔ skipped (required material not in body text)
-[8/1500] analysiere: https://india.mongabay.com/2025/09/behind-the-shimmer-the-toxic-story-of-mica-and-forever-chemicals/
-  ⛔ skipped (required material not in body text)
-[9/1500] analysiere: https://news.mongabay.com/2016/03/abuse-displacement-pollution-the-legacy-of-zimbabwes-marange-diamonds/
-  ⛔ skipped (required material not in body text)
-[10/1500] analysiere: https://news.mongabay.com/2020/12/labor-abuses-rspo-oil-palm-plantations-indonesia-sumatra-kalimantan/
-  ⛔ skipped (required material not in body text)
-[11/1500] analysiere: https://news.mongabay.com/2022/08/toxic-rare-earth-mines-fuel-deforestation-rights-abuses-in-myanmar-report-says/
-  ⛔ skipped (required material not in body text)
-[12/1500] analysiere: https://news.mongabay.com/2024/06/report-illegal-fishing-and-labor-abuse-rampant-in-chinas-indian-ocean-fleet/
-  ⛔ skipped (required material not in body text)
-[13/1500] analysiere: https://news.mongabay.com/2024/10/in-the-battle-against-plastic-pollution-asias-informal-workers-are-critical-allies-commentary/
-  ⛔ skipped (required material not in body text)
-[14/1500] analysiere: https://news.mongabay.com/2021/07/top-brands-failing-to-spot-rights-abuses-on-indonesian-oil-palm-plantations-rspo/
-  ⛔ skipped (required material not in body text)
-[15/1500] analysiere: https://news.mongabay.com/2020/05/locals-stage-latest-fight-against-png-mine-dumping-waste-into-sea/
-  ⛔ skipped (required material not in body text)
-[16/1500] analysiere: https://news.mongabay.com/2025/04/still-no-trial-over-argentina-cyanide-mine-spill-7-years-after-officials-were-charged/
-  ⛔ skipped (required material not in body text)
-[17/1500] analysiere: https://news.mongabay.com/2025/07/oil-and-plastic-pollution-from-shipwreck-raises-concerns-legal-scrutiny-in-india/
-  ⛔ skipped (required material not in body text)
-[18/1500] analysiere: https://news.mongabay.com/2025/10/negro-river-study-finds-genetic-damage-in-fish-after-oil-spill/
-  ⛔ skipped (required material not in body text)
-[19/1500] analysiere: https://news.mongabay.com/2023/05/chemical-spill-in-nicaraguan-reserve-raises-questions-about-industrial-mining-regulations/
-  ⛔ skipped (required material not in body text)
-[20/1500] analysiere: https://news.mongabay.com/2024/04/outdated-infrastructure-and-oil-spills-the-cases-of-colombia-peru-and-ecuador/
-  ⛔ skipped (required material not in body text)
-[21/1500] analysiere: https://news.mongabay.com/2023/01/indonesia-nickel-mining-batteries-ev-environmental-license-foia/
-  ⛔ skipped (required material not in body text)
-[22/1500] analysiere: https://news.mongabay.com/2021/09/toxic-spill-at-angola-diamond-mine-pollutes-congo-river-tributary-in-drc/
-  ⛔ skipped (required material not in body text)
-[23/1500] analysiere: https://news.mongabay.com/2025/06/rare-earth-rush-in-myanmar-blamed-for-toxic-river-spillover-into-thailand/
-  ⛔ skipped (required material not in body text)
-[24/1500] analysiere: https://news.mongabay.com/2017/12/top-argentine-glacier-scientist-charged-over-cyanide-mine-spill/
-  ⛔ skipped (required material not in body text)
-[25/1500] analysiere: https://news.mongabay.com/2025/04/15-years-after-the-bp-oil-spill-disaster-how-is-the-gulf-of-mexico-faring/
-  ⛔ skipped (required material not in body text)
-[26/1500] analysiere: https://news.mongabay.com/2024/07/a-year-after-toxic-tar-sands-spill-questions-remain-for-affected-first-nation/
-  ⛔ skipped (required material not in body text)
-[27/1500] analysiere: https://news.mongabay.com/2020/10/more-than-470-oil-spills-in-the-peruvian-amazon-since-2000-report/
-  ⛔ skipped (required material not in body text)
-[28/1500] analysiere: https://news.mongabay.com/2024/03/global-cobalt-rush-drives-toxic-toll-near-drc-mines/
-  ⛔ skipped (required material not in body text)
-[29/1500] analysiere: https://news.mongabay.com/2016/06/1-6-million-brazilians-struggle-to-recover-from-fundao-toxic-waste-spill/
-  ⛔ skipped (required material not in body text)
-[30/1500] analysiere: https://news.mongabay.com/2016/05/taiwanese-chemical-spill-thought-cause-mass-fish-die-off-vietnam/
-  ⛔ skipped (required material not in body text)
-[31/1500] analysiere: https://news.mongabay.com/2024/01/u-s-mining-companies-leave-lasting-trail-of-contamination-across-peru/
-  ⛔ skipped (required material not in body text)
-[32/1500] analysiere: https://news.mongabay.com/2024/04/indigenous-bolivians-flee-homes-as-backlash-to-mining-protest-turns-explosive/
-  ⛔ skipped (required material not in body text)
-[33/1500] analysiere: https://news.mongabay.com/2025/11/soy-giants-quietly-prepare-for-eu-deforestation-law-impacts-still-uncertain/
-  ⛔ skipped (required material not in body text)
-[34/1500] analysiere: https://news.mongabay.com/2023/02/critics-allege-eus-toxic-collusion-with-fishing-lobbies-is-damaging-indian-ocean-tuna/
-  ⛔ skipped (required material not in body text)
-[35/1500] analysiere: https://news.mongabay.com/2013/11/palm-oil-workers-stage-massive-protest-at-sustainability-meeting-in-indonesia/
-  ⛔ skipped (required material not in body text)
-[36/1500] analysiere: https://news.mongabay.com/2022/11/sulawesi-nickel-plant-coats-nearby-homes-in-toxic-dust/
-  ⛔ skipped (required material not in body text)
-[37/1500] analysiere: https://news.mongabay.com/2020/05/indonesian-miners-eyeing-ev-nickel-boom-seek-to-dump-waste-into-the-sea/
-  ⛔ skipped (required material not in body text)
-[38/1500] analysiere: https://india.mongabay.com/2024/08/kanpurs-leather-legacy-navigating-sustainability-against-industrial-challenges/
-  ⛔ skipped (required material not in body text)
-[39/1500] analysiere: https://news.mongabay.com/2026/01/indonesias-illegal-gold-boom-leaves-a-toxic-legacy-of-mercury-pollution/
-  ⛔ skipped (required material not in body text)
-[40/1500] analysiere: https://news.mongabay.com/2025/04/indonesia-raises-concerns-over-eu-deforestation-laws-impact-on-smallholders/
-  ⛔ skipped (required material not in body text)
-[41/1500] analysiere: https://news.mongabay.com/2023/05/borders-between-mercosur-countries-have-become-a-hub-for-trafficking-agrochemicals/
-  ⛔ skipped (required material not in body text)
-[42/1500] analysiere: https://www.theguardian.com/global-development/2021/feb/12/mars-nestle-and-hershey-to-face-landmark-child-slavery-lawsuit-in-us
-  ⛔ skipped (required material not in body text)
-[43/1500] analysiere: https://www.theguardian.com/law/child-labour
-  ⛔ skipped (required material not in body text)
-[44/1500] analysiere: https://www.theguardian.com/business/article/2024/aug/23/shein-fashion-retailer-child-labour-supply-chain
-  ⛔ skipped (required material not in body text)
-[45/1500] analysiere: https://www.theguardian.com/business/2025/feb/26/shein-found-two-cases-of-child-labour-at-suppliers-in-2024-firm-tells-uk-mps
-  ⛔ skipped (required material not in body text)
-[46/1500] analysiere: https://www.theguardian.com/business/2024/jan/11/starbucks-labor-lawsuit-human-rights-violations-coffee-farm
-  ⛔ skipped (required material not in body text)
-[47/1500] analysiere: https://www.theguardian.com/law/2022/apr/03/cadbury-faces-fresh-accusations-of-child-labour-on-cocoa-farms-in-ghana
-  ⛔ skipped (required material not in body text)
-[48/1500] analysiere: https://www.theguardian.com/environment/pollution
-  ⛔ skipped (required material not in body text)
-[49/1500] analysiere: https://www.theguardian.com/law/2024/feb/01/car-manufacturers-toyota-volkswagen-tesla-general-motors-byd-alleged-forced-labour-aluminium-uyghur
-  ⛔ skipped (required material not in body text)
-[50/1500] analysiere: https://www.theguardian.com/us-news/2022/sep/27/slavery-loophole-unpaid-labor-in-prisons
-  ⛔ skipped (required material not in body text)
-[51/1500] analysiere: https://www.theguardian.com/technology/2023/oct/10/amazon-trafficking-links-claims-saudi-arabia-workers-abuses
-  ⛔ skipped (required material not in body text)
-[52/1500] analysiere: https://www.theguardian.com/sustainable-business/india-child-labour-mica-mineral-cosmetics
-  ⛔ skipped (required material not in body text)
-[53/1500] analysiere: https://www.theguardian.com/australia-news/2026/feb/03/cadia-goldmine-nsw-community-class-action-pollution
-  ⛔ skipped (required material not in body text)
-[54/1500] analysiere: https://www.theguardian.com/environment/2025/mar/05/greenland-mining-energy-transition-minerals-environmental-laws-uranium-rare-earth-toxic-waste-investor-state-dispute-settlement-isds-aoe
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-[55/1500] analysiere: https://www.theguardian.com/us-news/2025/apr/05/girl-scout-cookies-heavy-metals-lawsuit
-  ⛔ skipped (required material not in body text)
-[56/1500] analysiere: https://www.theguardian.com/us-news/2023/jun/25/us-navy-accused-radiocative-shipyard-waste
-  ⛔ skipped (required material not in body text)
-[57/1500] analysiere: https://www.theguardian.com/us-news/2025/feb/08/mexico-monterrey-factory-cleanup-zinc-nacional
-  ⛔ skipped (required material not in body text)
-[58/1500] analysiere: https://www.theguardian.com/film/2025/dec/28/tyler-perry-sexual-assault-lawsuit
-  ⛔ skipped (required material not in body text)
-[59/1500] analysiere: https://www.theguardian.com/environment/2023/jun/22/3m-settlement-municipal-water-systems-pfas-contamination
-  ⛔ skipped (required material not in body text)
-[60/1500] analysiere: https://www.theguardian.com/us-news/2015/aug/08/toxic-mine-spill-colorado-river-new-mexico
-  ⛔ skipped (required material not in body text)
-[61/1500] analysiere: https://www.theguardian.com/environment/2023/jan/19/simply-orange-juice-coca-cola-pfas-class-action-lawsuit
-  ⛔ skipped (required material not in body text)
-[62/1500] analysiere: https://www.theguardian.com/environment/2023/oct/27/chemours-forever-chemicals-pfas-north-carolina-water-pollution
-  ⛔ skipped (required material not in body text)
-[63/1500] analysiere: https://www.theguardian.com/us-news/2025/apr/17/toothpaste-lead-heavy-metals
-  ⛔ skipped (required material not in body text)
-[64/1500] analysiere: https://www.theguardian.com/us-news/2024/mar/19/kleenex-plant-pfas-toxic-chemicals-lawsuit-connecticut
-  ⛔ skipped (required material not in body text)
-[65/1500] analysiere: https://www.theguardian.com/us-news/2025/apr/03/lawsuit-claims-gore-tex-poisoned-drinking-water-near-maryland-facilities
-  ⛔ skipped (required material not in body text)
-[66/1500] analysiere: https://www.theguardian.com/us-news/2025/jul/10/new-mexico-us-air-force-pfas
-  ⛔ skipped (required material not in body text)
-[67/1500] analysiere: https://www.theguardian.com/uk-news/2026/jan/19/gmb-union-faces-claims-of-bullying-in-industrial-disputes-from-rival-union-leader
-  ⛔ skipped (required material not in body text)
-[68/1500] analysiere: https://www.theguardian.com/us-news/2023/sep/02/union-nlrb-decision-delays-busting
-  ⛔ skipped (required material not in body text)
-[69/1500] analysiere: https://www.theguardian.com/us-news/2026/jan/14/union-leaders-trump-administration-white-supremacy
-  ⛔ skipped (required material not in body text)
-[70/1500] analysiere: https://amp.theguardian.com/us-news/2024/jan/31/teamsters-racial-discrimination-lawsuit
-  ⛔ skipped (required material not in body text)
-[71/1500] analysiere: https://www.theguardian.com/us-news/2022/jun/10/us-union-workers-report-congress
-  ⛔ skipped (required material not in body text)
-[72/1500] analysiere: https://www.theguardian.com/us-news/2022/sep/01/starbucks-amazon-trader-joes-union-contract
-  ⛔ skipped (required material not in body text)
-[73/1500] analysiere: https://www.theguardian.com/us-news/2023/feb/02/us-environmental-groups-unionization
-  ⛔ skipped (required material not in body text)
-[74/1500] analysiere: https://www.theguardian.com/us-news/2025/mar/28/trump-order-union-rights-federal-workers
-  ⛔ skipped (required material not in body text)
-[75/1500] analysiere: https://www.theguardian.com/tv-and-radio/2021/jan/29/gogglebox-staff-claim-toxic-culture-behind-scenes-of-hit-show
-  ⛔ skipped (required material not in body text)
-[76/1500] analysiere: https://www.theguardian.com/us-news/2023/feb/26/amazon-trader-joes-starbucks-anti-union-measures?ref=auquan
-  ⛔ skipped (required material not in body text)
-[77/1500] analysiere: https://www.theguardian.com/us-news/2022/apr/13/union-victories-busting-consultants-amazon-tactics
-  ⛔ skipped (required material not in body text)
-[78/1500] analysiere: https://www.theguardian.com/us-news/article/2024/may/13/alabama-mercedes-workers-union-election-uaw
-  ⛔ skipped (required material not in body text)
-[79/1500] analysiere: https://www.theguardian.com/business/2022/jul/04/new-york-starbucks-closed-union-drive
-  ⛔ skipped (required material not in body text)
-[80/1500] analysiere: https://www.miningweekly.com/article/us-group-sues-apple-over-congo-conflict-minerals-2025-11-27
-  ⛔ skipped (required material not in body text)
-[81/1500] analysiere: https://www.miningweekly.com/article/longonjo-neodymiumpraseodymium-project-angola-update-2025-04-10
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-[82/1500] analysiere: https://www.miningweekly.com/article/niger-accuses-frances-orano-of-radioactive-pollution-as-uranium-row-deepens-2025-12-04
-  ⛔ skipped (required material not in body text)
-[83/1500] analysiere: https://www.miningweekly.com/article/nolans-neodymiumpraseodymium-rare-earths-project-australia-update-2025-08-22
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-[84/1500] analysiere: https://www.miningweekly.com/article/nolans-neodymiumpraseodymium-rare-earths-project-australia-update-2024-07-12
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-[85/1500] analysiere: https://www.miningweekly.com/article/nolansneodymiumpraseodymium-rare-earths-project-australia-2021-04-30
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-[86/1500] analysiere: https://www.miningweekly.com/article/tailings-remining-can-meet-critical-minerals-demand-2024-04-04
-  ⛔ skipped (required material not in body text)
-[87/1500] analysiere: https://www.miningweekly.com/article/zambia-assures-public-water-is-safe-after-mine-pollution-spill-2025-08-15
-  ⛔ skipped (required material not in body text)
-[88/1500] analysiere: https://www.miningweekly.com/article/chiles-environmental-watchdog-hits-codelco-with-mining-waste-pollution-claims-2020-06-26/page:390
-  ⛔ skipped (required material not in body text)
-[89/1500] analysiere: https://www.miningweekly.com/article/russian-court-rules-in-favour-of-rusal-in-132bn-lawsuit-against-rio-tinto-2025-12-17
-  ⛔ skipped (required material not in body text)
-[90/1500] analysiere: https://www.miningweekly.com/article/union-at-chiles-mantoverde-mine-says-company-avoiding-talks-to-end-strike-2026-01-26
-  ⛔ skipped (required material not in body text)
-[91/1500] analysiere: https://www.miningweekly.com/article/nolans-neodymiumpraseodymium-rare-earths-project-australia-update-2025-01-24
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-[92/1500] analysiere: https://www.miningweekly.com/article/nolans-neodymiumpraseodymium-rare-earths-project-australia-2020-06-19
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-[93/1500] analysiere: https://www.miningweekly.com/article/human-rights-a-key-issue-2024-02-16
-  ⛔ skipped (required material not in body text)
-[94/1500] analysiere: https://www.miningweekly.com/article/longonjo-neodymiumpraseodymium-project-angola-update-2025-11-28
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-[95/1500] analysiere: https://www.miningweekly.com/article/longonjo-neodymiumpraseodymium-project-angola-update-2025-12-12
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-[96/1500] analysiere: https://www.miningweekly.com/article/longonjo-neodymiumpraseodymium-project-angola-update-2025-03-21
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-[97/1500] analysiere: https://www.miningweekly.com/article/nolansneodymiumpraseodymium-rare-earths-project-australia-update-2021-06-25
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-[98/1500] analysiere: https://www.miningweekly.com/article/longonjo-neodymiumpraseodymium-project-angola-update-2020-10-09
-  ❌ error: Error code: 401 - {'message': 'Unauthorized'}
-[99/1500] analysiere: https://www.miningweekly.com/article/chilean-court-orders-halt-of-union-roadblocks-at-caserones-mine-2024-08-22
-  ⛔ skipped (required material not in body text)
-[100/1500] analysiere: https://www.fian.de/aktuelles/presseinfo-indonesische-gemeinden-reichen-oecd-beschwerde-gegen-heidelbergcement-ein/
-  ⛔ skipped (required material not in body text)
-[101/1500] analysiere: https://www.fian.de/aktuelles/oecd-beschwerde-bundesregierung-fordert-heidelberg-materials-zu-offenlegung-von-risikobericht-auf-2/
-  ⛔ skipped (required material not in body text)
-[102/1500] analysiere: https://www.fian.de/aktuelles/aldi-ing-diba-heidelbergcement-menschenrechtsverletzungen-und-umweltzerstoerung-bei-auslandsgeschaeften-deutscher-unternehmen/
-  ⛔ skipped (required material not in body text)
-[103/1500] analysiere: https://www.fian.de/aktuelles/offener-brief-an-die-europaeische-union-eine-geschlechtergerechte-regulierung-zu-sorgfaltspflichten-gewaehrleisten/
-  ⛔ skipped (required material not in body text)
-[104/1500] analysiere: https://www.brot-fuer-die-welt.de/themen/kinderarbeit/
-  ⛔ skipped (required material not in body text)
-[105/1500] analysiere: https://www.brot-fuer-die-welt.de/blog/2019-niederlaendisches-gesetz-gegen-kinderarbeit/
-  ⛔ skipped (required material not in body text)
-[106/1500] analysiere: https://www.brot-fuer-die-welt.de/blog/2016-rohstoffabbau-menschenrechtsverletzungen-und-unternehmensverantwortung/
-  ⛔ skipped (required material not in body text)
-[107/1500] analysiere: https://www.business-humanrights.org/en/latest-news/renewable-energy-projects-linked-to-risks-of-forced-labour-amid-limitations-on-supply-chain-regulation/
-  ⛔ skipped (required material not in body text)
-[108/1500] analysiere: https://www.business-humanrights.org/en/latest-news/india-enduring-forced-labour-and-gaps-in-protection-systemic-failures-across-sectors-and-lessons-from-the-sugarcane-belt/
-  ⛔ skipped (required material not in body text)
-[109/1500] analysiere: https://www.business-humanrights.org/en/from-us/briefings/transition-minerals-sector-case-studies/human-rights-in-the-mineral-supply-chains-of-electric-vehicles/
-  ⛔ skipped (required material not in body text)
-[110/1500] analysiere: https://www.business-humanrights.org/en/latest-news/usa-tesla-sued-over-alleged-forced-labour-and-greenwashing-in-cobalt-supply-chain/
-  ⛔ skipped (required material not in body text)
-[111/1500] analysiere: https://www.business-humanrights.org/en/latest-news/indonesia-pt-huadi-nickel-alloy-indonesia-alleged-of-forced-labour-practice-and-other-labour-rights-violations-incl-company-non-response/
-  ⛔ skipped (required material not in body text)
-[112/1500] analysiere: https://www.business-humanrights.org/en/latest-news/indonesia-us-department-of-labor-adds-nickel-to-forced-labour-list-for-2024-includes-responses-from-advocates-and-indonesian-government-officials/
-  ⛔ skipped (required material not in body text)
-[113/1500] analysiere: https://www.business-humanrights.org/en/latest-news/usa-apple-google-dell-microsoft-tesla-face-lawsuit-over-forced-child-labour-in-drc-cobalt-mines/
-  ⛔ skipped (required material not in body text)
-[114/1500] analysiere: https://www.business-humanrights.org/en/latest-news/usa-victims-of-child-trafficking-slavery-sue-major-chocolate-brands-incl-nestle-cargill-hershey-mars-alleging-they-knowingly-profited-from-the-forced-labor-of-children-harvesting-their-cocoa-beans/
-  ⛔ skipped (required material not in body text)
-[115/1500] analysiere: https://www.business-humanrights.org/en/latest-news/china-shein-refutes-public-eye-reports-labor-violation-claims-cites-audits-showing-above-average-wages/
-  ⛔ skipped (required material not in body text)
-[116/1500] analysiere: https://www.business-humanrights.org/en/latest-news/china-83-major-brands-implicated-in-report-on-forced-labour-of-ethnic-minorities-from-xinjiang-assigned-to-factories-across-provinces-includes-company-responses/
-  ⛔ skipped (required material not in body text)
-[117/1500] analysiere: https://www.business-humanrights.org/en/latest-news/report-by-human-rights-watch-alleges-labour-rights-abuses-child-labour-in-gold-diamond-supply-chains-of-global-jewellery-brands-incl-co-responses/
-  ⛔ skipped (required material not in body text)
-[118/1500] analysiere: https://www.business-humanrights.org/en/latest-news/a-report-highlights-forced-labor-in-cobalt-mining-in-the-democratic-republic-of-the-congo/
-  ⛔ skipped (required material not in body text)
-[119/1500] analysiere: https://www.business-humanrights.org/en/latest-news/indonesia-us-labor-dept-adds-nickel-to-forced-labor-list-citing-poor-woorking-conditions-in-chinese-indonesian-industrial-parks/
-  ⛔ skipped (required material not in body text)
-[120/1500] analysiere: https://www.business-humanrights.org/en/latest-news/malaysia-report-finds-child-labour-forced-labour-migrant-worker-abuses-at-nestl%C3%A9-palm-oil-suppliers-includes-comment-from-nestl%C3%A9/
-  ⛔ skipped (required material not in body text)
-[121/1500] analysiere: https://www.business-humanrights.org/en/latest-news/daimler-promises-to-audit-cobalt-supply-to-ensure-child-labour-not-used-to-power-its-electric-vehicles/
-  ⛔ skipped (required material not in body text)
-[122/1500] analysiere: https://www.business-humanrights.org/en/latest-news/china-carmakers-may-be-using-aluminium-made-by-uyghur-forced-labour-human-rights-watch-investigation-finds-incl-co-comments/
-  ⛔ skipped (required material not in body text)
-[123/1500] analysiere: https://www.business-humanrights.org/en/latest-news/global-2/
-  ⛔ skipped (required material not in body text)
-[124/1500] analysiere: https://www.business-humanrights.org/en/latest-news/drc-us-to-ban-imported-products-containing-minerals-critical-to-electric-vehicle-batteries-mined-through-child-labour-and-other-abusive-conditions/
-  ⛔ skipped (required material not in body text)
-[125/1500] analysiere: https://www.business-humanrights.org/en/latest-news/china-new-report-identifies-more-than-100-companies-in-the-critical-minerals-supply-chians-exposed-to-forced-labour-risks-in-xinjiang/
-  ⛔ skipped (required material not in body text)
-[126/1500] analysiere: https://www.business-humanrights.org/en/latest-news/usa-department-of-labor-adds-malaysian-rubber-gloves-to-list-of-forced-labour-produced-goods-following-revelations-of-migrant-worker-abuse/
-  ⛔ skipped (required material not in body text)
-[127/1500] analysiere: https://www.business-humanrights.org/en/latest-news/indonesia-advocates-call-for-reform-and-increased-oversight-in-nickel-industry-as-us-department-of-labor-adds-nickel-to-forced-labour-list-citing-more-than-100-safety-incidents-from-2015-to-june-2024/
-  ⛔ skipped (required material not in body text)
-[128/1500] analysiere: https://www.business-humanrights.org/en/latest-news/sungrow-did-not-respond/
-  ⛔ skipped (required material not in body text)
-[129/1500] analysiere: https://www.business-humanrights.org/en/latest-news/1-zambia-residents-sue-china-nonferrous-mining-over-tailings-spill-allege-unsafe-cleanup-surveillance-and-intimidation/
-  ⛔ skipped (required material not in body text)
-[130/1500] analysiere: https://www.business-humanrights.org/en/latest-news/zambia-foreign-copper-mining-companies-accused-of-dumping-toxic-waste-into-key-kafue-river-causing-environmental-disasters-civil-society-calls-for-increased-oversight-and-corporate-accountability/
-  ⛔ skipped (required material not in body text)
-[131/1500] analysiere: https://www.business-humanrights.org/en/latest-news/zambia-four-foreign-mining-companies-accused-of-polluting-the-countrys-main-watershed-sparking-public-outrage/
-  ⛔ skipped (required material not in body text)
-[132/1500] analysiere: https://www.business-humanrights.org/en/latest-news/norsk-hydro-re-waste-pollution-in-brazil-filed-in-the-netherlands/
+# -*- coding: utf-8 -*-
+"""
+ANALYSE-SKRIPT (NO LLM) mit Risikokategorien (A–M)
+- Deterministic, no Azure/OpenAI calls.
+- Keeps the SAME output CSV columns as your current pipeline.
+- Reads:  C:/Users/SHTANDO/Desktop/KI Risko/gescrapte_Artikel-Links/gescrapte_links_<rohst>.csv
+- Writes: C:/Users/SHTANDO/Desktop/KI Risko/Analyse_Tabelle/analyse_tabelle_<rohst>.csv
+
+Key changes vs your LLM version:
+✅ No OpenAI/Azure usage at all (no API keys needed)
+✅ Analyses ALL links (no random sample)
+✅ Mandatory-material gate: skips if required material not present in extracted body text
+✅ Robust-ish extraction with requests + BeautifulSoup; Selenium fallback if needed
+✅ Basic anti-block handling (User-Agent, timeouts)
+"""
+
+import csv
+import re
+import time
+from pathlib import Path
+from datetime import datetime
+from urllib.parse import urlparse
+
+import requests
+import dateparser
+from bs4 import BeautifulSoup
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+
+
+# --------------------------------------------------
+# 0) Paths
+# --------------------------------------------------
+PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
+SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
+SCRAPED_DIR = PROJECT_ROOT / "gescrapte_Artikel-Links"
+OUTPUT_DIR = PROJECT_ROOT / "Analyse_Tabelle"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+WRITE_DEBUG = True  # keep rows even if all “Not in Text”
+
+# --------------------------------------------------
+# 1) Read settings
+# --------------------------------------------------
+rohst = rawm = max_datum = None
+seitenumfang = 3  # kept for compatibility, not used here
+
+def lese_einstellungen():
+    global rohst, rawm, max_datum, seitenumfang
+    settings_path = SETTINGS_DIR / "Einstellungen_Analyse.csv"
+    with settings_path.open("r", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f, delimiter=","))
+
+    def get_row(idx, default=""):
+        return rows[idx][0].strip() if len(rows) > idx and len(rows[idx]) > 0 else default
+
+    rohst        = get_row(5, "Stahl")
+    rawm         = get_row(8, "Steel")
+    max_datum    = get_row(11, "20.11.2020")
+    seitenumfang = int(get_row(14, "3") or "3")
+
+
+# --------------------------------------------------
+# 2) Selenium driver (only if needed)
+# --------------------------------------------------
+HEADLESS = True
+
+def make_driver():
+    opts = Options()
+    if HEADLESS:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--enable-javascript")
+    opts.add_argument("--window-size=1400,2200")
+    try:
+        return webdriver.Chrome(options=opts)
+    except Exception:
+        # fallback legacy headless
+        opts.add_argument("--headless")
+        return webdriver.Chrome(options=opts)
+
+
+# --------------------------------------------------
+# 3) Fetch + extract article text (requests first, selenium fallback)
+# --------------------------------------------------
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/121.0 Safari/537.36")
+
+BLOCK_MARKERS = [
+    "captcha", "verify you are human", "access denied", "unusual traffic",
+    "cloudflare", "blocked", "bot detection"
+]
+
+def looks_blocked(text: str) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in BLOCK_MARKERS)
+
+def clean_visible_text(html: str) -> str:
+    soup = BeautifulSoup(html or "", "html.parser")
+
+    # remove obvious boilerplate
+    for tag in soup(["script", "style", "noscript", "svg", "canvas", "header", "footer", "nav", "aside"]):
+        tag.decompose()
+
+    # prefer <article>
+    art = soup.find("article")
+    if art:
+        txt = art.get_text(separator="\n", strip=True)
+        return txt
+
+    # fallback: main/body
+    main = soup.find("main")
+    if main:
+        return main.get_text(separator="\n", strip=True)
+
+    body = soup.find("body")
+    if body:
+        return body.get_text(separator="\n", strip=True)
+
+    return soup.get_text(separator="\n", strip=True)
+
+def fetch_html_requests(url: str, timeout_sec: int = 18) -> str:
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": UA, "Accept-Language": "en,de;q=0.9"},
+            timeout=timeout_sec,
+            allow_redirects=True
+        )
+        # Some sites return 403/406 etc. still with HTML
+        if r.text:
+            return r.text
+        return ""
+    except Exception:
+        return ""
+
+def fetch_html_selenium(url: str, timeout_sec: int = 18) -> str:
+    d = make_driver()
+    try:
+        d.set_page_load_timeout(timeout_sec)
+        d.get(url)
+        time.sleep(2.5)
+        return d.page_source or ""
+    finally:
+        try:
+            d.quit()
+        except Exception:
+            pass
+
+def url_zu_artikeltext(url: str) -> str:
+    # 1) requests
+    html = fetch_html_requests(url)
+    txt = clean_visible_text(html)
+    if txt and not looks_blocked(txt):
+        return txt
+
+    # 2) selenium fallback if blocked/empty
+    html2 = fetch_html_selenium(url)
+    txt2 = clean_visible_text(html2)
+    if txt2:
+        if looks_blocked(txt2):
+            raise RuntimeError("blocked_or_captcha")
+        return txt2
+
+    raise RuntimeError("empty_text")
+
+
+# --------------------------------------------------
+# 4) Deterministic extraction / classification
+# --------------------------------------------------
+RISIKOKATEGORIEN = {
+    "A": "Working conditions, including occupational health and safety",
+    "B": "Child labour",
+    "C": "Modern slavery, including forced labour",
+    "D": "Community and indigenous peoples’ rights",
+    "E": "Excessive violence by private and public security forces",
+    "F": "Environmental risks with impact on human rights",
+    "G": "Business conduct in Conflict and High Risk Areas",
+    "H": "Serious human rights abuses",
+    "I": "Biodiversity",
+    "J": "Water",
+    "K": "Air",
+    "L": "Soil",
+    "M": "Waste, hazardous substances, and plant safety",
+}
+
+# Category keyword patterns (broad/stem-like)
+CAT_PATTERNS = {
+    "A": [r"\bunsafe\b", r"\bsafety\b", r"\binjur(y|ies)\b", r"\bfatalit(y|ies)\b", r"\baccident(s)?\b",
+          r"\bworking conditions?\b", r"\boccupational\b", r"\bhealth and safety\b", r"\bwage(s)?\b", r"\bovertime\b"],
+    "B": [r"\bchild labor\b", r"\bchild labour\b", r"\bunderage\b", r"\bminor(s)?\b", r"\bchildren\b.*\bwork\b"],
+    "C": [r"\bforced labor\b", r"\bforced labour\b", r"\bmodern slavery\b", r"\btraffick(ing|ed)\b",
+          r"\bdebt bondage\b", r"\bcoerc(ed|ion)\b"],
+    "D": [r"\bindigenous\b", r"\bcommunity\b", r"\bdisplacement\b", r"\bland rights?\b", r"\bfree prior informed consent\b",
+          r"\bFPIC\b", r"\bresettlement\b"],
+    "E": [r"\bsecurity forces?\b", r"\bpolice\b", r"\bmilitar(y|ized)\b", r"\bshoot(ing|ings)\b", r"\bviolent\b",
+          r"\bassault\b", r"\bexcessive force\b"],
+    "F": [r"\benvironment(al)?\b", r"\bimpact\b", r"\bdamage\b", r"\b污染\b", r"\bemissions?\b", r"\bclimate\b"],
+    "G": [r"\bconflict\b", r"\barmed\b", r"\bmilitia\b", r"\bhigh[- ]risk\b", r"\bsanction(s)?\b", r"\bwar\b"],
+    "H": [r"\btorture\b", r"\bkilling(s)?\b", r"\bextrajudicial\b", r"\bgenocide\b", r"\bcrimes against humanity\b"],
+    "I": [r"\bbiodiversity\b", r"\bhabitat\b", r"\bendangered\b", r"\bwildlife\b", r"\becosystem(s)?\b"],
+    "J": [r"\bwater\b", r"\briver(s)?\b", r"\bgroundwater\b", r"\baquifer\b", r"\bdrinking water\b", r"\bwetland(s)?\b"],
+    "K": [r"\bair\b", r"\bdust\b", r"\bparticulate\b", r"\bsmog\b", r"\bfume(s)?\b", r"\bSO2\b", r"\bNOx\b"],
+    "L": [r"\bsoil\b", r"\bland contamination\b", r"\btopsoil\b", r"\bheavy metal(s)?\b"],
+    "M": [r"\bwaste\b", r"\btoxic\b", r"\bhazard(ous)?\b", r"\btailing(s)?\b", r"\btailings dam\b",
+          r"\bspill(s|ed)?\b", r"\bcyanide\b", r"\bmercury\b", r"\barsenic\b", r"\bleak(s|ed)?\b"],
+}
+
+# Risk “harms” extraction patterns
+HARM_PATTERNS = [
+    (r"\bchild labou?r\b|\bunderage\b", "Child labour"),
+    (r"\bforced labou?r\b|\bmodern slavery\b|\btraffick(ing|ed)\b", "Forced labour / modern slavery"),
+    (r"\bdiscriminat(ion|e|ed)\b|\brace\b|\breligion\b|\bage\b", "Discrimination (age/race/religion etc.)"),
+    (r"\btrade union\b|\bunion\b|\bcollective bargaining\b|\bunion[- ]bust", "Trade union freedoms / collective bargaining"),
+    (r"\bpollut(ion|ed|ing)\b|\bcontaminat(e|ed|ion)\b|\btoxic\b|\bspill\b", "Pollution / contamination / toxic release"),
+    (r"\bdeforest(ation|ed|ing)\b", "Deforestation"),
+    (r"\bdisplacement\b|\bresettlement\b|\bland rights?\b", "Displacement / land-rights impacts"),
+    (r"\bviolence\b|\bshoot(ing|ings)\b|\bassault\b", "Violence / security-force abuse"),
+]
+
+SEVERITY_RULES = [
+    ("critical", [r"\bdeath(s)?\b", r"\bkilled\b", r"\bfatalit(y|ies)\b", r"\bmassive spill\b", r"\btailings dam\b", r"\bgenocide\b"]),
+    ("major",    [r"\bserious\b", r"\bsevere\b", r"\bmajor\b", r"\blarge\b.*\bspill\b", r"\bforced labou?r\b", r"\bchild labou?r\b"]),
+    ("moderate", [r"\bmoderate\b", r"\balleg(ation|ed|edly)\b", r"\blawsuit\b", r"\binvestigation\b", r"\bcomplaint\b"]),
+]
+
+COUNTRY_HINTS = [
+    # minimal, common set (extend if you want)
+    "germany","france","italy","spain","portugal","poland","sweden","norway","finland","uk","united kingdom",
+    "usa","united states","canada","mexico","brazil","argentina","chile","peru","colombia",
+    "china","india","indonesia","philippines","vietnam","thailand","malaysia","australia",
+    "south africa","zambia","drc","democratic republic of the congo","congo",
+    "rwanda","uganda","kenya","tanzania","mozambique","madagascar",
+    "russia","ukraine","turkey","iran","iraq","saudi arabia","uae"
+]
+
+STAGE_HINTS = [
+    (r"\bexploration\b|\bprospecting\b", "Exploration"),
+    (r"\bmine\b|\bmining\b|\bextraction\b|\bpit\b|\bunderground\b", "Mining / extraction"),
+    (r"\bprocessing\b|\bbeneficiation\b|\bconcentrat(e|ion)\b", "Processing / beneficiation"),
+    (r"\bsmelt(ing|er)\b|\brefin(ing|ery)\b", "Smelting / refining"),
+    (r"\bmanufactur(e|ing)\b|\bfabricat(e|ion)\b|\bproduction\b", "Manufacturing / production"),
+    (r"\brecycl(e|ing)\b|\bsecondary\b", "Recycling / secondary material"),
+]
+
+YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
+CAPITALISED_ORG_RE = re.compile(r"\b([A-Z][A-Za-z0-9&\-.]{2,}(?:\s+[A-Z][A-Za-z0-9&\-.]{2,}){0,3})\b")
+
+def expand_categories(raw_cats: str) -> str:
+    if not raw_cats or raw_cats.lower().startswith("not in text"):
+        return raw_cats
+    parts = [p.strip().upper() for p in raw_cats.replace(";", ",").split(",") if p.strip()]
+    seen, expanded = set(), []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            label = RISIKOKATEGORIEN.get(p, "")
+            expanded.append(f"{p} ({label})" if label else p)
+    return ", ".join(expanded)
+
+def mandatory_material_present(text: str, material: str) -> bool:
+    if not material or not text:
+        return False
+    return material.lower() in text.lower()
+
+def pick_categories(text: str) -> str:
+    t = text.lower()
+    found = []
+    for code, pats in CAT_PATTERNS.items():
+        for p in pats:
+            if re.search(p, t, flags=re.IGNORECASE):
+                found.append(code)
+                break
+    if not found:
+        return "Not in Text"
+    # keep stable order A..M
+    found_sorted = [c for c in "ABCDEFGHIJKLM" if c in set(found)]
+    return expand_categories(", ".join(found_sorted))
+
+def extract_harms(text: str) -> str:
+    t = text.lower()
+    harms = []
+    for pat, label in HARM_PATTERNS:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            harms.append(label)
+    return "; ".join(dict.fromkeys(harms)) if harms else "Not in Text"
+
+def extract_years(text: str) -> str:
+    ys = YEAR_RE.findall(text or "")
+    ys = sorted(set(ys))
+    return ", ".join(ys) if ys else "Not in Text"
+
+def extract_countries(text: str) -> str:
+    t = (text or "").lower()
+    hits = []
+    for c in COUNTRY_HINTS:
+        if re.search(r"\b" + re.escape(c) + r"\b", t):
+            hits.append(c.title() if c.islower() else c)
+    hits = list(dict.fromkeys(hits))
+    return ", ".join(hits) if hits else "Not in Text"
+
+def extract_stage(text: str) -> str:
+    t = (text or "").lower()
+    for pat, label in STAGE_HINTS:
+        if re.search(pat, t):
+            return label
+    return "Not in Text"
+
+def extract_companies(text: str) -> str:
+    """
+    Very rough: pulls capitalised sequences and filters obvious non-company words.
+    You can improve later with spaCy when your Python version supports it.
+    """
+    if not text:
+        return "Not in Text"
+
+    blacklist = {
+        "The", "This", "That", "These", "Those", "Reuters", "Mongabay", "Guardian",
+        "Human", "Rights", "Environmental", "Report", "Reports", "Company", "Companies",
+        "Government", "Ministry", "Court", "University", "Institute", "Commission",
+        "January","February","March","April","May","June","July","August","September","October","November","December"
+    }
+
+    cands = CAPITALISED_ORG_RE.findall(text)
+    cleaned = []
+    for c in cands:
+        c = c.strip(" -–—,.;:()[]")
+        if not c:
+            continue
+        if c in blacklist:
+            continue
+        # discard if looks like a sentence start fragment
+        if len(c) < 3:
+            continue
+        # keep if contains Corp/Inc/AG/GmbH/SA/PLC/Ltd/LLC etc OR 2+ words
+        if re.search(r"\b(Inc|Corp|Corporation|Ltd|LLC|AG|GmbH|S\.A\.|SA|PLC|BV|NV)\b", c):
+            cleaned.append(c)
+        elif len(c.split()) >= 2:
+            cleaned.append(c)
+
+    cleaned = list(dict.fromkeys(cleaned))[:8]
+    return "; ".join(cleaned) if cleaned else "Not in Text"
+
+def extract_groups(text: str) -> str:
+    t = (text or "").lower()
+    groups = []
+    if re.search(r"\bworker(s)?\b|\blabou?rer(s)?\b|\bemployees?\b", t):
+        groups.append("Workers / employees")
+    if re.search(r"\bcommunity\b|\bresident(s)?\b|\bvillager(s)?\b", t):
+        groups.append("Local communities")
+    if re.search(r"\bindigenous\b", t):
+        groups.append("Indigenous peoples")
+    if re.search(r"\bchildren\b|\bchild\b|\bminor(s)?\b", t):
+        groups.append("Children")
+    if re.search(r"\becosystem(s)?\b|\bwildlife\b|\bhabitat\b|\briver\b|\bforest\b", t):
+        groups.append("Ecosystems / wildlife")
+    return "; ".join(dict.fromkeys(groups)) if groups else "Not in Text"
+
+def estimate_min_people(text: str) -> tuple[str, str]:
+    """
+    Conservative: only extract explicit integers with context.
+    Otherwise Not in Text.
+    """
+    if not text:
+        return "Not in Text", "Not in Text"
+
+    # examples: "100 workers", "2,000 residents"
+    m = re.search(r"\b(\d{1,3}(?:,\d{3})+|\d{1,7})\b\s+(workers?|employees?|people|residents?|villagers?)\b", text, flags=re.IGNORECASE)
+    if m:
+        num = m.group(1).replace(",", "")
+        return num, f"Found in text: '{m.group(0)}'"
+
+    return "Not in Text", "Not in Text"
+
+def severity_from_text(text: str, harms: str) -> tuple[str, str]:
+    t = (text or "").lower()
+
+    # explicit rules first
+    for sev, pats in SEVERITY_RULES:
+        for p in pats:
+            if re.search(p, t):
+                return sev, f"Matched pattern: {p}"
+
+    # if child/forced labour present -> at least major
+    if harms and harms != "Not in Text":
+        if "Child labour" in harms or "Forced labour" in harms:
+            return "major", "Harms include child/forced labour"
+
+    # otherwise moderate if allegations/lawsuit/investigation
+    if re.search(r"\balleg(ation|ed|edly)\b|\blawsuit\b|\binvestigation\b|\bcomplaint\b", t):
+        return "moderate", "Mentions allegations/lawsuit/investigation"
+
+    return "minor", "No strong severity markers found"
+
+
+def short_reason(text: str, max_sentences: int = 4) -> str:
+    if not text:
+        return "Not in Text"
+    # take first few non-empty sentences
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    parts = [p.strip() for p in parts if p.strip()]
+    if not parts:
+        return "Not in Text"
+    out = " ".join(parts[:max_sentences])
+    # clamp length
+    return out[:900]
+
+
+def analyse_artikel_deterministisch(rohstoff_name: str, artikeltext: str) -> list[str]:
+    """
+    Returns 13 fields in the exact order expected by your pipeline.
+    """
+    cats = pick_categories(artikeltext)
+    harms = extract_harms(artikeltext)
+    begr = short_reason(artikeltext, 3)
+
+    years = extract_years(artikeltext)
+    countries = extract_countries(artikeltext)
+
+    # "Ort(e)" not reliably extractable without NER -> keep Not in Text
+    locations = "Not in Text"
+
+    stage = extract_stage(artikeltext)
+    companies = extract_companies(artikeltext)
+    groups = extract_groups(artikeltext)
+
+    min_people, min_reason = estimate_min_people(artikeltext)
+
+    severity, sev_reason = severity_from_text(artikeltext, harms)
+
+    return [
+        cats,
+        harms,
+        begr,
+        years,
+        countries,
+        locations,
+        stage,
+        companies,
+        groups,
+        min_people,
+        min_reason,
+        severity,
+        sev_reason
+    ]
+
+
+# --------------------------------------------------
+# 5) CSV helpers
+# --------------------------------------------------
+def lese_links_aus_scrape_csv(rohstoff: str) -> list[str]:
+    fpath = SCRAPED_DIR / f"gescrapte_links_{rohstoff}.csv"
+    if not fpath.exists():
+        raise FileNotFoundError(f"Scrape CSV not found: {fpath}")
+
+    links = []
+    with fpath.open("r", encoding="utf-8-sig") as f:
+        r = csv.reader(f, delimiter=";")
+        next(r, None)
+        for row in r:
+            if row and row[0].strip():
+                links.append(row[0].strip())
+    return list(dict.fromkeys(links))
+
+def schreibe_analyse_csv(rohstoff: str, daten_zeilen: list[list[str]]):
+    out_path = OUTPUT_DIR / f"analyse_tabelle_{rohstoff}.csv"
+    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow([
+            "link",
+            "Risikokategorien (A–M)",
+            "Arten der Menschenrechts-/Umweltschädigungen",
+            "Begründung",
+            "Jahr(e)",
+            "Land/Länder",
+            "Ort(e)",
+            "Stufe der Rohstoffgewinnung",
+            "Involvierte Unternehmen",
+            "Betroffene Personengruppen/Ökosysteme",
+            "Mindestzahl der betroffenen Personen",
+            "Begründung Mindestzahl",
+            "Schwere",
+            "Begründung Schwere",
+        ])
+        for row in daten_zeilen:
+            if not WRITE_DEBUG:
+                all_not = all(
+                    (isinstance(x, str) and x.strip().lower() == "not in text")
+                    for x in row[1:]
+                )
+                if all_not:
+                    continue
+            w.writerow(row)
+    print(f"✅ Analyse geschrieben nach: {out_path}")
+
+
+# --------------------------------------------------
+# 6) Main process (ANALYZE ALL LINKS)
+# --------------------------------------------------
+if __name__ == "__main__":
+    lese_einstellungen()
+    print(f"SETTINGS:\n  rohst     = {rohst}\n  rawm      = {rawm}\n  max_datum = {max_datum}")
+
+    links = lese_links_aus_scrape_csv(rohst)
+    print("Links gefunden:", len(links))
+
+    rows, failed = [], []
+    analysed_count = 0
+    skipped_material = 0
+
+    for i, link in enumerate(links, start=1):
+        print(f"[{i}/{len(links)}] analysiere: {link}")
+
+        try:
+            artikel = url_zu_artikeltext(link)
+
+            # =========================================================
+            # ✅ MANDATORY MATERIAL GATE
+            # Skip if required material is NOT in the extracted body text
+            # =========================================================
+            if rawm and rawm.strip() and not mandatory_material_present(artikel, rawm):
+                skipped_material += 1
+                print("  ⛔ skipped (required material not in body text)")
+                continue
+
+            analysed = analyse_artikel_deterministisch(rawm, artikel)
+            cleaned = [x.replace("\n", " ").replace("\r", " ").strip(" -") if isinstance(x, str) else x for x in analysed]
+
+            rows.append([link] + cleaned)
+            analysed_count += 1
+            print("  ✅ done")
+
+            # small pause to reduce blocks
+            time.sleep(1.2)
+
+        except Exception as e:
+            print("  ❌ error:", e)
+            failed.append(link)
+
+            # backoff a bit
+            time.sleep(2.0)
+
+    schreibe_analyse_csv(rohst, rows)
+
+    # Write failed URLs
+    if failed:
+        fail_path = OUTPUT_DIR / f"fehlgeschlagene_urls_analyse_{rohst}.csv"
+        with fail_path.open("w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f, delimiter=";")
+            w.writerow(["link"])
+            for u in failed:
+                w.writerow([u])
+        print(f"⚠️ Fehlgeschlagen: {len(failed)} → {fail_path}")
+
+    print(f"\nDONE.\n  Analysed: {analysed_count}\n  Skipped (material missing): {skipped_material}\n  Failed: {len(failed)}")
