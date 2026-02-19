@@ -1,8 +1,1 @@
-from pathlib import Path
-
-p = Path(r"C:\Users\SHTANDO\Desktop\chatbot\input")
-print("Exists:", p.exists())
-print("Files (top level):", [x.name for x in p.iterdir()] if p.exists() else "N/A")
-
-print("MSG count recursive:", len(list(p.rglob("*.msg"))) if p.exists() else 0)
-print("MSG count recursive (upper-case):", len(list(p.rglob("*.MSG"))) if p.exists() else 0)
+C:\Users\SHTANDO\Desktop\chatbot\Mails Rasmus
