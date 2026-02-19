@@ -1,558 +1,559 @@
 # -*- coding: utf-8 -*-
-"""
-ANALYSE-SKRIPT (NO LLM) mit Risikokategorien (A–M)
-- Deterministic, no Azure/OpenAI calls.
-- Keeps the SAME output CSV columns as your current pipeline.
-- Reads:  C:/Users/SHTANDO/Desktop/KI Risko/gescrapte_Artikel-Links/gescrapte_links_<rohst>.csv
-- Writes: C:/Users/SHTANDO/Desktop/KI Risko/Analyse_Tabelle/analyse_tabelle_<rohst>.csv
-
-Key changes vs your LLM version:
-✅ No OpenAI/Azure usage at all (no API keys needed)
-✅ Analyses ALL links (no random sample)
-✅ Mandatory-material gate: skips if required material not present in extracted body text
-✅ Robust-ish extraction with requests + BeautifulSoup; Selenium fallback if needed
-✅ Basic anti-block handling (User-Agent, timeouts)
-"""
+# ============================================================
+# KI Risiko – HIGH RECALL material-aware HR/ENV scraper
+# Reads:
+#   C:\Users\SHTANDO\Desktop\KI Risko\Textdoks_für_Einstellungen_der_Suche\
+#       Einstellungen_Analyse.csv
+#       Bekannte_Seiten.csv
+#       Schlagwörter.csv
+# Writes:
+#   C:\Users\SHTANDO\Desktop\KI Risko\gescrapte_Artikel-Links\gescrapte_links_<rohst>.csv
+#
+# Behavior:
+#   Phase 1: search your sites (from Bekannte_Seiten.csv) + 10 extra trusted sites (added below)
+#   Phase 2: if <5 total, search web-wide until 10 total
+#   Shows progress counters while running
+#   Skips: PDFs, obvious social media (LinkedIn allowed), jobs/careers/IR pages, duplicates
+# ============================================================
 
 import csv
-import re
 import time
+import re
+import random
 from pathlib import Path
-from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
-import requests
 import dateparser
-from bs4 import BeautifulSoup
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 
-# --------------------------------------------------
-# 0) Paths
-# --------------------------------------------------
+# =========================
+# 1) PATHS / CONFIG
+# =========================
 PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
 SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
 SCRAPED_DIR = PROJECT_ROOT / "gescrapte_Artikel-Links"
-OUTPUT_DIR = PROJECT_ROOT / "Analyse_Tabelle"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+SCRAPED_DIR.mkdir(parents=True, exist_ok=True)
 
-WRITE_DEBUG = True  # keep rows even if all “Not in Text”
+EINSTELLUNGEN_CSV = SETTINGS_DIR / "Einstellungen_Analyse.csv"
+BEKANNTE_SEITEN_CSV = SETTINGS_DIR / "Bekannte_Seiten.csv"
+SCHLAGWORT_CSV = SETTINGS_DIR / "Schlagwörter.csv"
 
-# --------------------------------------------------
-# 1) Read settings
-# --------------------------------------------------
-rohst = rawm = max_datum = None
-seitenumfang = 3  # kept for compatibility, not used here
+HEADLESS = False
+MAX_DDG_PAGES = 2
+
+# runtime controls
+QUERIES_PER_SITE = 6
+
+# fallback behavior
+MIN_AFTER_SITES = 5
+FALLBACK_TARGET_TOTAL = 10
+
+# pauses
+PAUSE_BETWEEN_QUERIES_SEC = (1.5, 3.5)
+PAUSE_BETWEEN_SITES_SEC = (2.0, 5.0)
+
+
+# =========================
+# 2) RISK TERMS (broad / stem-like)
+# =========================
+RISK_PATTERNS = [
+    r"\bhuman rights?\b",
+    r"\bviolat(e|ed|ion|ions)\b",
+    r"\babuse(s|d)?\b",
+    r"\bforced\s+labou?r\b",
+    r"\bchild\s+labou?r\b",
+    r"\bmodern\s+slavery\b",
+    r"\btraffick(ing|ed)?\b",
+    r"\bexploitation\b",
+    r"\bunsafe\b",
+    r"\bhazard(ous)?\b",
+    r"\bdiscriminat(ion|e|ed)\b",
+    r"\bunion\b",
+    r"\bcollective\s+bargaining\b",
+    r"\bunion[-\s]?bust(ing|er|ed)?\b",
+    r"\bpollut(ion|ed|ing)\b",
+    r"\bcontaminat(e|ed|ion)\b",
+    r"\btoxic\b",
+    r"\bspill(s|ed)?\b",
+    r"\btailing(s)?\b",
+    r"\bwaste\b",
+    r"\bdeforest(ation|ed|ing)\b",
+    r"\bconflict\b",
+    r"\bprotest(s|ed|ing)?\b",
+    r"\blawsuit(s)?\b",
+    r"\balleg(ation|ed|edly)\b",
+]
+RISK_RE = re.compile("|".join(RISK_PATTERNS), flags=re.IGNORECASE)
+
+
+# =========================
+# 3) YOUR SITES (as you listed) + 10 EXTRA TRUSTED SITES
+#    NOTE: the script still reads Bekannte_Seiten.csv as primary input.
+#          If that file already contains these, fine; if not, we merge.
+# =========================
+YOUR_SITES_FALLBACK = [
+    "mongabay.com",
+    "theguardian.com",
+    "miningweekly.com",
+    "fian.de",
+    "brot-fuer-die-welt.de",
+    "business-humanrights.org",
+    "misereor.de",
+    "deutsche-rohstoffagentur.de",
+    "hrw.org",
+    "inclusivedevelopment.net",
+    "diversedaily.com",
+]
+
+TOP10_EXTRA_SITES = [
+    # High-quality news / investigations / enforcement & litigation coverage
+    "reuters.com",
+    "apnews.com",
+    "bbc.com",
+    "dw.com",
+    "aljazeera.com",
+    # Institutions / primary sources for labour & HR risks
+    "amnesty.org",
+    "ilo.org",
+    "un.org",
+    "oecd.org",
+    "state.gov",
+]
+
+
+# =========================
+# 4) READ SETTINGS
+# =========================
+rohst = rawm = max_datum_str = None
 
 def lese_einstellungen():
-    global rohst, rawm, max_datum, seitenumfang
-    settings_path = SETTINGS_DIR / "Einstellungen_Analyse.csv"
-    with settings_path.open("r", encoding="utf-8-sig") as f:
+    global rohst, rawm, max_datum_str
+
+    if not EINSTELLUNGEN_CSV.exists():
+        raise FileNotFoundError(f"Settings file not found: {EINSTELLUNGEN_CSV}")
+
+    with EINSTELLUNGEN_CSV.open("r", encoding="utf-8-sig", newline="") as f:
         rows = list(csv.reader(f, delimiter=","))
 
     def get_row(idx, default=""):
-        return rows[idx][0].strip() if len(rows) > idx and len(rows[idx]) > 0 else default
+        if len(rows) > idx and len(rows[idx]) > 0:
+            return (rows[idx][0] or "").strip()
+        return default
 
-    rohst        = get_row(5, "Stahl")
-    rawm         = get_row(8, "Steel")
-    max_datum    = get_row(11, "20.11.2020")
-    seitenumfang = int(get_row(14, "3") or "3")
+    rohst = get_row(5, "Stahl")
+    rawm = get_row(8, "Steel")
+    max_datum_str = get_row(11, "20.11.2020")
+
+    max_date = dateparser.parse(max_datum_str, languages=["de", "en"]) if max_datum_str else None
+    return max_date.date() if max_date else None
 
 
-# --------------------------------------------------
-# 2) Selenium driver (only if needed)
-# --------------------------------------------------
-HEADLESS = True
+# =========================
+# 5) LOAD CSV LISTS
+# =========================
+def lese_einfache_liste(pfad: Path, delimiter=",") -> list[str]:
+    if not pfad.exists():
+        return []
+    items = []
+    with pfad.open("r", encoding="utf-8-sig", newline="") as f:
+        r = csv.reader(f, delimiter=delimiter)
+        for row in r:
+            for cell in row:
+                v = (cell or "").strip()
+                if v:
+                    items.append(v.lower())
+    # uniq keep order
+    seen = set()
+    out = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
-def make_driver():
+
+# =========================
+# 6) SELENIUM DRIVER
+# =========================
+def make_driver() -> webdriver.Chrome:
     opts = Options()
     if HEADLESS:
         opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--enable-javascript")
-    opts.add_argument("--window-size=1400,2200")
+    opts.add_argument("--start-maximized")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    return webdriver.Chrome(options=opts)
+
+
+# =========================
+# 7) DDG SEARCH + SCRAPE
+# =========================
+def ddg_search_url(query: str) -> str:
+    return "https://duckduckgo.com/?q=" + quote_plus(query) + "&kp=1&ia=web"
+
+def scrape_ddg_results(driver: webdriver.Chrome, search_url: str, max_pages: int = MAX_DDG_PAGES) -> list[dict]:
+    items = []
     try:
-        return webdriver.Chrome(options=opts)
+        driver.get(search_url)
     except Exception:
-        # fallback legacy headless
-        opts.add_argument("--headless")
-        return webdriver.Chrome(options=opts)
+        return items
+
+    pages_seen = 0
+    while pages_seen < max_pages:
+        time.sleep(2.5)
+
+        try:
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'article[data-testid="result"]'))
+            )
+        except Exception:
+            break
+
+        articles = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="result"]')
+        for art in articles:
+            try:
+                link_el = art.find_element(By.CSS_SELECTOR, "a[data-testid='result-title-a']")
+                url = link_el.get_attribute("href") or ""
+                title = (link_el.text or "").strip()
+                if not url or "duckduckgo.com" in url:
+                    continue
+            except Exception:
+                continue
+
+            snippet = ""
+            try:
+                snippet = (art.find_element(By.CSS_SELECTOR, "div[data-testid='result-snippet']").text or "").strip()
+            except Exception:
+                pass
+
+            date_txt = ""
+            try:
+                date_txt = (art.find_element(By.CSS_SELECTOR, "span.MILR5XIVy9h75WrLvKiq").text or "").strip()
+            except Exception:
+                pass
+
+            items.append({"url": url, "title": title, "snippet": snippet, "date_txt": date_txt})
+
+        # more results
+        try:
+            more_btn = WebDriverWait(driver, 3).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "#more-results"))
+            )
+            driver.execute_script("arguments[0].scrollIntoView(true);", more_btn)
+            time.sleep(0.8)
+            more_btn.click()
+            pages_seen += 1
+        except Exception:
+            break
+
+    return items
 
 
-# --------------------------------------------------
-# 3) Fetch + extract article text (requests first, selenium fallback)
-# --------------------------------------------------
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/121.0 Safari/537.36")
+# =========================
+# 8) FILTERS (HIGH RECALL)
+# =========================
+SOCIAL_BAD = [
+    "facebook.com", "instagram.com", "tiktok.com", "youtube.com",
+    "twitter.com", "x.com", "reddit.com",
+]
+ALLOW_LIST = ["linkedin.com"]  # user allowed
 
-BLOCK_MARKERS = [
-    "captcha", "verify you are human", "access denied", "unusual traffic",
-    "cloudflare", "blocked", "bot detection"
+BAD_PATH_HINTS = [
+    "/jobs", "/careers", "/career", "/job/", "/vacancies", "/vacancy",
+    "/investor", "/investors", "/ir/", "/financial", "/finance", "/stock",
+    "/press-release", "/pressreleases", "/media-kit",
 ]
 
-def looks_blocked(text: str) -> bool:
-    t = (text or "").lower()
-    return any(m in t for m in BLOCK_MARKERS)
+def is_pdf(url: str) -> bool:
+    u = url.lower().split("?")[0]
+    return u.endswith(".pdf")
 
-def clean_visible_text(html: str) -> str:
-    soup = BeautifulSoup(html or "", "html.parser")
+def is_bad_social_domain(domain: str) -> bool:
+    d = domain.lower()
+    if any(a in d for a in ALLOW_LIST):
+        return False
+    return any(b in d for b in SOCIAL_BAD)
 
-    # remove obvious boilerplate
-    for tag in soup(["script", "style", "noscript", "svg", "canvas", "header", "footer", "nav", "aside"]):
-        tag.decompose()
+def is_bad_path(url: str) -> bool:
+    u = url.lower()
+    return any(h in u for h in BAD_PATH_HINTS)
 
-    # prefer <article>
-    art = soup.find("article")
-    if art:
-        txt = art.get_text(separator="\n", strip=True)
-        return txt
+def material_present_soft(text: str, material: str) -> bool:
+    if not material:
+        return False
+    return material.lower() in (text or "").lower()
 
-    # fallback: main/body
-    main = soup.find("main")
-    if main:
-        return main.get_text(separator="\n", strip=True)
+def risk_present_soft(text: str) -> bool:
+    return bool(RISK_RE.search(text or ""))
 
-    body = soup.find("body")
-    if body:
-        return body.get_text(separator="\n", strip=True)
+def score_hit(title: str, snippet: str, domain: str, material: str) -> int:
+    text = f"{title} {snippet}".lower()
+    s = 0
+    if material and material.lower() in text:
+        s += 3
+    if risk_present_soft(text):
+        s += 3
+    if domain.endswith(".gov") or domain.endswith(".int") or domain.endswith(".org"):
+        s += 1
+    if "business-humanrights" in domain:
+        s += 2
+    return s
 
-    return soup.get_text(separator="\n", strip=True)
+def date_ok(date_txt: str, min_date) -> bool:
+    if not min_date:
+        return True
+    if not date_txt:
+        return True
+    dt = dateparser.parse(date_txt, languages=["de", "en"])
+    if not dt:
+        return True
+    return dt.date() >= min_date
 
-def fetch_html_requests(url: str, timeout_sec: int = 18) -> str:
-    try:
-        r = requests.get(
-            url,
-            headers={"User-Agent": UA, "Accept-Language": "en,de;q=0.9"},
-            timeout=timeout_sec,
-            allow_redirects=True
+def rand_sleep(a_b: tuple[float, float]) -> None:
+    time.sleep(random.uniform(a_b[0], a_b[1]))
+
+
+# =========================
+# 9) QUERY BUILDERS
+# =========================
+def build_site_queries(domain: str, material: str, schlagwoerter: list[str]) -> list[str]:
+    base = [
+        "human rights", "abuse", "violation", "forced labor", "child labor",
+        "pollution", "contamination", "spill", "toxic", "lawsuit", "allegations",
+        "discrimination", "trade union",
+    ]
+    kws = schlagwoerter[:8] if schlagwoerter else []
+
+    queries = []
+    queries.append(f"site:{domain} {material} " + " ".join(base[:6]))
+    queries.append(f"site:{domain} {material} " + " ".join(base[6:11]))
+    queries.append(f"site:{domain} {material} discrimination trade union union rights")
+
+    for k in kws[:3]:
+        k_clean = k.replace("+", " ")
+        queries.append(f"site:{domain} {material} {k_clean}")
+
+    # non-material variant to catch titles/snippets missing material
+    queries.append(f"site:{domain} " + " ".join(base[:8]))
+
+    seen = set()
+    out = []
+    for q in queries:
+        q = re.sub(r'[\u201C\u201D\"\']', "", q).strip()
+        if q and q not in seen:
+            seen.add(q)
+            out.append(q)
+    return out[:QUERIES_PER_SITE]
+
+def build_fallback_queries(material: str, schlagwoerter: list[str]) -> list[str]:
+    base = [
+        f"{material} human rights violation",
+        f"{material} forced labor allegations",
+        f"{material} child labor supply chain",
+        f"{material} pollution contamination spill",
+        f"{material} discrimination trade union rights",
+        f"{material} lawsuit environmental damage",
+    ]
+    for k in (schlagwoerter[:8] if schlagwoerter else []):
+        base.append(f"{material} {k.replace('+',' ')}")
+    seen, out = set(), []
+    for q in base:
+        q = re.sub(r'[\u201C\u201D\"\']', "", q).strip()
+        if q and q not in seen:
+            seen.add(q)
+            out.append(q)
+    return out
+
+
+# =========================
+# 10) MAIN
+# =========================
+if __name__ == "__main__":
+    min_date = lese_einstellungen()
+    print(f"SETTINGS: rohst={rohst} | rawm={rawm} | max_datum={max_datum_str}")
+
+    # Read YOUR sites from Bekannte_Seiten.csv (primary)
+    seiten_user = lese_einfache_liste(BEKANNTE_SEITEN_CSV, delimiter=",")
+
+    # If Bekannte_Seiten.csv is empty, fall back to your pasted list
+    if not seiten_user:
+        seiten_user = [s.lower() for s in YOUR_SITES_FALLBACK]
+        print("⚠️ Bekannte_Seiten.csv empty/not found → using YOUR_SITES_FALLBACK list.")
+
+    # Read Schlagwörter.csv
+    schlagwoerter = lese_einfache_liste(SCHLAGWORT_CSV, delimiter=",")
+
+    # Merge: your sites first, then 10 extra
+    merged_sites = []
+    seen = set()
+    for s in seiten_user + TOP10_EXTRA_SITES:
+        s = (s or "").strip().lower()
+        if not s:
+            continue
+        s = s[4:] if s.startswith("www.") else s
+        if s not in seen:
+            seen.add(s)
+            merged_sites.append(s)
+
+    print(f"Sites total: {len(merged_sites)} | user={len(seiten_user)} | extra={len(merged_sites)-len(seiten_user)}")
+    print("User sites (from CSV):", ", ".join(seiten_user))
+    print("Extra sites (top10):", ", ".join(TOP10_EXTRA_SITES))
+
+    out_path = SCRAPED_DIR / f"gescrapte_links_{rohst}.csv"
+
+    global_seen_urls = set()
+
+    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
+        csv.writer(f, delimiter=";").writerow(
+            ["url", "datum", "site", "query", "title", "snippet", "score"]
         )
-        # Some sites return 403/406 etc. still with HTML
-        if r.text:
-            return r.text
-        return ""
-    except Exception:
-        return ""
 
-def fetch_html_selenium(url: str, timeout_sec: int = 18) -> str:
-    d = make_driver()
+    driver = make_driver()
+    collected_total = 0
+
     try:
-        d.set_page_load_timeout(timeout_sec)
-        d.get(url)
-        time.sleep(2.5)
-        return d.page_source or ""
+        # -----------------------------
+        # Phase 1: site-based
+        # -----------------------------
+        for idx_site, domain in enumerate(merged_sites, start=1):
+            print(f"\n🌐 Site {idx_site}/{len(merged_sites)}: {domain}")
+            queries = build_site_queries(domain, rawm, schlagwoerter)
+            print(f"   → queries: {len(queries)}")
+
+            accepted_for_site = 0
+
+            for q_i, q in enumerate(queries, start=1):
+                print(f"   🔎 {q_i}/{len(queries)} | collected so far = {collected_total}")
+                url_search = ddg_search_url(q)
+
+                results = scrape_ddg_results(driver, url_search, max_pages=MAX_DDG_PAGES)
+                print(f"      → raw hits: {len(results)}")
+
+                scored = []
+                for r in results:
+                    u = r.get("url", "")
+                    if not u or u in global_seen_urls:
+                        continue
+
+                    dom = urlparse(u).netloc.lower()
+
+                    if is_pdf(u):
+                        continue
+                    if is_bad_social_domain(dom):
+                        continue
+                    if is_bad_path(u):
+                        continue
+                    if not date_ok(r.get("date_txt", ""), min_date):
+                        continue
+
+                    sc = score_hit(r.get("title", ""), r.get("snippet", ""), dom, rawm)
+                    scored.append((sc, r))
+
+                scored.sort(key=lambda x: x[0], reverse=True)
+
+                for sc, r in scored:
+                    u = r["url"]
+                    if u in global_seen_urls:
+                        continue
+
+                    # High-recall acceptance:
+                    # keep some relevance by preferring scored items, but don't starve the output
+                    if sc == 0 and accepted_for_site >= 3:
+                        continue
+
+                    global_seen_urls.add(u)
+                    collected_total += 1
+                    accepted_for_site += 1
+
+                    with out_path.open("a", newline="", encoding="utf-8-sig") as f:
+                        csv.writer(f, delimiter=";").writerow([
+                            u,
+                            r.get("date_txt", ""),
+                            domain,
+                            q,
+                            r.get("title", ""),
+                            r.get("snippet", ""),
+                            sc
+                        ])
+
+                    print(
+                        f"      ✅ accepted | total={collected_total} | site={accepted_for_site} | score={sc} | "
+                        f"{(r.get('title','') or '')[:80]}"
+                    )
+
+                rand_sleep(PAUSE_BETWEEN_QUERIES_SEC)
+
+            print(f"   → accepted from site: {accepted_for_site}")
+            rand_sleep(PAUSE_BETWEEN_SITES_SEC)
+
+        # -----------------------------
+        # Phase 2: fallback web-wide
+        # -----------------------------
+        if collected_total < MIN_AFTER_SITES:
+            print(f"\n⚠️ Only {collected_total} collected after sites. Starting web-wide fallback…")
+            fallback_queries = build_fallback_queries(rawm, schlagwoerter)
+
+            for q_i, q in enumerate(fallback_queries, start=1):
+                if collected_total >= FALLBACK_TARGET_TOTAL:
+                    break
+
+                print(f"🌍 Fallback {q_i}/{len(fallback_queries)} | collected so far = {collected_total}")
+                results = scrape_ddg_results(driver, ddg_search_url(q), max_pages=MAX_DDG_PAGES)
+                print(f"   → raw hits: {len(results)}")
+
+                for r in results:
+                    if collected_total >= FALLBACK_TARGET_TOTAL:
+                        break
+
+                    u = r.get("url", "")
+                    if not u or u in global_seen_urls:
+                        continue
+
+                    dom = urlparse(u).netloc.lower()
+                    if is_pdf(u):
+                        continue
+                    if is_bad_social_domain(dom):
+                        continue
+                    if is_bad_path(u):
+                        continue
+
+                    text = f"{r.get('title','')} {r.get('snippet','')}".lower()
+                    # fallback must have at least material OR risk in title/snippet
+                    if not (material_present_soft(text, rawm) or risk_present_soft(text)):
+                        continue
+
+                    global_seen_urls.add(u)
+                    collected_total += 1
+                    sc = score_hit(r.get("title", ""), r.get("snippet", ""), dom, rawm)
+
+                    with out_path.open("a", newline="", encoding="utf-8-sig") as f:
+                        csv.writer(f, delimiter=";").writerow([
+                            u,
+                            r.get("date_txt", ""),
+                            "WEB_WIDE",
+                            q,
+                            r.get("title", ""),
+                            r.get("snippet", ""),
+                            sc
+                        ])
+
+                    print(f"   ✅ fallback accepted | total={collected_total} | score={sc} | {r.get('title','')[:80]}")
+
+                rand_sleep(PAUSE_BETWEEN_QUERIES_SEC)
+
     finally:
         try:
-            d.quit()
+            driver.quit()
         except Exception:
             pass
 
-def url_zu_artikeltext(url: str) -> str:
-    # 1) requests
-    html = fetch_html_requests(url)
-    txt = clean_visible_text(html)
-    if txt and not looks_blocked(txt):
-        return txt
-
-    # 2) selenium fallback if blocked/empty
-    html2 = fetch_html_selenium(url)
-    txt2 = clean_visible_text(html2)
-    if txt2:
-        if looks_blocked(txt2):
-            raise RuntimeError("blocked_or_captcha")
-        return txt2
-
-    raise RuntimeError("empty_text")
-
-
-# --------------------------------------------------
-# 4) Deterministic extraction / classification
-# --------------------------------------------------
-RISIKOKATEGORIEN = {
-    "A": "Working conditions, including occupational health and safety",
-    "B": "Child labour",
-    "C": "Modern slavery, including forced labour",
-    "D": "Community and indigenous peoples’ rights",
-    "E": "Excessive violence by private and public security forces",
-    "F": "Environmental risks with impact on human rights",
-    "G": "Business conduct in Conflict and High Risk Areas",
-    "H": "Serious human rights abuses",
-    "I": "Biodiversity",
-    "J": "Water",
-    "K": "Air",
-    "L": "Soil",
-    "M": "Waste, hazardous substances, and plant safety",
-}
-
-# Category keyword patterns (broad/stem-like)
-CAT_PATTERNS = {
-    "A": [r"\bunsafe\b", r"\bsafety\b", r"\binjur(y|ies)\b", r"\bfatalit(y|ies)\b", r"\baccident(s)?\b",
-          r"\bworking conditions?\b", r"\boccupational\b", r"\bhealth and safety\b", r"\bwage(s)?\b", r"\bovertime\b"],
-    "B": [r"\bchild labor\b", r"\bchild labour\b", r"\bunderage\b", r"\bminor(s)?\b", r"\bchildren\b.*\bwork\b"],
-    "C": [r"\bforced labor\b", r"\bforced labour\b", r"\bmodern slavery\b", r"\btraffick(ing|ed)\b",
-          r"\bdebt bondage\b", r"\bcoerc(ed|ion)\b"],
-    "D": [r"\bindigenous\b", r"\bcommunity\b", r"\bdisplacement\b", r"\bland rights?\b", r"\bfree prior informed consent\b",
-          r"\bFPIC\b", r"\bresettlement\b"],
-    "E": [r"\bsecurity forces?\b", r"\bpolice\b", r"\bmilitar(y|ized)\b", r"\bshoot(ing|ings)\b", r"\bviolent\b",
-          r"\bassault\b", r"\bexcessive force\b"],
-    "F": [r"\benvironment(al)?\b", r"\bimpact\b", r"\bdamage\b", r"\b污染\b", r"\bemissions?\b", r"\bclimate\b"],
-    "G": [r"\bconflict\b", r"\barmed\b", r"\bmilitia\b", r"\bhigh[- ]risk\b", r"\bsanction(s)?\b", r"\bwar\b"],
-    "H": [r"\btorture\b", r"\bkilling(s)?\b", r"\bextrajudicial\b", r"\bgenocide\b", r"\bcrimes against humanity\b"],
-    "I": [r"\bbiodiversity\b", r"\bhabitat\b", r"\bendangered\b", r"\bwildlife\b", r"\becosystem(s)?\b"],
-    "J": [r"\bwater\b", r"\briver(s)?\b", r"\bgroundwater\b", r"\baquifer\b", r"\bdrinking water\b", r"\bwetland(s)?\b"],
-    "K": [r"\bair\b", r"\bdust\b", r"\bparticulate\b", r"\bsmog\b", r"\bfume(s)?\b", r"\bSO2\b", r"\bNOx\b"],
-    "L": [r"\bsoil\b", r"\bland contamination\b", r"\btopsoil\b", r"\bheavy metal(s)?\b"],
-    "M": [r"\bwaste\b", r"\btoxic\b", r"\bhazard(ous)?\b", r"\btailing(s)?\b", r"\btailings dam\b",
-          r"\bspill(s|ed)?\b", r"\bcyanide\b", r"\bmercury\b", r"\barsenic\b", r"\bleak(s|ed)?\b"],
-}
-
-# Risk “harms” extraction patterns
-HARM_PATTERNS = [
-    (r"\bchild labou?r\b|\bunderage\b", "Child labour"),
-    (r"\bforced labou?r\b|\bmodern slavery\b|\btraffick(ing|ed)\b", "Forced labour / modern slavery"),
-    (r"\bdiscriminat(ion|e|ed)\b|\brace\b|\breligion\b|\bage\b", "Discrimination (age/race/religion etc.)"),
-    (r"\btrade union\b|\bunion\b|\bcollective bargaining\b|\bunion[- ]bust", "Trade union freedoms / collective bargaining"),
-    (r"\bpollut(ion|ed|ing)\b|\bcontaminat(e|ed|ion)\b|\btoxic\b|\bspill\b", "Pollution / contamination / toxic release"),
-    (r"\bdeforest(ation|ed|ing)\b", "Deforestation"),
-    (r"\bdisplacement\b|\bresettlement\b|\bland rights?\b", "Displacement / land-rights impacts"),
-    (r"\bviolence\b|\bshoot(ing|ings)\b|\bassault\b", "Violence / security-force abuse"),
-]
-
-SEVERITY_RULES = [
-    ("critical", [r"\bdeath(s)?\b", r"\bkilled\b", r"\bfatalit(y|ies)\b", r"\bmassive spill\b", r"\btailings dam\b", r"\bgenocide\b"]),
-    ("major",    [r"\bserious\b", r"\bsevere\b", r"\bmajor\b", r"\blarge\b.*\bspill\b", r"\bforced labou?r\b", r"\bchild labou?r\b"]),
-    ("moderate", [r"\bmoderate\b", r"\balleg(ation|ed|edly)\b", r"\blawsuit\b", r"\binvestigation\b", r"\bcomplaint\b"]),
-]
-
-COUNTRY_HINTS = [
-    # minimal, common set (extend if you want)
-    "germany","france","italy","spain","portugal","poland","sweden","norway","finland","uk","united kingdom",
-    "usa","united states","canada","mexico","brazil","argentina","chile","peru","colombia",
-    "china","india","indonesia","philippines","vietnam","thailand","malaysia","australia",
-    "south africa","zambia","drc","democratic republic of the congo","congo",
-    "rwanda","uganda","kenya","tanzania","mozambique","madagascar",
-    "russia","ukraine","turkey","iran","iraq","saudi arabia","uae"
-]
-
-STAGE_HINTS = [
-    (r"\bexploration\b|\bprospecting\b", "Exploration"),
-    (r"\bmine\b|\bmining\b|\bextraction\b|\bpit\b|\bunderground\b", "Mining / extraction"),
-    (r"\bprocessing\b|\bbeneficiation\b|\bconcentrat(e|ion)\b", "Processing / beneficiation"),
-    (r"\bsmelt(ing|er)\b|\brefin(ing|ery)\b", "Smelting / refining"),
-    (r"\bmanufactur(e|ing)\b|\bfabricat(e|ion)\b|\bproduction\b", "Manufacturing / production"),
-    (r"\brecycl(e|ing)\b|\bsecondary\b", "Recycling / secondary material"),
-]
-
-YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
-CAPITALISED_ORG_RE = re.compile(r"\b([A-Z][A-Za-z0-9&\-.]{2,}(?:\s+[A-Z][A-Za-z0-9&\-.]{2,}){0,3})\b")
-
-def expand_categories(raw_cats: str) -> str:
-    if not raw_cats or raw_cats.lower().startswith("not in text"):
-        return raw_cats
-    parts = [p.strip().upper() for p in raw_cats.replace(";", ",").split(",") if p.strip()]
-    seen, expanded = set(), []
-    for p in parts:
-        if p not in seen:
-            seen.add(p)
-            label = RISIKOKATEGORIEN.get(p, "")
-            expanded.append(f"{p} ({label})" if label else p)
-    return ", ".join(expanded)
-
-def mandatory_material_present(text: str, material: str) -> bool:
-    if not material or not text:
-        return False
-    return material.lower() in text.lower()
-
-def pick_categories(text: str) -> str:
-    t = text.lower()
-    found = []
-    for code, pats in CAT_PATTERNS.items():
-        for p in pats:
-            if re.search(p, t, flags=re.IGNORECASE):
-                found.append(code)
-                break
-    if not found:
-        return "Not in Text"
-    # keep stable order A..M
-    found_sorted = [c for c in "ABCDEFGHIJKLM" if c in set(found)]
-    return expand_categories(", ".join(found_sorted))
-
-def extract_harms(text: str) -> str:
-    t = text.lower()
-    harms = []
-    for pat, label in HARM_PATTERNS:
-        if re.search(pat, t, flags=re.IGNORECASE):
-            harms.append(label)
-    return "; ".join(dict.fromkeys(harms)) if harms else "Not in Text"
-
-def extract_years(text: str) -> str:
-    ys = YEAR_RE.findall(text or "")
-    ys = sorted(set(ys))
-    return ", ".join(ys) if ys else "Not in Text"
-
-def extract_countries(text: str) -> str:
-    t = (text or "").lower()
-    hits = []
-    for c in COUNTRY_HINTS:
-        if re.search(r"\b" + re.escape(c) + r"\b", t):
-            hits.append(c.title() if c.islower() else c)
-    hits = list(dict.fromkeys(hits))
-    return ", ".join(hits) if hits else "Not in Text"
-
-def extract_stage(text: str) -> str:
-    t = (text or "").lower()
-    for pat, label in STAGE_HINTS:
-        if re.search(pat, t):
-            return label
-    return "Not in Text"
-
-def extract_companies(text: str) -> str:
-    """
-    Very rough: pulls capitalised sequences and filters obvious non-company words.
-    You can improve later with spaCy when your Python version supports it.
-    """
-    if not text:
-        return "Not in Text"
-
-    blacklist = {
-        "The", "This", "That", "These", "Those", "Reuters", "Mongabay", "Guardian",
-        "Human", "Rights", "Environmental", "Report", "Reports", "Company", "Companies",
-        "Government", "Ministry", "Court", "University", "Institute", "Commission",
-        "January","February","March","April","May","June","July","August","September","October","November","December"
-    }
-
-    cands = CAPITALISED_ORG_RE.findall(text)
-    cleaned = []
-    for c in cands:
-        c = c.strip(" -–—,.;:()[]")
-        if not c:
-            continue
-        if c in blacklist:
-            continue
-        # discard if looks like a sentence start fragment
-        if len(c) < 3:
-            continue
-        # keep if contains Corp/Inc/AG/GmbH/SA/PLC/Ltd/LLC etc OR 2+ words
-        if re.search(r"\b(Inc|Corp|Corporation|Ltd|LLC|AG|GmbH|S\.A\.|SA|PLC|BV|NV)\b", c):
-            cleaned.append(c)
-        elif len(c.split()) >= 2:
-            cleaned.append(c)
-
-    cleaned = list(dict.fromkeys(cleaned))[:8]
-    return "; ".join(cleaned) if cleaned else "Not in Text"
-
-def extract_groups(text: str) -> str:
-    t = (text or "").lower()
-    groups = []
-    if re.search(r"\bworker(s)?\b|\blabou?rer(s)?\b|\bemployees?\b", t):
-        groups.append("Workers / employees")
-    if re.search(r"\bcommunity\b|\bresident(s)?\b|\bvillager(s)?\b", t):
-        groups.append("Local communities")
-    if re.search(r"\bindigenous\b", t):
-        groups.append("Indigenous peoples")
-    if re.search(r"\bchildren\b|\bchild\b|\bminor(s)?\b", t):
-        groups.append("Children")
-    if re.search(r"\becosystem(s)?\b|\bwildlife\b|\bhabitat\b|\briver\b|\bforest\b", t):
-        groups.append("Ecosystems / wildlife")
-    return "; ".join(dict.fromkeys(groups)) if groups else "Not in Text"
-
-def estimate_min_people(text: str) -> tuple[str, str]:
-    """
-    Conservative: only extract explicit integers with context.
-    Otherwise Not in Text.
-    """
-    if not text:
-        return "Not in Text", "Not in Text"
-
-    # examples: "100 workers", "2,000 residents"
-    m = re.search(r"\b(\d{1,3}(?:,\d{3})+|\d{1,7})\b\s+(workers?|employees?|people|residents?|villagers?)\b", text, flags=re.IGNORECASE)
-    if m:
-        num = m.group(1).replace(",", "")
-        return num, f"Found in text: '{m.group(0)}'"
-
-    return "Not in Text", "Not in Text"
-
-def severity_from_text(text: str, harms: str) -> tuple[str, str]:
-    t = (text or "").lower()
-
-    # explicit rules first
-    for sev, pats in SEVERITY_RULES:
-        for p in pats:
-            if re.search(p, t):
-                return sev, f"Matched pattern: {p}"
-
-    # if child/forced labour present -> at least major
-    if harms and harms != "Not in Text":
-        if "Child labour" in harms or "Forced labour" in harms:
-            return "major", "Harms include child/forced labour"
-
-    # otherwise moderate if allegations/lawsuit/investigation
-    if re.search(r"\balleg(ation|ed|edly)\b|\blawsuit\b|\binvestigation\b|\bcomplaint\b", t):
-        return "moderate", "Mentions allegations/lawsuit/investigation"
-
-    return "minor", "No strong severity markers found"
-
-
-def short_reason(text: str, max_sentences: int = 4) -> str:
-    if not text:
-        return "Not in Text"
-    # take first few non-empty sentences
-    parts = re.split(r"(?<=[.!?])\s+", text.strip())
-    parts = [p.strip() for p in parts if p.strip()]
-    if not parts:
-        return "Not in Text"
-    out = " ".join(parts[:max_sentences])
-    # clamp length
-    return out[:900]
-
-
-def analyse_artikel_deterministisch(rohstoff_name: str, artikeltext: str) -> list[str]:
-    """
-    Returns 13 fields in the exact order expected by your pipeline.
-    """
-    cats = pick_categories(artikeltext)
-    harms = extract_harms(artikeltext)
-    begr = short_reason(artikeltext, 3)
-
-    years = extract_years(artikeltext)
-    countries = extract_countries(artikeltext)
-
-    # "Ort(e)" not reliably extractable without NER -> keep Not in Text
-    locations = "Not in Text"
-
-    stage = extract_stage(artikeltext)
-    companies = extract_companies(artikeltext)
-    groups = extract_groups(artikeltext)
-
-    min_people, min_reason = estimate_min_people(artikeltext)
-
-    severity, sev_reason = severity_from_text(artikeltext, harms)
-
-    return [
-        cats,
-        harms,
-        begr,
-        years,
-        countries,
-        locations,
-        stage,
-        companies,
-        groups,
-        min_people,
-        min_reason,
-        severity,
-        sev_reason
-    ]
-
-
-# --------------------------------------------------
-# 5) CSV helpers
-# --------------------------------------------------
-def lese_links_aus_scrape_csv(rohstoff: str) -> list[str]:
-    fpath = SCRAPED_DIR / f"gescrapte_links_{rohstoff}.csv"
-    if not fpath.exists():
-        raise FileNotFoundError(f"Scrape CSV not found: {fpath}")
-
-    links = []
-    with fpath.open("r", encoding="utf-8-sig") as f:
-        r = csv.reader(f, delimiter=";")
-        next(r, None)
-        for row in r:
-            if row and row[0].strip():
-                links.append(row[0].strip())
-    return list(dict.fromkeys(links))
-
-def schreibe_analyse_csv(rohstoff: str, daten_zeilen: list[list[str]]):
-    out_path = OUTPUT_DIR / f"analyse_tabelle_{rohstoff}.csv"
-    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f, delimiter=";")
-        w.writerow([
-            "link",
-            "Risikokategorien (A–M)",
-            "Arten der Menschenrechts-/Umweltschädigungen",
-            "Begründung",
-            "Jahr(e)",
-            "Land/Länder",
-            "Ort(e)",
-            "Stufe der Rohstoffgewinnung",
-            "Involvierte Unternehmen",
-            "Betroffene Personengruppen/Ökosysteme",
-            "Mindestzahl der betroffenen Personen",
-            "Begründung Mindestzahl",
-            "Schwere",
-            "Begründung Schwere",
-        ])
-        for row in daten_zeilen:
-            if not WRITE_DEBUG:
-                all_not = all(
-                    (isinstance(x, str) and x.strip().lower() == "not in text")
-                    for x in row[1:]
-                )
-                if all_not:
-                    continue
-            w.writerow(row)
-    print(f"✅ Analyse geschrieben nach: {out_path}")
-
-
-# --------------------------------------------------
-# 6) Main process (ANALYZE ALL LINKS)
-# --------------------------------------------------
-if __name__ == "__main__":
-    lese_einstellungen()
-    print(f"SETTINGS:\n  rohst     = {rohst}\n  rawm      = {rawm}\n  max_datum = {max_datum}")
-
-    links = lese_links_aus_scrape_csv(rohst)
-    print("Links gefunden:", len(links))
-
-    rows, failed = [], []
-    analysed_count = 0
-    skipped_material = 0
-
-    for i, link in enumerate(links, start=1):
-        print(f"[{i}/{len(links)}] analysiere: {link}")
-
-        try:
-            artikel = url_zu_artikeltext(link)
-
-            # =========================================================
-            # ✅ MANDATORY MATERIAL GATE
-            # Skip if required material is NOT in the extracted body text
-            # =========================================================
-            if rawm and rawm.strip() and not mandatory_material_present(artikel, rawm):
-                skipped_material += 1
-                print("  ⛔ skipped (required material not in body text)")
-                continue
-
-            analysed = analyse_artikel_deterministisch(rawm, artikel)
-            cleaned = [x.replace("\n", " ").replace("\r", " ").strip(" -") if isinstance(x, str) else x for x in analysed]
-
-            rows.append([link] + cleaned)
-            analysed_count += 1
-            print("  ✅ done")
-
-            # small pause to reduce blocks
-            time.sleep(1.2)
-
-        except Exception as e:
-            print("  ❌ error:", e)
-            failed.append(link)
-
-            # backoff a bit
-            time.sleep(2.0)
-
-    schreibe_analyse_csv(rohst, rows)
-
-    # Write failed URLs
-    if failed:
-        fail_path = OUTPUT_DIR / f"fehlgeschlagene_urls_analyse_{rohst}.csv"
-        with fail_path.open("w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f, delimiter=";")
-            w.writerow(["link"])
-            for u in failed:
-                w.writerow([u])
-        print(f"⚠️ Fehlgeschlagen: {len(failed)} → {fail_path}")
-
-    print(f"\nDONE.\n  Analysed: {analysed_count}\n  Skipped (material missing): {skipped_material}\n  Failed: {len(failed)}")
+    print(f"\n✅ Done. Collected total: {collected_total}\nOutput:\n{out_path}")
