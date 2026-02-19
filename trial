@@ -1,9 +1,8 @@
-ROOT: C:\Users\SHTANDO\Desktop\chatbot
-INPUT_DIR: C:\Users\SHTANDO\Desktop\chatbot\input
-Found .msg files: 0
-RUN_DIR: C:\Users\SHTANDO\Desktop\chatbot\_exports\collect_att_20260219_190027
-Done. MSG ok=0 fail=0 | attachments saved=0
-Manifest: C:\Users\SHTANDO\Desktop\chatbot\_exports\collect_att_20260219_190027\manifest.csv
-Errors: C:\Users\SHTANDO\Desktop\chatbot\_exports\collect_att_20260219_190027\errors.log
-PDFs folder: C:\Users\SHTANDO\Desktop\chatbot\_exports\collect_att_20260219_190027\pdfs
-Images folder: C:\Users\SHTANDO\Desktop\chatbot\_exports\collect_att_20260219_190027\images
+from pathlib import Path
+
+p = Path(r"C:\Users\SHTANDO\Desktop\chatbot\input")
+print("Exists:", p.exists())
+print("Files (top level):", [x.name for x in p.iterdir()] if p.exists() else "N/A")
+
+print("MSG count recursive:", len(list(p.rglob("*.msg"))) if p.exists() else 0)
+print("MSG count recursive (upper-case):", len(list(p.rglob("*.MSG"))) if p.exists() else 0)
