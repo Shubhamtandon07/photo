@@ -1,566 +1,299 @@
 # -*- coding: utf-8 -*-
-# ============================================================
-# KI Risiko – HIGH RECALL material-aware HR/ENV scraper
-# Reads:
-#   C:\Users\SHTANDO\Desktop\KI Risko\Textdoks_für_Einstellungen_der_Suche\
-#       Einstellungen_Analyse.csv
-#       Bekannte_Seiten.csv
-#       Schlagwörter.csv
-# Writes:
-#   C:\Users\SHTANDO\Desktop\KI Risko\gescrapte_Artikel-Links\gescrapte_links_<rohst>.csv
-#
-# Key behavior:
-#   Phase 1: search your sites + extra trusted sites (high recall, minimal rejects)
-#   Phase 2: if <5 total, search web-wide until 10 total
-#   Skips: PDFs, obvious social media (LinkedIn allowed), jobs/careers, duplicates
-# ============================================================
+"""
+ANALYSE-SKRIPT mit Risikokategorien (A–M)
+reads:  C:/Users/SHTANDO/Desktop/KI Risko/gescrapte_Artikel-Links/gescrapte_links_<rohst>.csv
+writes: C:/Users/SHTANDO/Desktop/KI Risko/Analyse_Tabelle/analyse_tabelle_<rohst>.csv
+"""
 
+import os
 import csv
-import time
-import re
 import random
 from pathlib import Path
-from urllib.parse import quote_plus, urlparse
-
-import dateparser
+import openai
 from bs4 import BeautifulSoup
-
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-
-# =========================
-# 1) PATHS / CONFIG
-# =========================
+# --------------------------------------------------
+# 0) Paths
+# --------------------------------------------------
 PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
 SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
 SCRAPED_DIR = PROJECT_ROOT / "gescrapte_Artikel-Links"
-SCRAPED_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR = PROJECT_ROOT / "Analyse_Tabelle"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-EINSTELLUNGEN_CSV = SETTINGS_DIR / "Einstellungen_Analyse.csv"
-BEKANNTE_SEITEN_CSV = SETTINGS_DIR / "Bekannte_Seiten.csv"
-SCHLAGWORT_CSV = SETTINGS_DIR / "Schlagwörter.csv"
+WRITE_DEBUG = True  # keep rows even if all “Not in Text”
 
-HEADLESS = False
-MAX_DDG_PAGES = 2
+# --------------------------------------------------
+# 1) OpenAI setup
+# --------------------------------------------------
+client = openai.AzureOpenAI(
+    api_version="2024-06-01",
+    azure_endpoint="https://genai-nexus.api.corpinter.net/apikey/",
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
 
-# No per-site hard cap (as you requested)
-# But keep runtime sane by limiting queries per site
-QUERIES_PER_SITE = 6
-
-# Fallback behavior
-MIN_AFTER_SITES = 5
-FALLBACK_TARGET_TOTAL = 10
-
-# Pauses
-PAUSE_BETWEEN_QUERIES_SEC = (1.5, 3.5)
-PAUSE_BETWEEN_SITES_SEC = (2.0, 5.0)
-
-# =========================
-# 2) RISK TERMS (broad / stem-like)
-# =========================
-RISK_PATTERNS = [
-    r"\bhuman rights?\b",
-    r"\bviolat(e|ed|ion|ions)\b",
-    r"\babuse(s|d)?\b",
-    r"\bforced\s+labou?r\b",
-    r"\bchild\s+labou?r\b",
-    r"\bmodern\s+slavery\b",
-    r"\btraffick(ing|ed)?\b",
-    r"\bexploitation\b",
-    r"\bunsafe\b",
-    r"\bhazard(ous)?\b",
-    r"\bdiscriminat(ion|e|ed)\b",
-    r"\bunion\b",
-    r"\bcollective\s+bargaining\b",
-    r"\bunion[-\s]?bust(ing|er|ed)?\b",
-    r"\bpollut(ion|ed|ing)\b",
-    r"\bcontaminat(e|ed|ion)\b",
-    r"\btoxic\b",
-    r"\bspill(s|ed)?\b",
-    r"\btailing(s)?\b",
-    r"\bwaste\b",
-    r"\bdeforest(ation|ed|ing)\b",
-    r"\bconflict\b",
-    r"\bprotest(s|ed|ing)?\b",
-    r"\blawsuit(s)?\b",
-    r"\balleg(ation|ed|edly)\b",
-]
-
-RISK_RE = re.compile("|".join(RISK_PATTERNS), flags=re.IGNORECASE)
-
-
-# =========================
-# 3) EXTRA TRUSTED SITES (added by me)
-# =========================
-EXTRA_TRUSTED_SITES = [
-    "reuters.com",
-    "apnews.com",
-    "theguardian.com",
-    "ft.com",
-    "bloomberg.com",
-    "wsj.com",
-    "aljazeera.com",
-    "bbc.com",
-    "dw.com",
-    "lemonde.fr",
-    "spiegel.de",
-    "handelsblatt.com",
-    "business-humanrights.org",
-    "amnesty.org",
-    "hrw.org",
-    "oecd.org",
-    "worldbank.org",
-    "un.org",
-    "ilo.org",
-    "epa.gov",
-    "europa.eu",
-    "ec.europa.eu",
-    "ustr.gov",
-    "state.gov",
-    "mongabay.com",
-    "news.mongabay.com",
-]
-
-
-# =========================
-# 4) READ SETTINGS
-# =========================
-rohst = rawm = max_datum_str = None
+# --------------------------------------------------
+# 2) Read settings
+# --------------------------------------------------
+rohst = rawm = max_datum = None
+seitenumfang = 3
 
 def lese_einstellungen():
-    global rohst, rawm, max_datum_str
-
-    if not EINSTELLUNGEN_CSV.exists():
-        raise FileNotFoundError(f"Settings file not found: {EINSTELLUNGEN_CSV}")
-
-    with EINSTELLUNGEN_CSV.open("r", encoding="utf-8-sig", newline="") as f:
+    global rohst, rawm, max_datum, seitenumfang
+    settings_path = SETTINGS_DIR / "Einstellungen_Analyse.csv"
+    with settings_path.open("r", encoding="utf-8-sig") as f:
         rows = list(csv.reader(f, delimiter=","))
-
     def get_row(idx, default=""):
-        if len(rows) > idx and len(rows[idx]) > 0:
-            return (rows[idx][0] or "").strip()
-        return default
+        return rows[idx][0].strip() if len(rows) > idx and len(rows[idx]) > 0 else default
+    rohst        = get_row(5, "Stahl")
+    rawm         = get_row(8, "Steel")
+    max_datum    = get_row(11, "20.11.2020")
+    seitenumfang = int(get_row(14, "3") or "3")
 
-    rohst = get_row(5, "Stahl")
-    rawm = get_row(8, "Steel")
-    max_datum_str = get_row(11, "20.11.2020")
-
-    max_date = dateparser.parse(max_datum_str, languages=["de", "en"]) if max_datum_str else None
-    return max_date.date() if max_date else None
-
-
-# =========================
-# 5) LOAD CSV LISTS
-# =========================
-def lese_einfache_liste(pfad: Path, delimiter=",") -> list[str]:
-    if not pfad.exists():
-        return []
-    items = []
-    with pfad.open("r", encoding="utf-8-sig", newline="") as f:
-        r = csv.reader(f, delimiter=delimiter)
-        for row in r:
-            for cell in row:
-                v = (cell or "").strip()
-                if v:
-                    items.append(v.lower())
-    # uniq keep order
-    seen = set()
-    out = []
-    for x in items:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-
-# =========================
-# 6) SELENIUM DRIVER
-# =========================
-def make_driver() -> webdriver.Chrome:
+# --------------------------------------------------
+# 3) Chrome driver
+# --------------------------------------------------
+def make_driver():
     opts = Options()
-    if HEADLESS:
-        opts.add_argument("--headless=new")
+    opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--enable-javascript")
-    opts.add_argument("--start-maximized")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    return webdriver.Chrome(options=opts)
-
-
-# =========================
-# 7) DDG SEARCH + SCRAPE
-# =========================
-def ddg_search_url(query: str) -> str:
-    return "https://duckduckgo.com/?q=" + quote_plus(query) + "&kp=1&ia=web"
-
-def scrape_ddg_results(driver: webdriver.Chrome, search_url: str, max_pages: int = MAX_DDG_PAGES) -> list[dict]:
-    items = []
     try:
-        driver.get(search_url)
+        return webdriver.Chrome(options=opts)
     except Exception:
-        return items
+        opts.add_argument("--headless")
+        return webdriver.Chrome(options=opts)
 
-    pages_seen = 0
-    while pages_seen < max_pages:
-        time.sleep(2.5)
-
-        try:
-            WebDriverWait(driver, 8).until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'article[data-testid="result"]'))
-            )
-        except Exception:
-            break
-
-        articles = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="result"]')
-        for art in articles:
-            try:
-                link_el = art.find_element(By.CSS_SELECTOR, "a[data-testid='result-title-a']")
-                url = link_el.get_attribute("href") or ""
-                title = (link_el.text or "").strip()
-                if not url or "duckduckgo.com" in url:
-                    continue
-            except Exception:
-                continue
-
-            snippet = ""
-            try:
-                snippet = (art.find_element(By.CSS_SELECTOR, "div[data-testid='result-snippet']").text or "").strip()
-            except Exception:
-                pass
-
-            date_txt = ""
-            try:
-                date_txt = (art.find_element(By.CSS_SELECTOR, "span.MILR5XIVy9h75WrLvKiq").text or "").strip()
-            except Exception:
-                pass
-
-            items.append({"url": url, "title": title, "snippet": snippet, "date_txt": date_txt})
-
-        # more results
-        try:
-            more_btn = WebDriverWait(driver, 3).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "#more-results"))
-            )
-            driver.execute_script("arguments[0].scrollIntoView(true);", more_btn)
-            time.sleep(0.8)
-            more_btn.click()
-            pages_seen += 1
-        except Exception:
-            break
-
-    return items
-
-
-# =========================
-# 8) FILTERS (EASED)
-# =========================
-SOCIAL_BAD = [
-    "facebook.com", "instagram.com", "tiktok.com", "youtube.com",
-    "twitter.com", "x.com", "reddit.com",
-]
-# allow linkedin because you said critical linkedin can be useful
-ALLOW_LIST = ["linkedin.com"]
-
-BAD_PATH_HINTS = [
-    "/jobs", "/careers", "/career", "/job/", "/vacancies", "/vacancy",
-    "/investor", "/investors", "/ir/", "/financial", "/finance", "/stock",
-    "/press-release", "/pressreleases", "/media-kit",
-]
-
-def is_pdf(url: str) -> bool:
-    u = url.lower().split("?")[0]
-    return u.endswith(".pdf")
-
-def is_bad_social_domain(domain: str) -> bool:
-    d = domain.lower()
-    if any(a in d for a in ALLOW_LIST):
-        return False
-    return any(b in d for b in SOCIAL_BAD)
-
-def is_bad_path(url: str) -> bool:
-    u = url.lower()
-    return any(h in u for h in BAD_PATH_HINTS)
-
-def material_present_soft(text: str, material: str) -> bool:
-    """Soft check: accept if material appears, but do not reject if absent."""
-    if not material:
-        return False
-    return material.lower() in (text or "").lower()
-
-def risk_present_soft(text: str) -> bool:
-    """Soft check: accept if risk terms appear, but do not reject if absent."""
-    return bool(RISK_RE.search(text or ""))
-
-def score_hit(title: str, snippet: str, domain: str, material: str) -> int:
-    """Higher score = more likely relevant; used for ordering only."""
-    text = f"{title} {snippet}".lower()
-    s = 0
-    if material and material.lower() in text:
-        s += 3
-    if risk_present_soft(text):
-        s += 3
-    # domain credibility heuristic
-    if domain.endswith(".gov") or domain.endswith(".int") or domain.endswith(".org"):
-        s += 1
-    if "business-humanrights" in domain:
-        s += 2
-    return s
-
-def date_ok(date_txt: str, min_date) -> bool:
-    if not min_date:
-        return True
-    if not date_txt:
-        return True
-    dt = dateparser.parse(date_txt, languages=["de", "en"])
-    if not dt:
-        return True
-    return dt.date() >= min_date
-
-
-def rand_sleep(a_b: tuple[float, float]) -> None:
-    time.sleep(random.uniform(a_b[0], a_b[1]))
-
-
-# =========================
-# 9) QUERY BUILDERS
-# =========================
-def build_site_queries(domain: str, material: str, schlagwoerter: list[str]) -> list[str]:
-    # Use your Schlagwörter, but do not require exact matches.
-    # Also include a few broad HR/ENV terms to avoid thin results.
-    base = [
-        "human rights", "abuse", "violation", "forced labor", "child labor",
-        "pollution", "contamination", "spill", "toxic", "lawsuit", "allegations",
-        "discrimination", "trade union",
-    ]
-    kws = schlagwoerter[:6] if schlagwoerter else []
-    # build variants
-    queries = []
-
-    # 1) strong material + broad risks
-    queries.append(f"site:{domain} {material} " + " ".join(base[:6]))
-    # 2) material + env
-    queries.append(f"site:{domain} {material} " + " ".join(base[6:11]))
-    # 3) material + labour-rights
-    queries.append(f"site:{domain} {material} discrimination trade union union rights")
-
-    # 4-6) material + your keywords (first few)
-    for k in kws[:3]:
-        k_clean = k.replace("+", " ")
-        queries.append(f"site:{domain} {material} {k_clean}")
-
-    # if still fewer, add non-material variant to catch titles missing material
-    queries.append(f"site:{domain} " + " ".join(base[:8]))
-
-    # uniq keep order
-    seen = set()
-    out = []
-    for q in queries:
-        q = re.sub(r'[\u201C\u201D\"\']', "", q).strip()
-        if q and q not in seen:
-            seen.add(q)
-            out.append(q)
-    return out[:QUERIES_PER_SITE]
-
-def build_fallback_queries(material: str, schlagwoerter: list[str]) -> list[str]:
-    base = [
-        f"{material} human rights violation",
-        f"{material} forced labor allegations",
-        f"{material} child labor supply chain",
-        f"{material} pollution contamination spill",
-        f"{material} discrimination trade union rights",
-        f"{material} lawsuit environmental damage",
-    ]
-    for k in (schlagwoerter[:6] if schlagwoerter else []):
-        base.append(f"{material} {k.replace('+',' ')}")
-    # uniq
-    seen, out = set(), []
-    for q in base:
-        q = re.sub(r'[\u201C\u201D\"\']', "", q).strip()
-        if q and q not in seen:
-            seen.add(q)
-            out.append(q)
-    return out
-
-
-# =========================
-# 10) MAIN
-# =========================
-if __name__ == "__main__":
-    min_date = lese_einstellungen()
-    print(f"SETTINGS: rohst={rohst} | rawm={rawm} | max_datum={max_datum_str}")
-
-    seiten_user = lese_einfache_liste(BEKANNTE_SEITEN_CSV, delimiter=",")
-    schlagwoerter = lese_einfache_liste(SCHLAGWORT_CSV, delimiter=",")
-
-    # Merge: your sites first, then extra
-    merged_sites = []
-    seen = set()
-    for s in seiten_user + EXTRA_TRUSTED_SITES:
-        s = (s or "").strip().lower()
-        if not s:
-            continue
-        # strip leading www.
-        s = s[4:] if s.startswith("www.") else s
-        if s not in seen:
-            seen.add(s)
-            merged_sites.append(s)
-
-    print(f"Sites (user+extra): {len(merged_sites)} | user={len(seiten_user)} | extra={len(merged_sites)-len(seiten_user)}")
-
-    out_path = SCRAPED_DIR / f"gescrapte_links_{rohst}.csv"
-
-    # global dedupe across everything
-    global_seen_urls = set()
-
-    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
-        csv.writer(f, delimiter=";").writerow(["url", "datum", "site", "query", "title", "snippet", "score"])
-
-    driver = make_driver()
-    collected_total = 0
-
+# --------------------------------------------------
+# 4) Extract article text
+# --------------------------------------------------
+def extract_with_gpt(full_text: str, fallback: str = "") -> str:
+    prompt = (
+        "Extract only the main news/article body from this webpage text. "
+        "Ignore navigation, ads, cookie banners, and unrelated content.\n\n" + full_text
+    )
     try:
-        # -----------------------------
-        # Phase 1: site-based
-        # -----------------------------
-        for idx_site, domain in enumerate(merged_sites, start=1):
-            print(f"\n🌐 Site {idx_site}/{len(merged_sites)}: {domain}")
-            queries = build_site_queries(domain, rawm, schlagwoerter)
-            print(f"   → queries: {len(queries)}")
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You extract clean article text from messy HTML."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return fallback or full_text
 
-            accepted_for_site = 0
-
-            for q_i, q in enumerate(queries, start=1):
-                print(f"   🔎 {q_i}/{len(queries)} | collected so far = {collected_total}")
-                url_search = ddg_search_url(q)
-
-                results = scrape_ddg_results(driver, url_search, max_pages=MAX_DDG_PAGES)
-                print(f"      → raw hits: {len(results)}")
-
-                # score + sort (do not over-reject)
-                scored = []
-                for r in results:
-                    u = r["url"]
-                    if not u:
-                        continue
-                    if u in global_seen_urls:
-                        continue
-
-                    dom = urlparse(u).netloc.lower()
-                    if is_pdf(u):
-                        continue
-                    if is_bad_social_domain(dom):
-                        continue
-                    if is_bad_path(u):
-                        continue
-                    if not date_ok(r.get("date_txt", ""), min_date):
-                        continue
-
-                    sc = score_hit(r.get("title",""), r.get("snippet",""), dom, rawm)
-                    scored.append((sc, r))
-
-                scored.sort(key=lambda x: x[0], reverse=True)
-
-                for sc, r in scored:
-                    u = r["url"]
-                    if u in global_seen_urls:
-                        continue
-
-                    # EASED acceptance:
-                    # - accept even if material/risk missing in snippet/title
-                    # - BUT prefer those with some signal (score>=1) unless site is very thin
-                    # If site yields nothing, accept score==0 too (still better than 0 results)
-                    if sc == 0 and accepted_for_site >= 3:
-                        continue
-
-                    global_seen_urls.add(u)
-                    collected_total += 1
-                    accepted_for_site += 1
-
-                    with out_path.open("a", newline="", encoding="utf-8-sig") as f:
-                        csv.writer(f, delimiter=";").writerow([
-                            u,
-                            r.get("date_txt",""),
-                            domain,
-                            q,
-                            r.get("title",""),
-                            r.get("snippet",""),
-                            sc
-                        ])
-
-                    print(f"      ✅ accepted | total={collected_total} | site={accepted_for_site} | score={sc} | {r.get('title','')[:80]}")
-
-                rand_sleep(PAUSE_BETWEEN_QUERIES_SEC)
-
-            print(f"   → accepted from site: {accepted_for_site}")
-            rand_sleep(PAUSE_BETWEEN_SITES_SEC)
-
-        # -----------------------------
-        # Phase 2: fallback web-wide
-        # -----------------------------
-        if collected_total < MIN_AFTER_SITES:
-            print(f"\n⚠️ Only {collected_total} collected after sites. Starting web-wide fallback…")
-            fallback_queries = build_fallback_queries(rawm, schlagwoerter)
-
-            for q_i, q in enumerate(fallback_queries, start=1):
-                if collected_total >= FALLBACK_TARGET_TOTAL:
-                    break
-
-                print(f"🌍 Fallback {q_i}/{len(fallback_queries)} | collected so far = {collected_total}")
-                results = scrape_ddg_results(driver, ddg_search_url(q), max_pages=MAX_DDG_PAGES)
-                print(f"   → raw hits: {len(results)}")
-
-                # in fallback we accept only if there is at least SOME signal in title/snippet
-                for r in results:
-                    if collected_total >= FALLBACK_TARGET_TOTAL:
-                        break
-
-                    u = r["url"]
-                    if not u or u in global_seen_urls:
-                        continue
-
-                    dom = urlparse(u).netloc.lower()
-                    if is_pdf(u):
-                        continue
-                    if is_bad_social_domain(dom):
-                        continue
-                    if is_bad_path(u):
-                        continue
-
-                    text = f"{r.get('title','')} {r.get('snippet','')}".lower()
-                    # fallback needs at least material OR risk in snippet/title
-                    if not (material_present_soft(text, rawm) or risk_present_soft(text)):
-                        continue
-
-                    global_seen_urls.add(u)
-                    collected_total += 1
-
-                    sc = score_hit(r.get("title",""), r.get("snippet",""), dom, rawm)
-
-                    with out_path.open("a", newline="", encoding="utf-8-sig") as f:
-                        csv.writer(f, delimiter=";").writerow([
-                            u,
-                            r.get("date_txt",""),
-                            "WEB_WIDE",
-                            q,
-                            r.get("title",""),
-                            r.get("snippet",""),
-                            sc
-                        ])
-
-                    print(f"   ✅ fallback accepted | total={collected_total} | score={sc} | {r.get('title','')[:80]}")
-
-                rand_sleep(PAUSE_BETWEEN_QUERIES_SEC)
-
-    finally:
+def url_zu_artikeltext(url: str) -> str:
+    d = make_driver()
+    try:
+        d.get(url)
         try:
-            driver.quit()
+            WebDriverWait(d, 5).until(EC.presence_of_element_located((By.TAG_NAME, "article")))
         except Exception:
             pass
+        html = d.page_source
+    finally:
+        try: d.quit()
+        except Exception: pass
 
-    print(f"\n✅ Done. Collected total: {collected_total}\nOutput:\n{out_path}")
+    soup = BeautifulSoup(html, "html.parser")
+    art = soup.find("article")
+    if art:
+        return art.get_text(separator="\n", strip=True)
+
+    body = soup.find("body")
+    if body:
+        text = body.get_text(separator="\n", strip=True)
+        return extract_with_gpt(text, text)
+
+    text = soup.get_text(separator="\n", strip=True)
+    return extract_with_gpt(text, text)
+
+# --------------------------------------------------
+# 5) GPT analysis with category codes (with labels)
+# --------------------------------------------------
+RISIKOKATEGORIEN = {
+    "A": "Working conditions, including occupational health and safety",
+    "B": "Child labour",
+    "C": "Modern slavery, including forced labour",
+    "D": "Community and indigenous peoples’ rights",
+    "E": "Excessive violence by private and public security forces",
+    "F": "Environmental risks with impact on human rights",
+    "G": "Business conduct in Conflict and High Risk Areas",
+    "H": "Serious human rights abuses",
+    "I": "Biodiversity",
+    "J": "Water",
+    "K": "Air",
+    "L": "Soil",
+    "M": "Waste, hazardous substances, and plant safety",
+}
+
+def expand_categories(raw_cats: str) -> str:
+    """
+    Converts e.g. 'A, F, J' → 'A (Working conditions), F (Environmental risks with impact on human rights), J (Water)'
+    Keeps order and skips duplicates.
+    """
+    if not raw_cats or raw_cats.lower().startswith("not in text"):
+        return raw_cats
+
+    parts = [p.strip().upper() for p in raw_cats.replace(";", ",").split(",") if p.strip()]
+    seen, expanded = set(), []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            label = RISIKOKATEGORIEN.get(p, "")
+            if label:
+                expanded.append(f"{p} ({label})")
+            else:
+                expanded.append(p)
+    return ", ".join(expanded)
+
+def analyse_artikel(rohstoff_name: str, artikeltext: str, temperature: float = 0.1) -> list[str]:
+    prompt = f"""
+Analysiere den folgenden Zeitungsartikel über den Rohstoff "{rohstoff_name}" 
+und beantworte GENAU 13 Punkte. Wenn eine Information fehlt, schreibe "Not in Text".
+
+1) Zutreffende Risikokategorien (Buchstaben A–M, z. B. "A, F, J")
+2) Arten der Menschenrechts-/Umweltschädigungen
+3) Kurze Begründung (max. 4 Sätze)
+4) Jahr(e)
+5) Land/Länder
+6) Ort(e)
+7) Stufe der Rohstoffgewinnung
+8) Involvierte Unternehmen
+9) Betroffene Personengruppen/Ökosysteme
+10) Mindestzahl der betroffenen Personen (Integer)
+11) Begründung für die Mindestzahl (1–2 Sätze)
+12) Schwere (minor/moderate/major/critical)
+13) Kurze Begründung für die Schwere
+
+Artikel:
+{artikeltext}
+"""
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "Du bist ein Menschenrechts- und Nachhaltigkeitsexperte."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=temperature
+    )
+    txt = resp.choices[0].message.content.strip()
+    lines = [ln.strip() for ln in txt.split("\n") if ln.strip()]
+
+    # fill missing lines if GPT returned fewer
+    if len(lines) < 13:
+        lines += ["Not in Text"] * (13 - len(lines))
+    lines = lines[:13]
+
+    # expand category names in line 1
+    lines[0] = expand_categories(lines[0])
+    return lines
+
+# --------------------------------------------------
+# 6) CSV helpers
+# --------------------------------------------------
+def lese_links_aus_scrape_csv(rohstoff: str) -> list[str]:
+    fpath = SCRAPED_DIR / f"gescrapte_links_{rohstoff}.csv"
+    if not fpath.exists():
+        raise FileNotFoundError(f"Scrape CSV not found: {fpath}")
+    links = []
+    with fpath.open("r", encoding="utf-8-sig") as f:
+        r = csv.reader(f, delimiter=";")
+        next(r, None)
+        for row in r:
+            if row and row[0].strip():
+                links.append(row[0].strip())
+    return list(dict.fromkeys(links))
+
+def schreibe_analyse_csv(rohstoff: str, daten_zeilen: list[list[str]]):
+    out_path = OUTPUT_DIR / f"analyse_tabelle_{rohstoff}.csv"
+    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow([
+            "link",
+            "Risikokategorien (A–M)",
+            "Arten der Menschenrechts-/Umweltschädigungen",
+            "Begründung",
+            "Jahr(e)",
+            "Land/Länder",
+            "Ort(e)",
+            "Stufe der Rohstoffgewinnung",
+            "Involvierte Unternehmen",
+            "Betroffene Personengruppen/Ökosysteme",
+            "Mindestzahl der betroffenen Personen",
+            "Begründung Mindestzahl",
+            "Schwere",
+            "Begründung Schwere",
+        ])
+        for row in daten_zeilen:
+            # Skip rows where all fields are "Not in Text"
+            if not WRITE_DEBUG:
+                all_not = all(
+                    (isinstance(x, str) and x.strip().lower() == "not in text")
+                    for x in row[1:]
+                )
+                if all_not:
+                    continue
+            w.writerow(row)
+    print(f"✅ Analyse geschrieben nach: {out_path}")
+
+# --------------------------------------------------
+# 7) Main process
+# --------------------------------------------------
+if __name__ == "__main__":
+    lese_einstellungen()
+    print(f"SETTINGS:\n  rohst     = {rohst}\n  rawm      = {rawm}\n  max_datum = {max_datum}")
+
+    links = lese_links_aus_scrape_csv(rohst)
+    print("Links gefunden:", len(links))
+
+    # Pick 20 random links for test
+    test_links = random.sample(links, min(20, len(links)))
+    print(f"Wir testen diese {len(test_links)} zufälligen Links:")
+    for l in test_links:
+        print(" -", l)
+
+    rows, failed = [], []
+
+    for i, link in enumerate(test_links, start=1):
+        print(f"[{i}/{len(test_links)}] analysiere: {link}")
+        try:
+            artikel = url_zu_artikeltext(link)
+
+            # =========================================================
+            # ✅ MANDATORY MATERIAL GATE (ONLY CHANGE)
+            # Skip if required material is NOT in the extracted body text
+            # =========================================================
+            if rawm and rawm.strip() and (rawm.lower() not in (artikel or "").lower()):
+                print("  ⛔ skipped (required material not in body text)")
+                continue
+
+            analysed = analyse_artikel(rawm, artikel, temperature=0.1)
+            # Clean and normalize all text values
+            cleaned = [x.replace("\n", " ").replace("\r", " ").strip(" -") for x in analysed]
+            rows.append([link] + cleaned)
+            print("  ✅ done")
+        except Exception as e:
+            print("  ❌ error:", e)
+            failed.append(link)
+
+    schreibe_analyse_csv(rohst, rows)
+
+    # Write failed URLs
+    if failed:
+        fail_path = OUTPUT_DIR / f"fehlgeschlagene_urls_analyse_{rohst}.csv"
+        with fail_path.open("w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f, delimiter=";")
+            w.writerow(["link"])
+            for u in failed:
+                w.writerow([u])
+        print(f"⚠️ Fehlgeschlagen: {len(failed)} → {fail_path}")
