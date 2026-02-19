@@ -1,23 +1,13 @@
-!python -m pip install -U pdfplumber python-docx pillow
-!python -m pip install -U pytesseract
-
+!python -m pip install -U pdfplumber python-docx
 from pathlib import Path
 from datetime import datetime
 import re
-
+import statistics
 import pdfplumber
+
 from docx import Document
 from docx.shared import Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-from PIL import Image
-
-# Optional OCR (works only if pytesseract + Tesseract installed)
-try:
-    import pytesseract
-    OCR_OK = True
-except Exception:
-    OCR_OK = False
 
 
 # =========================
@@ -25,13 +15,10 @@ except Exception:
 # =========================
 RUN_DIR = Path(r"PASTE_YOUR_RUN_DIR_HERE")  # e.g. ...\_exports\collect_att_20260219_191939
 PDF_DIR = RUN_DIR / "pdfs"
-IMG_DIR = RUN_DIR / "images"
 
 OUT_DIR = RUN_DIR / f"docx_extracted_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 OUT_PDF = OUT_DIR / "from_pdfs"
-OUT_IMG = OUT_DIR / "from_images"
 OUT_PDF.mkdir(parents=True, exist_ok=True)
-OUT_IMG.mkdir(parents=True, exist_ok=True)
 
 
 # =========================
@@ -57,36 +44,196 @@ def add_heading_meta(doc: Document, title: str, source_path: Path):
     p.add_run(str(source_path))
     doc.add_paragraph("")
 
-def add_text_block(doc: Document, text: str):
-    text = (text or "").strip()
-    if not text:
-        return
-    for line in text.splitlines():
-        line = line.strip()
-        if line:
-            doc.add_paragraph(line)
+def add_paragraphs(doc: Document, text_lines):
+    for ln in text_lines:
+        ln = (ln or "").strip()
+        if ln:
+            doc.add_paragraph(ln)
 
-def add_table(doc: Document, table_data):
+def add_word_table(doc: Document, rows, cols, style="Table Grid"):
+    t = doc.add_table(rows=rows, cols=cols)
+    t.style = style
+    return t
+
+def normalize_spaces(s: str) -> str:
+    s = (s or "")
+    s = s.replace("\u00a0", " ")  # non-breaking space
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def cluster_words_into_lines(words, y_tol=3.0):
     """
-    table_data: list of rows, each row is list of cells (strings)
+    Group words into lines by their top coordinate (y).
+    Returns list of lines; each line is list of word dicts, sorted by x0.
     """
-    if not table_data or not isinstance(table_data, list):
+    if not words:
+        return []
+
+    # sort by y then x
+    words = sorted(words, key=lambda w: (w["top"], w["x0"]))
+
+    lines = []
+    cur = [words[0]]
+    cur_y = words[0]["top"]
+
+    for w in words[1:]:
+        if abs(w["top"] - cur_y) <= y_tol:
+            cur.append(w)
+        else:
+            cur = sorted(cur, key=lambda z: z["x0"])
+            lines.append(cur)
+            cur = [w]
+            cur_y = w["top"]
+
+    cur = sorted(cur, key=lambda z: z["x0"])
+    lines.append(cur)
+    return lines
+
+def detect_two_column_split(words, page_width, min_gap=35, min_share_each_side=0.25):
+    """
+    Heuristic: detect a vertical 'valley' (gap) that splits words into left and right columns.
+    Returns split_x or None.
+    """
+    if not words:
+        return None
+
+    xs = [w["x0"] for w in words if isinstance(w.get("x0"), (int, float))]
+    if len(xs) < 30:
+        return None
+
+    # Candidate split is around middle, but we check for emptiness zone near it.
+    mid = page_width / 2.0
+
+    # collect word bounding boxes
+    boxes = [(w["x0"], w["x1"]) for w in words if isinstance(w.get("x0"), (int,float)) and isinstance(w.get("x1"), (int,float))]
+    if not boxes:
+        return None
+
+    # test several split candidates around center
+    candidates = [mid + d for d in (-80, -40, -20, 0, 20, 40, 80)]
+    best = None
+    best_score = 0
+
+    for s in candidates:
+        # count words fully left vs fully right
+        left = 0
+        right = 0
+        crossing = 0
+        for x0, x1 in boxes:
+            if x1 < s:
+                left += 1
+            elif x0 > s:
+                right += 1
+            else:
+                crossing += 1
+
+        total = left + right + crossing
+        if total == 0:
+            continue
+
+        # must have enough on both sides, and few crossing
+        if left/total < min_share_each_side or right/total < min_share_each_side:
+            continue
+
+        # gap check: ensure there is a real empty vertical band around s
+        band_left = s - min_gap/2
+        band_right = s + min_gap/2
+        in_band = 0
+        for x0, x1 in boxes:
+            if not (x1 < band_left or x0 > band_right):
+                in_band += 1
+
+        # score: prefer low band occupancy and low crossing
+        score = (1 / (1 + in_band)) * (1 / (1 + crossing))
+        if score > best_score:
+            best_score = score
+            best = s
+
+    return best
+
+def build_lines_two_columns(lines, split_x):
+    """
+    For each line (list of words), split into left and right by x0/x1 vs split_x.
+    Returns list of tuples: (left_text, right_text)
+    """
+    out = []
+    for line in lines:
+        left_words = []
+        right_words = []
+        for w in line:
+            x0, x1 = w["x0"], w["x1"]
+            txt = w.get("text", "")
+            if x1 < split_x:
+                left_words.append((x0, txt))
+            elif x0 > split_x:
+                right_words.append((x0, txt))
+            else:
+                # straddling: assign by center
+                cx = (x0 + x1) / 2
+                (left_words if cx < split_x else right_words).append((x0, txt))
+
+        left_words.sort(key=lambda t: t[0])
+        right_words.sort(key=lambda t: t[0])
+
+        left_text = normalize_spaces(" ".join(t[1] for t in left_words))
+        right_text = normalize_spaces(" ".join(t[1] for t in right_words))
+
+        # drop empty rows
+        if left_text or right_text:
+            out.append((left_text, right_text))
+    return out
+
+def extract_tables_strict(page):
+    """
+    Only keep credible tables.
+    """
+    try:
+        tables = page.extract_tables(
+            table_settings={
+                "vertical_strategy": "lines",
+                "horizontal_strategy": "lines",
+                "intersection_tolerance": 5,
+                "snap_tolerance": 3,
+                "join_tolerance": 3,
+                "edge_min_length": 3,
+                "min_words_vertical": 3,
+                "min_words_horizontal": 1,
+            }
+        ) or []
+    except Exception:
+        return []
+
+    # Filter out garbage "tables" (e.g., 1 row, 1 col; or mostly empty)
+    clean = []
+    for t in tables:
+        if not t or not isinstance(t, list):
+            continue
+        rows = [r for r in t if isinstance(r, list)]
+        if len(rows) < 2:
+            continue
+        max_cols = max((len(r) for r in rows), default=0)
+        if max_cols < 2:
+            continue
+        # non-empty ratio
+        cells = [str(c).strip() for r in rows for c in r if c is not None]
+        nonempty = sum(1 for c in cells if c)
+        if nonempty < 4:
+            continue
+        clean.append(rows)
+    return clean
+
+def add_table(doc, table_data):
+    if not table_data:
         return
-    # normalize row lengths
     max_cols = max((len(r) for r in table_data if isinstance(r, list)), default=0)
-    if max_cols == 0:
+    if max_cols < 1:
         return
     norm = []
     for r in table_data:
-        if not isinstance(r, list):
-            continue
         r2 = [(c if c is not None else "") for c in r]
         if len(r2) < max_cols:
             r2 += [""] * (max_cols - len(r2))
-        norm.append([str(c).strip() for c in r2])
-
-    if not norm:
-        return
+        norm.append([normalize_spaces(str(c)) for c in r2])
 
     t = doc.add_table(rows=len(norm), cols=max_cols)
     t.style = "Table Grid"
@@ -95,6 +242,10 @@ def add_table(doc: Document, table_data):
             t.cell(i, j).text = cell
     doc.add_paragraph("")
 
+
+# =========================
+# CORE: PDF -> DOCX
+# =========================
 def extract_pdf_to_docx(pdf_path: Path, out_docx: Path):
     doc = Document()
     add_heading_meta(doc, f"PDF Extraction: {pdf_path.name}", pdf_path)
@@ -103,77 +254,62 @@ def extract_pdf_to_docx(pdf_path: Path, out_docx: Path):
         for page_idx, page in enumerate(pdf.pages, start=1):
             doc.add_heading(f"Page {page_idx}", level=2)
 
-            # 1) Tables first (so you don't lose structure)
-            try:
-                tables = page.extract_tables(
-                    table_settings={
-                        "vertical_strategy": "lines",
-                        "horizontal_strategy": "lines",
-                        "intersection_tolerance": 5,
-                        "snap_tolerance": 3,
-                        "join_tolerance": 3,
-                        "edge_min_length": 3,
-                        "min_words_vertical": 3,
-                        "min_words_horizontal": 1,
-                    }
-                ) or []
-            except Exception:
-                tables = []
-
+            # 1) Detect & write real tables (strict)
+            tables = extract_tables_strict(page)
             if tables:
-                doc.add_paragraph("Tables:")
+                doc.add_paragraph("Tables found:")
                 for ti, tbl in enumerate(tables, start=1):
                     doc.add_paragraph(f"Table {ti}:")
                     add_table(doc, tbl)
 
-            # 2) Page text
+            # 2) Extract words with coordinates for layout-preserving text
             try:
-                text = page.extract_text() or ""
+                words = page.extract_words(
+                    keep_blank_chars=False,
+                    use_text_flow=False,
+                    extra_attrs=["fontname", "size"]
+                )
             except Exception:
-                text = ""
+                words = []
 
-            if text.strip():
-                doc.add_paragraph("Text:")
-                add_text_block(doc, text)
+            # If the page has very little text, stop here.
+            if not words:
+                doc.add_paragraph("(No readable text found.)")
+                doc.add_page_break()
+                continue
+
+            split_x = detect_two_column_split(words, page.width)
+
+            lines = cluster_words_into_lines(words, y_tol=3.0)
+
+            # 3) Two-column: render as 2-col Word table (DE | EN)
+            if split_x is not None:
+                doc.add_paragraph("Text (two-column layout detected):")
+                pairs = build_lines_two_columns(lines, split_x)
+
+                # Create a 2-column table; header row helps readability
+                t = add_word_table(doc, rows=len(pairs) + 1, cols=2, style="Table Grid")
+                t.cell(0, 0).text = "Left column"
+                t.cell(0, 1).text = "Right column"
+
+                for i, (lt, rt) in enumerate(pairs, start=1):
+                    t.cell(i, 0).text = lt
+                    t.cell(i, 1).text = rt
+
+                doc.add_paragraph("")
+
+            # 4) Single-column: render as paragraphs (NOT as a table)
             else:
-                doc.add_paragraph("(No readable text extracted on this page.)")
+                doc.add_paragraph("Text:")
+                # Build single-column lines by joining words left-to-right
+                text_lines = []
+                for line in lines:
+                    text_lines.append(normalize_spaces(" ".join(w.get("text", "") for w in line)))
+                # light cleanup: remove repeated blanks
+                text_lines = [ln for ln in text_lines if ln]
+                add_paragraphs(doc, text_lines)
 
             doc.add_page_break()
-
-    doc.save(str(out_docx))
-
-def ocr_image(image_path: Path) -> str:
-    if not OCR_OK:
-        return ""
-    try:
-        img = Image.open(str(image_path)).convert("RGB")
-        # simple OCR; you can tune language if you want: lang="deu+eng"
-        return pytesseract.image_to_string(img)
-    except Exception:
-        return ""
-
-def extract_image_to_docx(img_path: Path, out_docx: Path, embed_image: bool = True):
-    doc = Document()
-    add_heading_meta(doc, f"Image Extraction: {img_path.name}", img_path)
-
-    if embed_image:
-        try:
-            doc.add_paragraph("Image preview:")
-            doc.add_picture(str(img_path), width=Inches(6.0))
-            doc.add_paragraph("")
-        except Exception:
-            doc.add_paragraph("(Could not embed image preview.)")
-            doc.add_paragraph("")
-
-    text = ocr_image(img_path)
-    if text.strip():
-        doc.add_paragraph("OCR text:")
-        add_text_block(doc, text)
-    else:
-        if OCR_OK:
-            doc.add_paragraph("(OCR returned empty text.)")
-        else:
-            doc.add_paragraph("(OCR not available: pytesseract/Tesseract not installed.)")
 
     doc.save(str(out_docx))
 
@@ -181,35 +317,19 @@ def extract_image_to_docx(img_path: Path, out_docx: Path, embed_image: bool = Tr
 # =========================
 # RUN
 # =========================
-pdfs = sorted([p for p in PDF_DIR.glob("*") if p.is_file() and p.suffix.lower() == ".pdf"])
-imgs = sorted([p for p in IMG_DIR.glob("*") if p.is_file() and p.suffix.lower() in {".png",".jpg",".jpeg",".tif",".tiff",".bmp",".gif"}])
+pdfs = sorted([p for p in PDF_DIR.glob("*.pdf") if p.is_file()])
+print("PDFs found:", len(pdfs))
+print("Output folder:", OUT_PDF)
 
-print("RUN_DIR:", RUN_DIR)
-print("PDF files found:", len(pdfs))
-print("Image files found:", len(imgs))
-print("OCR available:", OCR_OK)
-print("Output:", OUT_DIR)
-
-ok_pdf = fail_pdf = 0
+ok = fail = 0
 for p in pdfs:
     out = OUT_PDF / safe_filename(p.stem + ".docx")
     try:
         extract_pdf_to_docx(p, out)
-        ok_pdf += 1
+        ok += 1
     except Exception as e:
-        fail_pdf += 1
-        print("PDF FAIL:", p.name, "->", repr(e))
+        fail += 1
+        print("FAIL:", p.name, "->", repr(e))
 
-ok_img = fail_img = 0
-for p in imgs:
-    out = OUT_IMG / safe_filename(p.stem + ".docx")
-    try:
-        extract_image_to_docx(p, out, embed_image=True)
-        ok_img += 1
-    except Exception as e:
-        fail_img += 1
-        print("IMG FAIL:", p.name, "->", repr(e))
-
-print(f"Done. PDFs ok={ok_pdf} fail={fail_pdf} | Images ok={ok_img} fail={fail_img}")
-print("DOCX from PDFs:", OUT_PDF)
-print("DOCX from images:", OUT_IMG)
+print(f"Done. ok={ok} fail={fail}")
+print("DOCX output:", OUT_PDF)
