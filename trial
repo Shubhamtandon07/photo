@@ -1,34 +1,45 @@
+!python -m pip install -U pdfplumber python-docx pillow
+!python -m pip install -U pytesseract
+
 from pathlib import Path
-import csv
-import re
-import shutil
-import traceback
 from datetime import datetime
+import re
 
-import extract_msg  # pip install -U extract-msg
+import pdfplumber
+from docx import Document
+from docx.shared import Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+from PIL import Image
+
+# Optional OCR (works only if pytesseract + Tesseract installed)
+try:
+    import pytesseract
+    OCR_OK = True
+except Exception:
+    OCR_OK = False
+
 
 # =========================
-# CONFIG (FIXED)
+# CONFIG
 # =========================
-ROOT = Path(r"C:\Users\SHTANDO\Desktop\chatbot\Mails Rasmus")  # folder that CONTAINS .msg files
-EXPORT_ROOT = ROOT / "_exports"
+RUN_DIR = Path(r"PASTE_YOUR_RUN_DIR_HERE")  # e.g. ...\_exports\collect_att_20260219_191939
+PDF_DIR = RUN_DIR / "pdfs"
+IMG_DIR = RUN_DIR / "images"
 
-PDF_EXTS = {".pdf"}
-IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif"}
+OUT_DIR = RUN_DIR / f"docx_extracted_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+OUT_PDF = OUT_DIR / "from_pdfs"
+OUT_IMG = OUT_DIR / "from_images"
+OUT_PDF.mkdir(parents=True, exist_ok=True)
+OUT_IMG.mkdir(parents=True, exist_ok=True)
+
 
 # =========================
 # HELPERS
 # =========================
-def now_stamp():
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-def ensure_dir(p: Path) -> Path:
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-def safe_filename(name: str, max_len: int = 120) -> str:
+def safe_filename(name: str, max_len: int = 150) -> str:
     name = (name or "").strip()
-    name = re.sub(r"[<>:\"/\\|?*\x00-\x1F]", "_", name)  # Windows-illegal
+    name = re.sub(r"[<>:\"/\\|?*\x00-\x1F]", "_", name)
     name = re.sub(r"\s+", " ", name)
     if len(name) <= max_len:
         return name
@@ -38,105 +49,167 @@ def safe_filename(name: str, max_len: int = 120) -> str:
         return f"{base}.{ext}"
     return name[:max_len]
 
-def log_line(log_path: Path, line: str):
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(line.rstrip() + "\n")
+def add_heading_meta(doc: Document, title: str, source_path: Path):
+    h = doc.add_heading(title, level=1)
+    h.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    p = doc.add_paragraph()
+    p.add_run("Source: ").bold = True
+    p.add_run(str(source_path))
+    doc.add_paragraph("")
 
-def copy_collected(src: Path, dst_dir: Path, prefix: str) -> Path:
-    dst_name = safe_filename(f"{prefix}_{src.name}", max_len=140)
-    dst = dst_dir / dst_name
+def add_text_block(doc: Document, text: str):
+    text = (text or "").strip()
+    if not text:
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if line:
+            doc.add_paragraph(line)
 
-    # avoid collisions
-    if dst.exists():
-        stem = dst.stem
-        ext = dst.suffix
-        k = 2
-        while True:
-            cand = dst_dir / f"{stem}__{k}{ext}"
-            if not cand.exists():
-                dst = cand
-                break
-            k += 1
+def add_table(doc: Document, table_data):
+    """
+    table_data: list of rows, each row is list of cells (strings)
+    """
+    if not table_data or not isinstance(table_data, list):
+        return
+    # normalize row lengths
+    max_cols = max((len(r) for r in table_data if isinstance(r, list)), default=0)
+    if max_cols == 0:
+        return
+    norm = []
+    for r in table_data:
+        if not isinstance(r, list):
+            continue
+        r2 = [(c if c is not None else "") for c in r]
+        if len(r2) < max_cols:
+            r2 += [""] * (max_cols - len(r2))
+        norm.append([str(c).strip() for c in r2])
 
-    shutil.copy2(src, dst)
-    return dst
+    if not norm:
+        return
 
-# =========================
-# MAIN
-# =========================
-RUN_DIR = ensure_dir(EXPORT_ROOT / f"collect_att_{now_stamp()}")
-TMP_DIR = ensure_dir(RUN_DIR / "_tmp")
-PDF_DIR = ensure_dir(RUN_DIR / "pdfs")
-IMG_DIR = ensure_dir(RUN_DIR / "images")
-MANIFEST = RUN_DIR / "manifest.csv"
-ERRORS = RUN_DIR / "errors.log"
+    t = doc.add_table(rows=len(norm), cols=max_cols)
+    t.style = "Table Grid"
+    for i, row in enumerate(norm):
+        for j, cell in enumerate(row):
+            t.cell(i, j).text = cell
+    doc.add_paragraph("")
 
-# IMPORTANT: scan ROOT (NOT ROOT/input)
-msg_files = sorted({*ROOT.rglob("*.msg"), *ROOT.rglob("*.MSG")})
+def extract_pdf_to_docx(pdf_path: Path, out_docx: Path):
+    doc = Document()
+    add_heading_meta(doc, f"PDF Extraction: {pdf_path.name}", pdf_path)
 
-print("ROOT:", ROOT)
-print("Found .msg files:", len(msg_files))
-print("RUN_DIR:", RUN_DIR)
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page_idx, page in enumerate(pdf.pages, start=1):
+            doc.add_heading(f"Page {page_idx}", level=2)
 
-with MANIFEST.open("w", newline="", encoding="utf-8-sig") as f:
-    w = csv.writer(f)
-    w.writerow(["msg_file", "msg_path", "tmp_export_path", "attachment_found", "collected_as", "type"])
+            # 1) Tables first (so you don't lose structure)
+            try:
+                tables = page.extract_tables(
+                    table_settings={
+                        "vertical_strategy": "lines",
+                        "horizontal_strategy": "lines",
+                        "intersection_tolerance": 5,
+                        "snap_tolerance": 3,
+                        "join_tolerance": 3,
+                        "edge_min_length": 3,
+                        "min_words_vertical": 3,
+                        "min_words_horizontal": 1,
+                    }
+                ) or []
+            except Exception:
+                tables = []
 
-ok_msg = 0
-fail_msg = 0
-saved = 0
+            if tables:
+                doc.add_paragraph("Tables:")
+                for ti, tbl in enumerate(tables, start=1):
+                    doc.add_paragraph(f"Table {ti}:")
+                    add_table(doc, tbl)
 
-for i, msg_path in enumerate(msg_files, start=1):
-    mail_id = f"m{i:04d}"
-    tmp_out = ensure_dir(TMP_DIR / mail_id)
+            # 2) Page text
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
 
+            if text.strip():
+                doc.add_paragraph("Text:")
+                add_text_block(doc, text)
+            else:
+                doc.add_paragraph("(No readable text extracted on this page.)")
+
+            doc.add_page_break()
+
+    doc.save(str(out_docx))
+
+def ocr_image(image_path: Path) -> str:
+    if not OCR_OK:
+        return ""
     try:
-        m = extract_msg.Message(str(msg_path))
-        # export body + attachments into short folder name
-        m.save(customPath=str(tmp_out))
+        img = Image.open(str(image_path)).convert("RGB")
+        # simple OCR; you can tune language if you want: lang="deu+eng"
+        return pytesseract.image_to_string(img)
+    except Exception:
+        return ""
+
+def extract_image_to_docx(img_path: Path, out_docx: Path, embed_image: bool = True):
+    doc = Document()
+    add_heading_meta(doc, f"Image Extraction: {img_path.name}", img_path)
+
+    if embed_image:
         try:
-            m.close()
+            doc.add_paragraph("Image preview:")
+            doc.add_picture(str(img_path), width=Inches(6.0))
+            doc.add_paragraph("")
         except Exception:
-            pass
+            doc.add_paragraph("(Could not embed image preview.)")
+            doc.add_paragraph("")
 
-        ok_msg += 1
+    text = ocr_image(img_path)
+    if text.strip():
+        doc.add_paragraph("OCR text:")
+        add_text_block(doc, text)
+    else:
+        if OCR_OK:
+            doc.add_paragraph("(OCR returned empty text.)")
+        else:
+            doc.add_paragraph("(OCR not available: pytesseract/Tesseract not installed.)")
 
-        exported_files = [p for p in tmp_out.rglob("*") if p.is_file()]
+    doc.save(str(out_docx))
 
-        found_any = False
-        for p in exported_files:
-            ext = p.suffix.lower()
 
-            if ext in PDF_EXTS:
-                dst = copy_collected(p, PDF_DIR, prefix=mail_id)
-                saved += 1
-                found_any = True
-                with MANIFEST.open("a", newline="", encoding="utf-8-sig") as f:
-                    w = csv.writer(f)
-                    w.writerow([msg_path.name, str(msg_path), str(tmp_out), p.name, dst.name, "pdf"])
+# =========================
+# RUN
+# =========================
+pdfs = sorted([p for p in PDF_DIR.glob("*") if p.is_file() and p.suffix.lower() == ".pdf"])
+imgs = sorted([p for p in IMG_DIR.glob("*") if p.is_file() and p.suffix.lower() in {".png",".jpg",".jpeg",".tif",".tiff",".bmp",".gif"}])
 
-            elif ext in IMG_EXTS:
-                dst = copy_collected(p, IMG_DIR, prefix=mail_id)
-                saved += 1
-                found_any = True
-                with MANIFEST.open("a", newline="", encoding="utf-8-sig") as f:
-                    w = csv.writer(f)
-                    w.writerow([msg_path.name, str(msg_path), str(tmp_out), p.name, dst.name, "image"])
+print("RUN_DIR:", RUN_DIR)
+print("PDF files found:", len(pdfs))
+print("Image files found:", len(imgs))
+print("OCR available:", OCR_OK)
+print("Output:", OUT_DIR)
 
-        # record row even if no attachments found
-        if not found_any:
-            with MANIFEST.open("a", newline="", encoding="utf-8-sig") as f:
-                w = csv.writer(f)
-                w.writerow([msg_path.name, str(msg_path), str(tmp_out), "", "", "none"])
-
+ok_pdf = fail_pdf = 0
+for p in pdfs:
+    out = OUT_PDF / safe_filename(p.stem + ".docx")
+    try:
+        extract_pdf_to_docx(p, out)
+        ok_pdf += 1
     except Exception as e:
-        fail_msg += 1
-        log_line(ERRORS, f"MSG_ERROR | {msg_path} | {repr(e)}")
-        log_line(ERRORS, traceback.format_exc())
+        fail_pdf += 1
+        print("PDF FAIL:", p.name, "->", repr(e))
 
-print(f"Done. MSG ok={ok_msg} fail={fail_msg} | attachments collected={saved}")
-print("Manifest:", MANIFEST)
-print("Errors:", ERRORS)
-print("PDFs folder:", PDF_DIR)
-print("Images folder:", IMG_DIR)
+ok_img = fail_img = 0
+for p in imgs:
+    out = OUT_IMG / safe_filename(p.stem + ".docx")
+    try:
+        extract_image_to_docx(p, out, embed_image=True)
+        ok_img += 1
+    except Exception as e:
+        fail_img += 1
+        print("IMG FAIL:", p.name, "->", repr(e))
+
+print(f"Done. PDFs ok={ok_pdf} fail={fail_pdf} | Images ok={ok_img} fail={fail_img}")
+print("DOCX from PDFs:", OUT_PDF)
+print("DOCX from images:", OUT_IMG)
