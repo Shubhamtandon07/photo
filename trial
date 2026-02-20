@@ -1,1 +1,27 @@
-!python -m pip install -U pdf2docx
+from pathlib import Path
+from datetime import datetime
+from pdf2docx import Converter
+
+RUN_DIR = Path(r"C:\Users\SHTANDO\Desktop\chatbot\Mails Rasmus\_exports\collect_att_20260219_192712")
+PDF_DIR = RUN_DIR / "pdfs"
+
+OUT_DIR = RUN_DIR / f"docx_layout_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+pdfs = sorted(PDF_DIR.glob("*.pdf"))
+print("PDFs found:", len(pdfs))
+print("OUT:", OUT_DIR)
+
+ok = fail = 0
+for pdf_path in pdfs:
+    out_docx = OUT_DIR / (pdf_path.stem + ".docx")
+    try:
+        cv = Converter(str(pdf_path))
+        cv.convert(str(out_docx), start=0, end=None)
+        cv.close()
+        ok += 1
+    except Exception as e:
+        fail += 1
+        print("FAIL:", pdf_path.name, "->", repr(e))
+
+print(f"Done. ok={ok} fail={fail}")
