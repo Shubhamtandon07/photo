@@ -1,30 +1,1100 @@
-Hallo Sustainable-procurement,
-ich hoffe, es geht Ihnen gut.
-•	über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | The documentation of the recycled proportion shall be documented in accordance with the MBN 10300 “standard designation of materials” in the corresponding 3D record (Smaragd/ NX).
-•	gemäß | den | Vorgaben | Vorgaben | der | der | MBN | 10300 | 10300 | The documentation of the recycled proportion shall be documented in accordance with the MBN 10300 “standard designation of materials” in the corresponding 3D record (Smaragd/ NX).
-•	„Normbezeichnung | „Normbezeichnung | „Normbezeichnung | von | von | Werkstoffen“ | Werkstoffen“ | Werkstoffen“ | im | The documentation of the recycled proportion shall be documented in accordance with the MBN 10300 “standard designation of materials” in the corresponding 3D record (Smaragd/ NX).
-•	- | The documentation of the recycled proportion shall be documented in accordance with the MBN 10300 “standard designation of materials” in the corresponding 3D record (Smaragd/ NX).
-Mit freundlichen Grüßen
-Shubham
----
-Hello Sustainable-procurement,
-I hope you are doing well.
-Key points:
-- über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | über den Rezyklat-Anteil erfolgt | The documentation of the recycled proportion shall be documented in accordance with the MBN 10300 “standard designation of materials” in the corresponding 3D record (Smaragd/ NX).
-- in accordance with | den | Vorgaben | Vorgaben | der | der | MBN | 10300 | 10300 | The documentation of the recycled proportion shall be documented in accordance with the MBN 10300 “standard designation of materials” in the corresponding 3D record (Smaragd/ NX).
-- „Normbezeichnung | „Normbezeichnung | „Normbezeichnung | von | von | Werkstoffen“ | Werkstoffen“ | Werkstoffen“ | im | The documentation of the recycled proportion shall be documented in accordance with the MBN 10300 “standard designation of materials” in the corresponding 3D record (Smaragd/ NX).
-- - | The documentation of the recycled proportion shall be documented in accordance with the MBN 10300 “standard designation of materials” in the corresponding 3D record (Smaragd/ NX).
-Best regards,
-Shubham
-________________________________________
+# -*- coding: utf-8 -*-
+"""
+OUTLOOK DRAFT BOT (NO LLM) — Notebook-safe (Python 3.14+)
+
+What this script does (deterministic):
+- Watches an Outlook folder for emails with subject exactly "bot" (case-insensitive).
+- Builds a draft reply using ONLY your internal KB documents (NO mail-chain docs).
+- Retrieval improvements:
+  - Two-stage ranking: documents -> chunks
+  - TF-IDF similarity if sklearn installed, else token overlap fallback
+  - Strong de-prioritization for mail-chain-like docs (AW_/RE_/FW_/WG_)
+  - Intent-aware: definition vs requirement vs general
+  - "Which standard" questions boosted toward sentences mentioning standards (MBN/DIN/ISO/EN/VDA/IEC) and "gemäß/in accordance with"
+- Output improvements:
+  - No placeholders like [PERSON] (names are removed, not replaced)
+  - Removes email/phones/URLs/IBAN + your provided first-names list
+  - Deduplicates repeated table-cell text from DOCX tables (fixes "über ... | über ... | ...")
+  - Deduplicates near-duplicate bullets
+  - Appends source provenance at end: filename#pX(.Y) + the winning sentence
+- Outlook actions:
+  - Create draft reply
+  - Mark source email as Read
+  - Add category to prevent duplicates
+  - Optional: self-notify + task reminder
+
+Usage (in Jupyter):
+1) Put entire script in one cell.
+2) Run cell.
+3) Call: run_bot_once(force_rebuild_index=True)  # first time / after KB changes
+4) Then later: run_bot_once()  # fast, reuses index
+
+KB changes that require force_rebuild_index=True:
+- You added/removed/edited KB documents in KB_DIR.
+- You changed supported file types, parsing, chunking, or ranking logic.
+"""
+
+from __future__ import annotations
+
+import re
+import time
+import pickle
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from html import escape
+from typing import Optional, List, Tuple, Dict, Any
+
+import win32com.client as win32
 
 
-Von: sustainable-procurement (050-NPM) <sustainable-procurement@mercedes-benz.com> 
-Gesendet: Freitag, 20. Februar 2026 16:15
-An: Tandon, Shubham (050) <shubham.tandon@mercedes-benz.com>
-Betreff: bot
+# =========================================================
+# SETTINGS — EDIT THESE
+# =========================================================
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"  # Outlook store match (substring)
+WATCH_FOLDER_NAME = "Inbox"                          # "Inbox" or a subfolder under Inbox
+
+# Knowledge Base folder (documents only)
+KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
+
+# Processing behavior
+REQUIRE_UNREAD = True
+PROCESS_PER_RUN = 3
+SCAN_LIMIT = 250
+STARTUP_DELAY_SEC = 1
+
+# Gate condition: subject must be exactly "bot"
+REQUIRE_STRICT_SUBJECT = True
+
+# Avoid duplicates
+PROCESSED_CATEGORY = "Drafted-NoLLM"
+
+# Self notify + task reminder
+SELF_NOTIFY = True
+SELF_NOTIFY_TO = TARGET_MAILBOX
+CREATE_REMINDER_TASK = True
+REMINDER_DAYS = 2
+
+# =========================================================
+# KB limits / filters
+# =========================================================
+SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
+MAX_CHARS_PER_DOC = 180000          # cap per doc to avoid huge parsing
+MAX_CHARS_PER_CHUNK = 1400
+MAX_CHUNKS_PER_DOC = 160
+
+MAX_DOCS_TO_RANK = 12               # doc-stage top-K
+MAX_CHUNKS_TO_RANK = 60             # chunk-stage top-K
+MAX_BULLETS = 5
+
+MAILY_PREFIXES = ("aw_", "re_", "fw_", "wg_")
+MAILY_HINTS = ["subject", "mail", "email", ".msg", "inbox", "outlook", "conversation"]
+
+# Your extra first-names to delete (remove, do not replace)
+EXTRA_NAMES_TO_DELETE = [
+    "lisa", "dario", "tim", "daniel", "rasmus", "marvin", "victoria", "janina",
+    "veronika", "athanasia", "alina", "anne"
+]
+
+# =========================================================
+# REDACTION PATTERNS (remove, do not replace)
+# =========================================================
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+PHONE_RE = re.compile(r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d")
+URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
+DOMAIN_RE = re.compile(r"\b(?:[a-z0-9-]+\.)+(?:com|net|org|de|eu|io|gov|edu|co)\b", re.I)
+IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b", re.I)
+
+HEADER_LINE_RE = re.compile(
+    r"(?im)^\s*(von|from|an|to|cc|bcc|gesendet|sent|betreff|subject)\s*:\s*.*$"
+)
+
+TITLE_NAME_RE = re.compile(
+    r"\b(?:Mr|Mrs|Ms|Miss|Dr|Prof|Herr|Frau)\.?\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b"
+)
+FIRST_LAST_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b")
+
+# Standards patterns
+STD_TOKEN_RE = re.compile(r"(?i)\b(MBN|DIN|ISO|IEC|EN|VDA)\b")
+IN_ACCORD_RE = re.compile(r"(?i)\b(in\s+accordance\s+with|gemäß|gemaess|entsprechend)\b")
 
 
+# =========================================================
+# Optional TF-IDF
+# =========================================================
+def _try_import_sklearn():
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
+        from sklearn.metrics.pairwise import cosine_similarity       # type: ignore
+        return TfidfVectorizer, cosine_similarity
+    except Exception:
+        return None, None
 
-The documentation of the recycled proportion shall be documented in accordance with which standards?
+TFIDF_VECTORIZER, COSINE_SIM = _try_import_sklearn()
 
+
+# =========================================================
+# UTIL
+# =========================================================
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+def strict_subject_is_bot(subject: str) -> bool:
+    return (subject or "").strip().lower() == "bot"
+
+def safe_firstname_from_email(email: str) -> str:
+    email = (email or "").strip()
+    local = email.split("@", 1)[0] if "@" in email else email
+    first = local.split(".", 1)[0].strip()
+    if not first:
+        return "Colleague"
+    return first[:1].upper() + first[1:]
+
+def clean_html_to_text(html: str) -> str:
+    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
+    return clean_ws(txt)
+
+def format_outlook_html(text: str) -> str:
+    """
+    Convert plain text to Outlook-friendly HTML.
+    """
+    text = (text or "").replace("\r\n", "\n").strip()
+    if not text:
+        return "<p></p>"
+
+    blocks = re.split(r"\n\s*\n", text)
+    html_parts = []
+    for block in blocks:
+        lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        if all(ln.startswith("- ") for ln in lines):
+            html_parts.append("<ul>")
+            for ln in lines:
+                html_parts.append(f"<li>{escape(ln[2:].strip())}</li>")
+            html_parts.append("</ul>")
+        else:
+            para = "<br>".join(escape(ln) for ln in lines)
+            html_parts.append(f"<p>{para}</p>")
+    return "\n".join(html_parts)
+
+def _remove_names_case_insensitive(text: str, names: list[str]) -> str:
+    out = text
+    for n in names:
+        n = (n or "").strip()
+        if not n:
+            continue
+        out = re.sub(rf"\b{re.escape(n)}\b", "", out, flags=re.I)
+    return out
+
+def redact_sensitive_remove(text: str) -> str:
+    """
+    Remove sensitive tokens WITHOUT inserting placeholders like [PERSON].
+    """
+    if not text:
+        return ""
+
+    t = text
+
+    t = HEADER_LINE_RE.sub("", t)
+    t = EMAIL_RE.sub("", t)
+    t = PHONE_RE.sub("", t)
+    t = URL_RE.sub("", t)
+    t = DOMAIN_RE.sub("", t)
+    t = IBAN_RE.sub("", t)
+
+    t = TITLE_NAME_RE.sub("", t)
+    t = FIRST_LAST_RE.sub("", t)
+
+    t = _remove_names_case_insensitive(t, EXTRA_NAMES_TO_DELETE)
+
+    # cleanup spacing/punctuation after deletions
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"\s+,", ",", t)
+    t = re.sub(r"\(\s*\)", "", t)
+    t = re.sub(r"\s+\.", ".", t)
+    t = re.sub(r"\s+\)", ")", t)
+    t = re.sub(r"\(\s+", "(", t)
+
+    return t.strip()
+
+
+# =========================================================
+# KB READERS
+# =========================================================
+def read_txt(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="ignore")
+
+def _dedupe_consecutive(seq: List[str]) -> List[str]:
+    out = []
+    prev = None
+    for x in seq:
+        x = (x or "").strip()
+        if not x:
+            continue
+        if prev is None or x != prev:
+            out.append(x)
+        prev = x
+    return out
+
+def read_docx(p: Path) -> str:
+    """
+    Fixes repeated text artifacts from DOCX tables by collapsing repeated cells.
+    """
+    try:
+        from docx import Document as DocxDocument  # type: ignore
+    except Exception:
+        return ""
+
+    doc = DocxDocument(str(p))
+
+    paras = [clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text)]
+
+    table_lines = []
+    for table in doc.tables:
+        for row in table.rows:
+            raw_cells = [clean_ws(c.text) for c in row.cells]
+            cells = _dedupe_consecutive(raw_cells)
+
+            # if the row is basically one repeated phrase, keep it once
+            if not cells:
+                continue
+            if len(cells) >= 3 and len(set(cells)) == 1:
+                table_lines.append(cells[0])
+            else:
+                # also remove global duplicates but preserve order
+                dedup = list(dict.fromkeys([c for c in cells if c]))
+                table_lines.append(" | ".join(dedup))
+
+    return ("\n".join(paras) + "\n" + "\n".join(table_lines)).strip()
+
+def read_pdf(p: Path) -> str:
+    """
+    Text extraction only (no OCR). Prefer pdfplumber, else pypdf.
+    """
+    try:
+        import pdfplumber  # type: ignore
+        out = []
+        with pdfplumber.open(str(p)) as pdf:
+            for page in pdf.pages:
+                out.append(page.extract_text() or "")
+        return "\n".join(out).strip()
+    except Exception:
+        pass
+
+    try:
+        from pypdf import PdfReader  # type: ignore
+        r = PdfReader(str(p))
+        out = []
+        for pg in r.pages:
+            try:
+                out.append(pg.extract_text() or "")
+            except Exception:
+                pass
+        return "\n".join(out).strip()
+    except Exception:
+        return ""
+
+def read_xlsx(p: Path) -> str:
+    try:
+        import openpyxl  # type: ignore
+    except Exception:
+        return ""
+
+    wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+    out = []
+    for ws in wb.worksheets:
+        out.append(f"Sheet: {ws.title}")
+        max_rows = min(ws.max_row or 0, 200)
+        max_cols = min(ws.max_column or 0, 30)
+        for r in range(1, max_rows + 1):
+            row_vals = []
+            for c in range(1, max_cols + 1):
+                v = ws.cell(row=r, column=c).value
+                row_vals.append("" if v is None else str(v))
+            if any(cell.strip() for cell in row_vals):
+                out.append(" | ".join(clean_ws(x) for x in row_vals))
+    return "\n".join(out).strip()
+
+def extract_text_from_file(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext == ".txt":
+        return read_txt(p)
+    if ext == ".docx":
+        return read_docx(p)
+    if ext == ".pdf":
+        return read_pdf(p)
+    if ext == ".xlsx":
+        return read_xlsx(p)
+    return ""
+
+
+def is_maily_filename(p: Path) -> bool:
+    name = (p.name or "").lower()
+    stem = (p.stem or "").lower()
+    if stem.startswith("~$"):
+        return True
+    if stem.startswith(MAILY_PREFIXES):
+        return True
+    if any(h in name for h in MAILY_HINTS):
+        return True
+    return False
+
+
+# =========================================================
+# INTENT DETECTION
+# =========================================================
+DEF_PATTERNS = [
+    re.compile(r"(?i)\bwhat\s+is\s+([A-Za-z][A-Za-z0-9\-\s_/]{1,50})\??\b"),
+    re.compile(r"(?i)\bwhat\s+does\s+([A-Za-z][A-Za-z0-9\-\s_/]{1,50})\s+mean\??\b"),
+    re.compile(r"(?i)\bwas\s+ist\s+([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß0-9\-\s_/]{1,50})\??\b"),
+    re.compile(r"(?i)\bwas\s+bedeutet\s+([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß0-9\-\s_/]{1,50})\??\b"),
+]
+
+REQ_HINTS = [
+    "must", "shall", "required", "requirement", "how to", "where", "which standard", "which standards",
+    "which document", "what evidence", "proof",
+    "muss", "soll", "erforder", "anforder", "wie", "wo", "welche norm", "welcher standard", "nachweis", "beleg"
+]
+
+def detect_intent(question: str) -> str:
+    q = clean_ws(question).lower()
+    if any(p.search(q) for p in DEF_PATTERNS):
+        return "definition"
+    if any(h in q for h in REQ_HINTS):
+        return "requirement"
+    return "general"
+
+def extract_focus_term(question: str) -> Optional[str]:
+    q = clean_ws(question)
+    for pat in DEF_PATTERNS:
+        m = pat.search(q)
+        if m:
+            term = clean_ws(m.group(1))
+            # prefer acronym if present
+            m2 = re.search(r"\b([A-Z]{2,10})\b", term)
+            return m2.group(1) if m2 else term
+    # fallback: first acronym
+    m = re.search(r"\b([A-Z]{2,10})\b", q)
+    return m.group(1) if m else None
+
+def is_which_standard_question(question: str) -> bool:
+    q = clean_ws(question).lower()
+    return ("which standard" in q) or ("which standards" in q) or ("welche norm" in q) or ("welcher standard" in q) or ("gemäß welcher" in q)
+
+
+# =========================================================
+# DOC PRIORITY (AW_/RE_ last)
+# =========================================================
+def doc_priority_adjustment(filename: str) -> float:
+    """
+    Negative = worse priority
+    """
+    name = (filename or "").lower()
+    adj = 0.0
+
+    if name.startswith(MAILY_PREFIXES):
+        adj -= 0.25
+
+    if is_maily_filename(Path(filename)):
+        adj -= 0.12
+
+    # boost authoritative docs
+    boosts = [
+        "standard", "policy", "guideline", "handbook", "requirements", "requirement",
+        "glossary", "definition", "begriffe", "abk", "mbn", "din", "iso"
+    ]
+    if any(b in name for b in boosts):
+        adj += 0.10
+
+    return adj
+
+
+# =========================================================
+# TOKENIZATION + DEDUPE
+# =========================================================
+STOPWORDS = set("""
+the a an and or to of in on for with without from by at is are was were be been being
+der die das und oder zu von im in am an auf für mit ohne aus bei ist sind war waren
+""".split())
+
+def tokenize(s: str) -> List[str]:
+    toks = re.split(r"[^a-zA-Z0-9ÄÖÜäöüß]+", (s or "").lower())
+    return [t for t in toks if t and t not in STOPWORDS and len(t) >= 3]
+
+def normalize_for_dedupe(s: str) -> str:
+    s = clean_ws(s).lower()
+    s = re.sub(r"\s*\|\s*", " | ", s)
+    s = re.sub(r"[^a-z0-9äöüß |]+", " ", s)
+    s = clean_ws(s)
+    return s
+
+def is_near_duplicate(a: str, b: str, thresh: float = 0.90) -> bool:
+    ta = set(normalize_for_dedupe(a).split())
+    tb = set(normalize_for_dedupe(b).split())
+    if not ta or not tb:
+        return False
+    j = len(ta & tb) / max(1, len(ta | tb))
+    return j >= thresh
+
+
+# =========================================================
+# CHUNKING WITH PARAGRAPH IDs (for provenance)
+# =========================================================
+def split_into_chunks(text: str, filename: str) -> List[Tuple[str, str]]:
+    """
+    Returns [(chunk_id, chunk_text)] where chunk_id is filename#pX(.Y).
+    """
+    paras = [p.strip() for p in re.split(r"\n{2,}", text or "") if p.strip()]
+    out: List[Tuple[str, str]] = []
+    para_idx = 0
+
+    for p in paras:
+        para_idx += 1
+        if len(p) <= MAX_CHARS_PER_CHUNK:
+            out.append((f"{filename}#p{para_idx}", p))
+        else:
+            part = 0
+            for i in range(0, len(p), MAX_CHARS_PER_CHUNK):
+                part += 1
+                out.append((f"{filename}#p{para_idx}.{part}", p[i:i+MAX_CHARS_PER_CHUNK]))
+        if len(out) >= MAX_CHUNKS_PER_DOC:
+            break
+
+    return out
+
+
+# =========================================================
+# KB INDEX (cached)
+# =========================================================
+@dataclass
+class KBDoc:
+    fullpath: str
+    filename: str
+    text: str
+
+@dataclass
+class KBIndex:
+    docs: List[KBDoc]
+    created_at: str
+    kb_dir: str
+
+
+def _index_path_for_kb(kb_dir: str) -> Path:
+    d = Path(kb_dir)
+    return d / "_bot_index.pkl"
+
+def _kb_fingerprint(kb_dir: str) -> str:
+    """
+    Light fingerprint: list of filenames + mtimes + sizes
+    """
+    base = Path(kb_dir)
+    parts = []
+    for p in sorted(base.rglob("*")):
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS:
+            try:
+                st = p.stat()
+                parts.append(f"{p.name}|{st.st_mtime_ns}|{st.st_size}")
+            except Exception:
+                parts.append(p.name)
+    return str(hash("|".join(parts)))
+
+
+def build_or_load_index(kb_dir: str, force_rebuild: bool = False) -> KBIndex:
+    idx_path = _index_path_for_kb(kb_dir)
+    fp_path = Path(str(idx_path) + ".fingerprint")
+
+    if not force_rebuild and idx_path.exists() and fp_path.exists():
+        try:
+            saved_fp = fp_path.read_text(encoding="utf-8", errors="ignore").strip()
+            current_fp = _kb_fingerprint(kb_dir)
+            if saved_fp == current_fp:
+                with idx_path.open("rb") as f:
+                    idx = pickle.load(f)
+                if isinstance(idx, KBIndex):
+                    return idx
+        except Exception:
+            pass
+
+    # rebuild
+    base = Path(kb_dir)
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"KB_DIR not found or not a folder: {kb_dir}")
+
+    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    docs: List[KBDoc] = []
+
+    for p in sorted(files):
+        try:
+            txt = extract_text_from_file(p) or ""
+            txt = txt.strip()
+            if not txt:
+                continue
+            txt = txt[:MAX_CHARS_PER_DOC]
+            docs.append(KBDoc(fullpath=str(p), filename=p.name, text=txt))
+        except Exception:
+            continue
+
+    idx = KBIndex(docs=docs, created_at=datetime.now().isoformat(timespec="seconds"), kb_dir=kb_dir)
+
+    try:
+        with idx_path.open("wb") as f:
+            pickle.dump(idx, f)
+        fp_path.write_text(_kb_fingerprint(kb_dir), encoding="utf-8")
+    except Exception:
+        pass
+
+    return idx
+
+
+# =========================================================
+# RETRIEVAL: docs -> chunks
+# =========================================================
+def rank_docs(docs: List[KBDoc], query: str, top_k: int) -> List[Tuple[float, KBDoc]]:
+    query = clean_ws(query)
+    if not query:
+        return []
+
+    if TFIDF_VECTORIZER and COSINE_SIM:
+        texts = [d.text for d in docs]
+        vec = TFIDF_VECTORIZER(min_df=1, ngram_range=(1, 2), max_features=60000)
+        X = vec.fit_transform(texts)
+        qv = vec.transform([query])
+        sims = COSINE_SIM(qv, X).ravel()
+
+        scored = []
+        for d, sim in zip(docs, sims):
+            score = float(sim) + doc_priority_adjustment(d.filename)
+            scored.append((score, d))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[:top_k]
+
+    # fallback token overlap
+    q_tokens = set(tokenize(query))
+    scored = []
+    for d in docs:
+        t_low = d.text.lower()
+        overlap = sum(1 for tk in q_tokens if tk in t_low)
+        score = overlap / max(1, len(q_tokens))
+        score += doc_priority_adjustment(d.filename)
+        scored.append((float(score), d))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:top_k]
+
+
+def rank_chunks(top_docs: List[Tuple[float, KBDoc]], query: str, top_k: int) -> List[Tuple[float, str, str, str]]:
+    """
+    Returns: [(score, filename, chunk_id, chunk_text)]
+    """
+    query = clean_ws(query)
+    if not query:
+        return []
+
+    chunks: List[str] = []
+    meta: List[Tuple[float, str, str]] = []  # doc_score, filename, chunk_id
+
+    for doc_score, d in top_docs:
+        for chunk_id, ch in split_into_chunks(d.text, d.filename):
+            chunks.append(ch)
+            meta.append((doc_score, d.filename, chunk_id))
+
+    if not chunks:
+        return []
+
+    if TFIDF_VECTORIZER and COSINE_SIM:
+        vec = TFIDF_VECTORIZER(min_df=1, ngram_range=(1, 2), max_features=60000)
+        X = vec.fit_transform(chunks)
+        qv = vec.transform([query])
+        sims = COSINE_SIM(qv, X).ravel()
+
+        scored = []
+        for sim, (doc_score, filename, chunk_id), ch in zip(sims, meta, chunks):
+            score = float(sim) + (doc_score * 0.05)
+            scored.append((score, filename, chunk_id, ch))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[:top_k]
+
+    q_tokens = set(tokenize(query))
+    scored = []
+    for (doc_score, filename, chunk_id), ch in zip(meta, chunks):
+        c_low = ch.lower()
+        overlap = sum(1 for tk in q_tokens if tk in c_low)
+        score = overlap / max(1, len(q_tokens)) + (doc_score * 0.05)
+        scored.append((float(score), filename, chunk_id, ch))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:top_k]
+
+
+# =========================================================
+# SENTENCE SELECTION / ANSWER EXTRACTION
+# =========================================================
+def sentence_split(text: str) -> List[str]:
+    txt = re.sub(r"\s+", " ", text or "").strip()
+    if not txt:
+        return []
+    parts = re.split(r"(?<=[\.\!\?])\s+", txt)
+    out = [p.strip(" -•\t\r\n") for p in parts if len(p.strip()) >= 15]
+    return out
+
+def anchored_sentence(sent: str, anchors: List[str]) -> bool:
+    s = sent.lower()
+    return any(a in s for a in anchors if a)
+
+def build_anchors(query: str, focus_term: Optional[str]) -> List[str]:
+    anchors: List[str] = []
+    if focus_term:
+        anchors.append(focus_term.lower())
+    anchors += tokenize(query)[:10]
+    # keep unique
+    seen = set()
+    uniq = []
+    for a in anchors:
+        if a and a not in seen:
+            seen.add(a)
+            uniq.append(a)
+    return uniq
+
+def choose_best_sentence(chunks_scored: List[Tuple[float, str, str, str]], query: str, intent: str, focus_term: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Returns (sentence, filename, chunk_id)
+    """
+    anchors = build_anchors(query, focus_term)
+
+    def_pat = re.compile(r"(?i)\b(stands\s+for|steht\s+für|means|bedeutet|definition|definiert|=)\b")
+    req_pat = re.compile(r"(?i)\b(must|shall|required|requirement|muss|soll|erforder|anforder|nachweis|beleg)\b")
+
+    which_std = is_which_standard_question(query)
+
+    for score, filename, chunk_id, ch in chunks_scored:
+        for sent in sentence_split(ch):
+            if not anchored_sentence(sent, anchors):
+                continue
+
+            # Hard preference: "which standard" -> must include standard token and in-accordance wording if possible
+            if which_std:
+                if STD_TOKEN_RE.search(sent) and IN_ACCORD_RE.search(sent):
+                    return sent, filename, chunk_id
+                # still acceptable if it includes a standard token
+                if STD_TOKEN_RE.search(sent):
+                    return sent, filename, chunk_id
+
+            if intent == "definition":
+                if def_pat.search(sent):
+                    return sent, filename, chunk_id
+                if focus_term and re.search(rf"(?i)\b{re.escape(focus_term)}\b", sent) and len(sent) <= 220:
+                    return sent, filename, chunk_id
+
+            if intent == "requirement":
+                # prefer standards if question suggests it
+                if which_std and STD_TOKEN_RE.search(sent):
+                    return sent, filename, chunk_id
+                if req_pat.search(sent):
+                    return sent, filename, chunk_id
+
+            if intent == "general":
+                return sent, filename, chunk_id
+
+    return None, None, None
+
+
+def build_bullets_with_sources(chunks_scored: List[Tuple[float, str, str, str]],
+                              query: str,
+                              intent: str,
+                              focus_term: Optional[str],
+                              max_points: int = 5) -> List[Dict[str, str]]:
+    anchors = build_anchors(query, focus_term)
+    bullets: List[Dict[str, str]] = []
+
+    which_std = is_which_standard_question(query)
+
+    for score, filename, chunk_id, ch in chunks_scored:
+        for sent in sentence_split(ch):
+            if not anchored_sentence(sent, anchors):
+                continue
+
+            # for which-standard questions, skip sentences without standard tokens (keeps bullets clean)
+            if which_std and not STD_TOKEN_RE.search(sent):
+                continue
+
+            if any(is_near_duplicate(sent, b["text"]) for b in bullets):
+                continue
+
+            bullets.append({"text": sent, "filename": filename, "chunk_id": chunk_id})
+            if len(bullets) >= max_points:
+                break
+        if len(bullets) >= max_points:
+            break
+
+    # fallback
+    if not bullets and chunks_scored:
+        score, filename, chunk_id, ch = chunks_scored[0]
+        for sent in sentence_split(ch)[:max_points]:
+            if any(is_near_duplicate(sent, b["text"]) for b in bullets):
+                continue
+            bullets.append({"text": sent, "filename": filename, "chunk_id": chunk_id})
+
+    return bullets[:max_points]
+
+
+# =========================================================
+# SAFE BILINGUAL OUTPUT (no fake translation)
+# =========================================================
+def safe_en_from_de_line(line: str) -> str:
+    """
+    Minimal DE->EN; if still German, tag (DE original).
+    """
+    s = clean_ws(line)
+    if not s:
+        return s
+
+    repl = [
+        (r"\bBitte\b", "Please"),
+        (r"\bNachweis\b", "evidence"),
+        (r"\bAnforderung(en)?\b", "requirement(s)"),
+        (r"\bverbindlich\b", "binding"),
+        (r"\bPrüfung(en)?\b", "review(s)"),
+        (r"\bBewertung\b", "evaluation"),
+        (r"\bLieferant(en)?\b", "supplier(s)"),
+        (r"\bVertrag\b", "contract"),
+        (r"\bDokument(e|)\b", "document(s)"),
+        (r"\bKapitel\b", "chapter"),
+        (r"\bAbschnitt\b", "section"),
+        (r"\binterne\s+Rücksprache\b", "internal follow-up"),
+        (r"\bgemäß\b", "in accordance with"),
+        (r"\bentsprechend\b", "in accordance with"),
+    ]
+    out = s
+    for pat, rep in repl:
+        out = re.sub(pat, rep, out, flags=re.IGNORECASE)
+
+    de_markers = [" der ", " die ", " das ", " und ", " nicht ", " wird ", " wurde ", " kann ", " soll ", " muss "]
+    if sum(m in (" " + out.lower() + " ") for m in de_markers) >= 2:
+        return f"(DE original) {s}"
+    return out
+
+def build_bilingual_reply(greeting_name: str,
+                         signature_name: str,
+                         intent: str,
+                         best_sentence: Optional[str],
+                         best_source: Optional[str],
+                         best_chunk_id: Optional[str],
+                         bullets: List[Dict[str, str]],
+                         ask_clarification: bool) -> str:
+    greeting_name = greeting_name or "Colleague"
+    signature_name = signature_name or "Shubham"
+
+    de: List[str] = []
+    de.append(f"Hallo {greeting_name},")
+    de.append("ich hoffe, es geht Ihnen gut.")
+    de.append("")
+
+    if best_sentence:
+        de.append(best_sentence)
+    else:
+        for b in bullets:
+            txt = clean_ws(b.get("text", ""))
+            if txt:
+                de.append(f"- {txt}")
+
+    if ask_clarification:
+        de.append("")
+        de.append("Falls Sie mir den Dokumentennamen oder den relevanten Abschnitt nennen, kann ich die Antwort gezielt präzisieren.")
+
+    # provenance (doc + paragraph + winning sentence)
+    de.append("")
+    de.append("Quelle(n):")
+    if best_chunk_id:
+        de.append(f"- {best_chunk_id}")
+    else:
+        for b in bullets[:3]:
+            cid = b.get("chunk_id", "").strip()
+            if cid:
+                de.append(f"- {cid}")
+    if best_sentence:
+        de.append("")
+        de.append("Auszug:")
+        de.append(f"“{best_sentence}”")
+
+    de.append("")
+    de.append("Mit freundlichen Grüßen")
+    de.append(signature_name)
+
+    en: List[str] = []
+    en.append(f"Hello {greeting_name},")
+    en.append("I hope you are doing well.")
+    en.append("")
+
+    if best_sentence:
+        # If the best sentence is already English, keep it; else safe-EN render
+        if re.search(r"[A-Za-z]", best_sentence) and not re.search(r"[äöüßÄÖÜ]", best_sentence):
+            en.append(best_sentence)
+        else:
+            en.append(safe_en_from_de_line(best_sentence))
+    else:
+        en.append("Key points:")
+        for b in bullets:
+            txt = clean_ws(b.get("text", ""))
+            if txt:
+                en.append(f"- {safe_en_from_de_line(txt)}")
+
+    if ask_clarification:
+        en.append("")
+        en.append("If you share the document name or the relevant section, I can refine the answer precisely.")
+
+    en.append("")
+    en.append("Source(s):")
+    if best_chunk_id:
+        en.append(f"- {best_chunk_id}")
+    else:
+        for b in bullets[:3]:
+            cid = b.get("chunk_id", "").strip()
+            if cid:
+                en.append(f"- {cid}")
+    if best_sentence:
+        en.append("")
+        en.append("Excerpt:")
+        en.append(f"“{best_sentence}”")
+
+    en.append("")
+    en.append("Best regards,")
+    en.append(signature_name)
+
+    out = "\n".join(de).strip() + "\n\n---\n\n" + "\n".join(en).strip()
+    return redact_sensitive_remove(out)
+
+
+# =========================================================
+# OUTLOOK HELPERS
+# =========================================================
+def get_sender_smtp(mail) -> str:
+    try:
+        addr = (mail.SenderEmailAddress or "").lower()
+        if addr.startswith("/o="):
+            ex = mail.Sender.GetExchangeUser()
+            if ex:
+                return (ex.PrimarySmtpAddress or "").lower()
+        return addr
+    except Exception:
+        return (mail.SenderEmailAddress or "").lower()
+
+def add_processed_category(mail):
+    try:
+        cats = mail.Categories or ""
+        if PROCESSED_CATEGORY.lower() not in cats.lower():
+            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
+        mail.Save()
+    except Exception:
+        pass
+
+def mark_read(mail):
+    try:
+        mail.UnRead = False
+        mail.Save()
+    except Exception:
+        pass
+
+def get_target_folder():
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+    target_store = None
+    for st in ns.Stores:
+        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
+            target_store = st
+            break
+
+    if not target_store:
+        print("Available stores:")
+        for st in ns.Stores:
+            print(" -", st.DisplayName)
+        raise SystemExit("Target mailbox not found. Adjust TARGET_MAILBOX.")
+
+    inbox = target_store.GetDefaultFolder(6)  # Inbox
+
+    if WATCH_FOLDER_NAME.lower() == "inbox":
+        return ns, inbox, target_store.DisplayName, "Inbox"
+
+    for f in inbox.Folders:
+        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
+            return ns, f, target_store.DisplayName, f.Name
+
+    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox.")
+
+def get_account_for_mailbox(ns, mailbox_substring: str):
+    try:
+        for acc in ns.Session.Accounts:
+            smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
+            if mailbox_substring.lower() in smtp or smtp in mailbox_substring.lower():
+                return acc
+    except Exception:
+        pass
+    return None
+
+def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
+    msg = ns.Application.CreateItem(0)
+    msg.To = to_addr
+    msg.Subject = f"Draft created (review needed): {orig_subject}"
+    msg.Body = (
+        "A draft reply has been created in Outlook.\n\n"
+        f"Original subject: {orig_subject}\n"
+        f"Requester: {requester_email}\n\n"
+        "Please review the draft carefully before sending.\n"
+    )
+    acc = get_account_for_mailbox(ns, from_mailbox)
+    if acc:
+        try:
+            msg.SendUsingAccount = acc
+        except Exception:
+            pass
+    msg.Send()
+
+def create_outlook_task_reminder(ns, subject: str, days: int = 2):
+    try:
+        task = ns.Application.CreateItem(3)  # olTaskItem
+        task.Subject = f"Reminder: review/send draft for '{subject}'"
+        task.DueDate = (datetime.now() + timedelta(days=days)).date()
+        task.ReminderSet = True
+        task.ReminderTime = datetime.now() + timedelta(days=days)
+        task.Body = "A draft reply was created by the bot. Please review and send it."
+        task.Save()
+    except Exception:
+        pass
+
+
+# =========================================================
+# ANSWER PIPELINE
+# =========================================================
+def build_answer_from_kb(index: KBIndex, question_text: str, greeting_name: str) -> str:
+    question_text = clean_ws(question_text)
+    intent = detect_intent(question_text)
+    focus_term = extract_focus_term(question_text)
+
+    # Rank docs and chunks
+    top_docs = rank_docs(index.docs, question_text, top_k=MAX_DOCS_TO_RANK)
+    chunks = rank_chunks(top_docs, question_text, top_k=MAX_CHUNKS_TO_RANK)
+
+    # Choose best sentence (single best answer), then bullets as support
+    best_sentence, best_src, best_chunk_id = choose_best_sentence(chunks, question_text, intent, focus_term)
+
+    bullets = build_bullets_with_sources(chunks, question_text, intent, focus_term, max_points=MAX_BULLETS)
+
+    # If we have a best sentence, keep bullets minimal (avoid noise)
+    if best_sentence:
+        # keep only 0-2 supporting bullets that are not near-duplicates of best_sentence
+        filtered = []
+        for b in bullets:
+            if is_near_duplicate(b["text"], best_sentence):
+                continue
+            filtered.append(b)
+            if len(filtered) >= 2:
+                break
+        bullets = filtered
+
+    ask_clarification = False
+    if not best_sentence and not bullets:
+        ask_clarification = True
+
+    reply = build_bilingual_reply(
+        greeting_name=greeting_name,
+        signature_name=safe_firstname_from_email(TARGET_MAILBOX),
+        intent=intent,
+        best_sentence=best_sentence,
+        best_source=best_src,
+        best_chunk_id=best_chunk_id,
+        bullets=bullets,
+        ask_clarification=ask_clarification
+    )
+
+    return reply
+
+
+# =========================================================
+# MAIN RUN
+# =========================================================
+def run_bot_once(force_rebuild_index: bool = False):
+    time.sleep(STARTUP_DELAY_SEC)
+
+    print("KB_DIR:", KB_DIR)
+    index = build_or_load_index(KB_DIR, force_rebuild=force_rebuild_index)
+    print(f"KB indexed docs: {len(index.docs)} | index created_at: {index.created_at}")
+
+    ns, folder, store_name, folder_name = get_target_folder()
+    print(f"Mailbox={store_name} | Folder={folder_name}")
+
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True)
+
+    drafted = 0
+    checked = 0
+
+    for mail in items:
+        checked += 1
+        if checked > SCAN_LIMIT:
+            break
+        if drafted >= PROCESS_PER_RUN:
+            break
+
+        try:
+            if getattr(mail, "Class", None) != 43:  # MailItem
+                continue
+
+            subject = mail.Subject or ""
+            unread = bool(getattr(mail, "UnRead", False))
+            cats = (mail.Categories or "")
+
+            if PROCESSED_CATEGORY.lower() in cats.lower():
+                continue
+
+            if REQUIRE_UNREAD and not unread:
+                continue
+
+            if REQUIRE_STRICT_SUBJECT and not strict_subject_is_bot(subject):
+                continue
+
+            sender = get_sender_smtp(mail)
+            greeting_name = safe_firstname_from_email(sender) or "Colleague"
+
+            # Extract top-of-body only (avoid quoted chains)
+            body_text = clean_html_to_text(mail.HTMLBody or "")
+            body_top = re.split(r"(?i)\b(von:|from:|gesendet:|sent:|-----original message-----)\b", body_text)[0].strip()
+            question = body_top if body_top else body_text
+
+            # Build answer
+            reply_text = build_answer_from_kb(index, question_text=question, greeting_name=greeting_name)
+
+            html_answer = format_outlook_html(reply_text)
+
+            reply = mail.Reply()
+            reply.HTMLBody = f"<div>{html_answer}</div><hr>" + reply.HTMLBody
+            reply.Save()
+
+            mark_read(mail)
+            add_processed_category(mail)
+
+            drafted += 1
+            print("Draft created for subject:", subject)
+
+            if SELF_NOTIFY:
+                try:
+                    send_self_notification(
+                        ns=ns,
+                        from_mailbox=TARGET_MAILBOX,
+                        to_addr=SELF_NOTIFY_TO,
+                        orig_subject=subject,
+                        requester_email=sender,
+                    )
+                except Exception as e:
+                    print("Self notification failed:", e)
+
+            if CREATE_REMINDER_TASK:
+                create_outlook_task_reminder(ns, subject=subject, days=REMINDER_DAYS)
+
+        except Exception as e:
+            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", e)
+
+    print(f"Done. Checked={checked}, Drafted={drafted}")
+
+
+# Example usage:
+# run_bot_once(force_rebuild_index=True)
+# run_bot_once()
