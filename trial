@@ -1,140 +1,62 @@
-import re
-from datetime import datetime, timedelta
-import win32com.client as win32
+Mailbox=shubham.tandon@mercedes-benz.com | Folder=Inbox
+Items.Count: 529
+[PASS] Subject='bot' UnRead=True Cats=''
+Draft created for: bot
+[SKIP category] Subject='bot' Cats='Drafted-NoLLM'
+[SKIP subject] Subject='Mercedes-Benz. Die Woche. | 20. Februar 2026' (needs exactly 'bot')
+[SKIP read] Subject='Draft created (review needed): bot' UnRead=False
+[SKIP read] Subject='Draft created (review needed): bot' UnRead=False
+[SKIP read] Subject='Draft created (review needed): bot' UnRead=False
+[SKIP category] Subject='bot' Cats='AI-Drafted-Deterministic; Drafted-NoLLM'
+[SKIP read] Subject='AW: Ki Risiko Analyse Rohstoffe 2026' UnRead=False
+[SKIP subject] Subject='WG: Morning Briefing |  20.02.2026' (needs exactly 'bot')
+[SKIP read] Subject='AW: Ki Risiko Analyse Rohstoffe 2026' UnRead=False
+[SKIP read] Subject='WG: Personelle Veränderungen in MO & RD / Personnel changes in MO & RD' UnRead=False
+[SKIP not MailItem] Class=53
+[SKIP read] Subject='Erinnerung: Briefwahlunterlagen rechtzeitig zurücksenden' UnRead=False
+[SKIP read] Subject='WG: Share Invitation | Drive+ Introduction webinar' UnRead=False
+[SKIP read] Subject='WG: Morning Briefing |  19.02.2026' UnRead=False
+[SKIP read] Subject='Neuer Lieferantenterminplan - KM446, 1571 Vitoria / New supplier schedule - KM44' UnRead=False
+[SKIP subject] Subject='Reminder: review/send draft for 'bot'' (needs exactly 'bot')
+[SKIP subject] Subject='Reminder: review/send draft for 'bot'' (needs exactly 'bot')
+[SKIP read] Subject='WG: Morning Briefing |  18.02.2026' UnRead=False
+[SKIP read] Subject='Neuer Lieferantenterminplan - KB446, 3760 Jawor / New supplier schedule - KB446,' UnRead=False
+[SKIP read] Subject='TaskForce Optimierung der Vertragslandschaft - MP Archivierungsprozess für Papie' UnRead=False
+[SKIP read] Subject='AW: Ki Risiko Analyse Rohstoffe 2026' UnRead=False
+[SKIP subject] Subject='WG: Morning Briefing |  17.02.2026' (needs exactly 'bot')
+[SKIP read] Subject='WG: Info Call Management: Weiterentwicklung@MP' UnRead=False
+[SKIP read] Subject='Heads up! We noticed that you recently deleted a large number of files from a si' UnRead=False
+[SKIP read] Subject='You’re invited: Databricks AI Days' UnRead=False
+[SKIP subject] Subject='In bewegten Zeiten gut für sich sorgen: Digitales Gesundheitsprogramm & „Gesundh' (needs exactly 'bot')
+[SKIP subject] Subject='Draft created (review needed): bot' (needs exactly 'bot')
+[SKIP subject] Subject='Draft created (review needed): bot' (needs exactly 'bot')
+[SKIP read] Subject='bot' UnRead=False
+[SKIP read] Subject='bot' UnRead=False
+[SKIP read] Subject='Reminder: review/send draft for 'bot'' UnRead=False
+[SKIP subject] Subject='WG: Morning Briefing |  16.02.2026' (needs exactly 'bot')
+[SKIP subject] Subject='WG: Weekend News | 15.02.2026' (needs exactly 'bot')
+[SKIP subject] Subject='WG: Weekend News | 14.02.2026' (needs exactly 'bot')
+[SKIP subject] Subject='Neue Nachricht in IT Shop: Bitte bewerten Sie Ihre neuen Services' (needs exactly 'bot')
+[SKIP subject] Subject='Draft created (review needed): bot' (needs exactly 'bot')
+[SKIP subject] Subject='Draft created (review needed): bot' (needs exactly 'bot')
+[SKIP subject] Subject='Draft created (review needed): bot' (needs exactly 'bot')
+[SKIP category] Subject='bot' Cats='Drafted-NoLLM'
+[SKIP subject] Subject='MMA+MFA2 BRM-JF - 12.02.2026: Link zu den Unterlagen' (needs exactly 'bot')
+[SKIP subject] Subject='Mercedes-Benz. Die Woche. | 13. Februar 2026' (needs exactly 'bot')
+[SKIP subject] Subject='Draft created (review needed): bot' (needs exactly 'bot')
+[SKIP subject] Subject='Neuer Lieferantenterminplan - C590, 0500 Sindelfingen / New supplier schedule - ' (needs exactly 'bot')
+[SKIP read] Subject='bot' UnRead=False
+[SKIP read] Subject='Neue Nachricht in IT Shop: Information: Registrierung bei Software Provider (Auf' UnRead=False
+[SKIP read] Subject='Welcome to M365 Copilot!' UnRead=False
+[SKIP read] Subject='Kunstführungen 2026 für alle Mitarbeitende in Stuttgart | Guided art tours in St' UnRead=False
+[SKIP read] Subject='Neue Nachricht in IT Shop: Änderung des Auftragsstatus (Auftrag 41806851)' UnRead=False
+[SKIP read] Subject='WG: Aushang Unternehmensergebnis' UnRead=False
 
-# ===== Keep your existing config values =====
-TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"
-WATCH_FOLDER_NAME = "Inbox"
-PROCESSED_CATEGORY = "Drafted-NoLLM"
-
-REQUIRE_UNREAD = True
-REQUIRE_STRICT_SUBJECT = True
-SCAN_LIMIT = 200
-PROCESS_PER_RUN = 3
-
-def strict_subject_is_bot(subject: str) -> bool:
-    return (subject or "").strip().lower() == "bot"
-
-def get_target_folder():
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-
-    target_store = None
-    for st in ns.Stores:
-        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
-            target_store = st
-            break
-
-    if not target_store:
-        print("Available stores:")
-        for st in ns.Stores:
-            print(" -", st.DisplayName)
-        raise SystemExit("Target mailbox not found. Adjust TARGET_MAILBOX.")
-
-    inbox = target_store.GetDefaultFolder(6)  # Inbox
-
-    if WATCH_FOLDER_NAME.lower() == "inbox":
-        return ns, inbox, target_store.DisplayName, "Inbox"
-
-    for f in inbox.Folders:
-        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
-            return ns, f, target_store.DisplayName, f.Name
-
-    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox.")
-
-def run_bot_once_debug():
-    ns, folder, store_name, folder_name = get_target_folder()
-    print(f"Mailbox={store_name} | Folder={folder_name}")
-
-    items = folder.Items
-    items.Sort("[ReceivedTime]", True)
-
-    drafted = 0
-    checked = 0
-
-    # Debug counters
-    c_not_mail = 0
-    c_has_cat = 0
-    c_read = 0
-    c_subject = 0
-    c_pass = 0
-
-    # Show what Outlook thinks the folder contains
-    try:
-        print("Items.Count:", items.Count)
-    except Exception:
-        pass
-
-    for mail in items:
-        checked += 1
-        if checked > SCAN_LIMIT:
-            break
-        if drafted >= PROCESS_PER_RUN:
-            break
-
-        try:
-            # Not a MailItem
-            if getattr(mail, "Class", None) != 43:
-                c_not_mail += 1
-                if checked <= 50:
-                    print(f"[SKIP not MailItem] Class={getattr(mail,'Class',None)}")
-                continue
-
-            subj = mail.Subject or ""
-            unread = bool(getattr(mail, "UnRead", False))
-            cats = (mail.Categories or "")
-
-            # Already processed
-            if PROCESSED_CATEGORY.lower() in cats.lower():
-                c_has_cat += 1
-                if checked <= 50:
-                    print(f"[SKIP category] Subject='{subj[:80]}' Cats='{cats}'")
-                continue
-
-            # Unread gate
-            if REQUIRE_UNREAD and not unread:
-                c_read += 1
-                if checked <= 50:
-                    print(f"[SKIP read] Subject='{subj[:80]}' UnRead={unread}")
-                continue
-
-            # Subject gate
-            if REQUIRE_STRICT_SUBJECT and not strict_subject_is_bot(subj):
-                c_subject += 1
-                if checked <= 50:
-                    print(f"[SKIP subject] Subject='{subj[:80]}' (needs exactly 'bot')")
-                continue
-
-            c_pass += 1
-            print(f"[PASS] Subject='{subj}' UnRead={unread} Cats='{cats}'")
-
-            # Draft a minimal reply so we know drafting works
-            reply = mail.Reply()
-            reply.Subject = "DRAFT TEST — " + (reply.Subject or "")
-            reply.Body = "Draft test created by notebook.\n\n" + (reply.Body or "")
-            reply.Save()
-
-            # Mark + category
-            try:
-                mail.UnRead = False
-                mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
-                mail.Save()
-            except Exception as e:
-                print("WARN: could not mark/categorize:", repr(e))
-
-            drafted += 1
-            print("Draft created for:", subj)
-
-        except Exception as e:
-            print("ERROR on mail:", repr(e))
-
-    print("\n=== Summary ===")
-    print("Checked:", checked)
-    print("Drafted:", drafted)
-    print("Skip not MailItem:", c_not_mail)
-    print("Skip category:", c_has_cat)
-    print("Skip read:", c_read)
-    print("Skip subject:", c_subject)
-    print("Passed filters:", c_pass)
-
-# Run:
-# run_bot_once_debug()
+=== Summary ===
+Checked: 201
+Drafted: 1
+Skip not MailItem: 9
+Skip category: 7
+Skip read: 147
+Skip subject: 36
+Passed filters: 1
