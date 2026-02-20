@@ -1,62 +1,618 @@
-Mailbox=shubham.tandon@mercedes-benz.com | Folder=Inbox
-Items.Count: 529
-[PASS] Subject='bot' UnRead=True Cats=''
-Draft created for: bot
-[SKIP category] Subject='bot' Cats='Drafted-NoLLM'
-[SKIP subject] Subject='Mercedes-Benz. Die Woche. | 20. Februar 2026' (needs exactly 'bot')
-[SKIP read] Subject='Draft created (review needed): bot' UnRead=False
-[SKIP read] Subject='Draft created (review needed): bot' UnRead=False
-[SKIP read] Subject='Draft created (review needed): bot' UnRead=False
-[SKIP category] Subject='bot' Cats='AI-Drafted-Deterministic; Drafted-NoLLM'
-[SKIP read] Subject='AW: Ki Risiko Analyse Rohstoffe 2026' UnRead=False
-[SKIP subject] Subject='WG: Morning Briefing |  20.02.2026' (needs exactly 'bot')
-[SKIP read] Subject='AW: Ki Risiko Analyse Rohstoffe 2026' UnRead=False
-[SKIP read] Subject='WG: Personelle Veränderungen in MO & RD / Personnel changes in MO & RD' UnRead=False
-[SKIP not MailItem] Class=53
-[SKIP read] Subject='Erinnerung: Briefwahlunterlagen rechtzeitig zurücksenden' UnRead=False
-[SKIP read] Subject='WG: Share Invitation | Drive+ Introduction webinar' UnRead=False
-[SKIP read] Subject='WG: Morning Briefing |  19.02.2026' UnRead=False
-[SKIP read] Subject='Neuer Lieferantenterminplan - KM446, 1571 Vitoria / New supplier schedule - KM44' UnRead=False
-[SKIP subject] Subject='Reminder: review/send draft for 'bot'' (needs exactly 'bot')
-[SKIP subject] Subject='Reminder: review/send draft for 'bot'' (needs exactly 'bot')
-[SKIP read] Subject='WG: Morning Briefing |  18.02.2026' UnRead=False
-[SKIP read] Subject='Neuer Lieferantenterminplan - KB446, 3760 Jawor / New supplier schedule - KB446,' UnRead=False
-[SKIP read] Subject='TaskForce Optimierung der Vertragslandschaft - MP Archivierungsprozess für Papie' UnRead=False
-[SKIP read] Subject='AW: Ki Risiko Analyse Rohstoffe 2026' UnRead=False
-[SKIP subject] Subject='WG: Morning Briefing |  17.02.2026' (needs exactly 'bot')
-[SKIP read] Subject='WG: Info Call Management: Weiterentwicklung@MP' UnRead=False
-[SKIP read] Subject='Heads up! We noticed that you recently deleted a large number of files from a si' UnRead=False
-[SKIP read] Subject='You’re invited: Databricks AI Days' UnRead=False
-[SKIP subject] Subject='In bewegten Zeiten gut für sich sorgen: Digitales Gesundheitsprogramm & „Gesundh' (needs exactly 'bot')
-[SKIP subject] Subject='Draft created (review needed): bot' (needs exactly 'bot')
-[SKIP subject] Subject='Draft created (review needed): bot' (needs exactly 'bot')
-[SKIP read] Subject='bot' UnRead=False
-[SKIP read] Subject='bot' UnRead=False
-[SKIP read] Subject='Reminder: review/send draft for 'bot'' UnRead=False
-[SKIP subject] Subject='WG: Morning Briefing |  16.02.2026' (needs exactly 'bot')
-[SKIP subject] Subject='WG: Weekend News | 15.02.2026' (needs exactly 'bot')
-[SKIP subject] Subject='WG: Weekend News | 14.02.2026' (needs exactly 'bot')
-[SKIP subject] Subject='Neue Nachricht in IT Shop: Bitte bewerten Sie Ihre neuen Services' (needs exactly 'bot')
-[SKIP subject] Subject='Draft created (review needed): bot' (needs exactly 'bot')
-[SKIP subject] Subject='Draft created (review needed): bot' (needs exactly 'bot')
-[SKIP subject] Subject='Draft created (review needed): bot' (needs exactly 'bot')
-[SKIP category] Subject='bot' Cats='Drafted-NoLLM'
-[SKIP subject] Subject='MMA+MFA2 BRM-JF - 12.02.2026: Link zu den Unterlagen' (needs exactly 'bot')
-[SKIP subject] Subject='Mercedes-Benz. Die Woche. | 13. Februar 2026' (needs exactly 'bot')
-[SKIP subject] Subject='Draft created (review needed): bot' (needs exactly 'bot')
-[SKIP subject] Subject='Neuer Lieferantenterminplan - C590, 0500 Sindelfingen / New supplier schedule - ' (needs exactly 'bot')
-[SKIP read] Subject='bot' UnRead=False
-[SKIP read] Subject='Neue Nachricht in IT Shop: Information: Registrierung bei Software Provider (Auf' UnRead=False
-[SKIP read] Subject='Welcome to M365 Copilot!' UnRead=False
-[SKIP read] Subject='Kunstführungen 2026 für alle Mitarbeitende in Stuttgart | Guided art tours in St' UnRead=False
-[SKIP read] Subject='Neue Nachricht in IT Shop: Änderung des Auftragsstatus (Auftrag 41806851)' UnRead=False
-[SKIP read] Subject='WG: Aushang Unternehmensergebnis' UnRead=False
+# -*- coding: utf-8 -*-
+"""
+OUTLOOK DRAFT BOT (NO LLM) — Notebook-safe
 
-=== Summary ===
-Checked: 201
-Drafted: 1
-Skip not MailItem: 9
-Skip category: 7
-Skip read: 147
-Skip subject: 36
-Passed filters: 1
+Deterministic behavior:
+- Processes emails in Outlook folder where Subject == "bot" (case-insensitive exact).
+- Builds a draft reply using ONLY KB documents (no mail-chain docs).
+- Two answer modes:
+  A) Definition Mode: for "what is X / was ist X / meaning / steht für" → tries to find a definition in KB
+  B) Retrieval Mode: otherwise → selects best snippets + bullets via overlap scoring
+- Bilingual output (DE + EN) without external translators:
+  - DE: derived from KB snippets
+  - EN: safe rule-based conversion for definition, else conservative “same content” with minimal transformations
+- Redaction: removes emails/phones/urls/addresses/IDs and removes person names (no [PERSON] placeholders).
+- Marks original mail read and categorizes it to avoid duplicates.
+"""
+
+import re
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import win32com.client as win32
+
+
+# =========================================================
+# SETTINGS — EDIT THESE
+# =========================================================
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"
+WATCH_FOLDER_NAME = "Inbox"
+
+KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
+
+REQUIRE_UNREAD = True
+REQUIRE_STRICT_SUBJECT = True
+PROCESS_PER_RUN = 3
+SCAN_LIMIT = 200
+STARTUP_DELAY_SEC = 1
+
+PROCESSED_CATEGORY = "Drafted-NoLLM"
+
+# KB limits
+SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
+MAX_FILES = 8
+MAX_CHARS_PER_FILE = 9000
+MAX_TOTAL_CHARS = 22000
+
+# Prefer documents, not mail-like artifacts in KB
+MAILY_FILENAME_HINTS = ["aw", "wg", "re", "fw", "subject", "mail", "email", ".msg"]
+
+# Sources line (docs only) — keep short
+INCLUDE_SOURCES_LINE = True
+MAX_SOURCES = 6
+
+# Signature
+SIGNATURE_NAME = "Shubham"
+
+
+# =========================================================
+# BASIC UTIL
+# =========================================================
+STOPWORDS = set("""
+the a an and or to of in on for with without from by at is are was were be been being
+der die das und oder zu von im in am an auf für mit ohne aus bei ist sind war waren
+was ist meaning definition steht für
+""".split())
+
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def strict_subject_is_bot(subject: str) -> bool:
+    return (subject or "").strip().lower() == "bot"
+
+def tokenize(s: str):
+    toks = re.split(r"[^a-zA-Z0-9ÄÖÜäöüß]+", (s or "").lower())
+    return [t for t in toks if t and t not in STOPWORDS and len(t) >= 2]
+
+def clean_html_to_text(html: str) -> str:
+    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
+    txt = re.sub(r"&nbsp;|&amp;|&lt;|&gt;|&quot;", " ", txt)
+    return clean_ws(txt)
+
+def format_outlook_html(text: str) -> str:
+    text = (text or "").replace("\r\n", "\n").strip()
+    if not text:
+        return "<p></p>"
+    blocks = re.split(r"\n\s*\n", text)
+    html_parts = []
+    for block in blocks:
+        lines = [ln.rstrip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        # bullet list
+        if all(ln.lstrip().startswith("- ") for ln in lines):
+            html_parts.append("<ul>")
+            for ln in lines:
+                item = ln.lstrip()[2:].strip()
+                html_parts.append(f"<li>{escape_html(item)}</li>")
+            html_parts.append("</ul>")
+        else:
+            para = "<br>".join(escape_html(ln) for ln in lines)
+            html_parts.append(f"<p>{para}</p>")
+    return "\n".join(html_parts)
+
+def escape_html(s: str) -> str:
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    s = s.replace('"', "&quot;")
+    return s
+
+
+# =========================================================
+# REDACTION — REMOVE (not replace) personal info
+# =========================================================
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+PHONE_RE = re.compile(r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d")
+URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
+DOMAIN_RE = re.compile(r"\b(?:[a-z0-9-]+\.)+(?:com|net|org|de|eu|io|gov|edu|co)\b", re.I)
+IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b", re.I)
+ADDRESS_RE = re.compile(
+    r"\b([A-ZÄÖÜ][a-zäöüß]+(?:\s[A-ZÄÖÜ][a-zäöüß]+){0,3})\s"
+    r"(Straße|Strasse|Str\.|Weg|Allee|Platz|Ring|Gasse|Damm|Ufer)\s"
+    r"\d{1,5}[a-zA-Z]?\b"
+)
+# Title names + First Last names (remove)
+TITLE_NAME_RE = re.compile(r"\b(?:Mr|Mrs|Ms|Miss|Dr|Prof|Herr|Frau)\.?\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b")
+NAME2_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b")
+
+def redact_sensitive(text: str) -> str:
+    if not text:
+        return ""
+    t = text
+
+    # Remove header-like lines (From/To/Cc/Subject)
+    t = re.sub(r"(?im)^\s*(von|from|an|to|cc|bcc|gesendet|sent|betreff|subject)\s*:\s*.*$", "", t)
+
+    # Remove sensitive tokens entirely
+    t = EMAIL_RE.sub("", t)
+    t = URL_RE.sub("", t)
+    t = DOMAIN_RE.sub("", t)
+    t = IBAN_RE.sub("", t)
+    t = PHONE_RE.sub("", t)
+    t = ADDRESS_RE.sub("", t)
+
+    # Remove person names
+    t = TITLE_NAME_RE.sub("", t)
+    t = NAME2_RE.sub("", t)
+
+    # Cleanup punctuation/whitespace artifacts
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"\s+,", ",", t)
+    t = re.sub(r"\(\s*\)", "", t)
+    return t.strip()
+
+
+# =========================================================
+# KB READERS (safe, skip if libs missing)
+# =========================================================
+def read_txt(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="ignore")
+
+def read_docx(p: Path) -> str:
+    try:
+        from docx import Document as DocxDocument
+    except Exception:
+        return ""
+    doc = DocxDocument(str(p))
+    out = []
+    for par in doc.paragraphs:
+        s = clean_ws(par.text)
+        if s:
+            out.append(s)
+    # tables
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [clean_ws(c.text) for c in row.cells]
+            if any(cells):
+                out.append(" | ".join(cells))
+    return "\n".join(out)
+
+def read_pdf(p: Path) -> str:
+    try:
+        import pdfplumber
+        out = []
+        with pdfplumber.open(str(p)) as pdf:
+            for page in pdf.pages:
+                out.append(page.extract_text() or "")
+        return "\n".join(out)
+    except Exception:
+        return ""
+
+def read_xlsx(p: Path) -> str:
+    try:
+        import openpyxl
+    except Exception:
+        return ""
+    wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+    out = []
+    for ws in wb.worksheets:
+        out.append(f"Sheet: {ws.title}")
+        max_rows = min(ws.max_row or 0, 200)
+        max_cols = min(ws.max_column or 0, 40)
+        for r in range(1, max_rows + 1):
+            row_vals = []
+            for c in range(1, max_cols + 1):
+                v = ws.cell(row=r, column=c).value
+                row_vals.append("" if v is None else str(v))
+            if any(x.strip() for x in row_vals):
+                out.append(" | ".join(clean_ws(x) for x in row_vals))
+    return "\n".join(out)
+
+def extract_text_from_file(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext == ".txt":
+        return read_txt(p)
+    if ext == ".docx":
+        return read_docx(p)
+    if ext == ".pdf":
+        return read_pdf(p)
+    if ext == ".xlsx":
+        return read_xlsx(p)
+    return ""
+
+def is_maily_filename(p: Path) -> bool:
+    stem = (p.stem or "").lower()
+    if stem.startswith("~$"):
+        return True
+    return any(h in stem for h in MAILY_FILENAME_HINTS)
+
+def load_kb(dirpath: str):
+    base = Path(dirpath)
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"KB_DIR not found or not a folder: {dirpath}")
+
+    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    files = [p for p in files if not is_maily_filename(p)]
+
+    chunks = []
+    for p in sorted(files):
+        try:
+            txt = extract_text_from_file(p)
+            txt = txt.strip()
+            if not txt:
+                continue
+            txt = txt[:MAX_CHARS_PER_FILE]
+            # chunk by blank lines for better targeting
+            paras = [clean_ws(x) for x in re.split(r"\n{2,}", txt) if clean_ws(x)]
+            if not paras:
+                chunks.append((str(p), p.name, txt))
+            else:
+                for i, para in enumerate(paras[:60]):
+                    chunks.append((str(p), f"{p.name}#p{i+1}", para[:MAX_CHARS_PER_FILE]))
+        except Exception:
+            continue
+    return chunks
+
+
+# =========================================================
+# DETERMINISTIC RETRIEVAL + DEFINITION MODE
+# =========================================================
+DEF_INTENT_RE = re.compile(r"(?i)\b(what\s+is|meaning\s+of|define|definition|was\s+ist|bedeutung|steht\s+für)\b")
+
+def extract_definition_term(question: str) -> str | None:
+    q = clean_ws(question)
+    if not q:
+        return None
+    # Acronym-only questions like "PPA?" or "PPAs?"
+    m = re.match(r"^\s*([A-Za-z]{2,10})s?\s*\?\s*$", q)
+    if m:
+        return m.group(1).upper()
+
+    # "what is X" / "was ist X"
+    m = re.search(r"(?i)\b(?:what\s+is|was\s+ist|meaning\s+of|steht\s+für)\s+([A-Za-z][A-Za-z0-9\-_/]{1,30})", q)
+    if m:
+        term = m.group(1).strip()
+        # normalize plural PPAs -> PPA
+        term = term[:-1] if term.lower().endswith("s") and len(term) <= 10 else term
+        return term.upper() if term.isalpha() and len(term) <= 10 else term
+    return None
+
+def score_chunk_basic(query: str, chunk_text: str, chunk_name: str) -> int:
+    q_tokens = tokenize(query)
+    if not q_tokens:
+        return 0
+    text = chunk_text.lower()
+    name = chunk_name.lower()
+    score = 0
+    # filename boosts
+    for tk in tokenize(name):
+        if tk in q_tokens:
+            score += 10
+    # content
+    uniq = set(q_tokens)
+    for tk in uniq:
+        if tk in text:
+            score += 3
+    # policy-ish cues
+    if any(k in text for k in ["must", "shall", "require", "requirement", "muss", "soll", "erforder", "anforder", "definition", "steht für", "bedeutung"]):
+        score += 5
+    return score
+
+def pick_relevant_chunks(kb_chunks, query: str, max_files: int):
+    scored = []
+    for fullpath, name, txt in kb_chunks:
+        s = score_chunk_basic(query, txt, name)
+        if s > 0:
+            scored.append((s, fullpath, name, txt))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    picked = []
+    used_sources = []
+    total = 0
+    for s, fullpath, name, txt in scored:
+        if len(picked) >= max_files:
+            break
+        if total + len(txt) > MAX_TOTAL_CHARS:
+            txt = txt[:max(0, MAX_TOTAL_CHARS - total)]
+        if not txt.strip():
+            continue
+        picked.append((name, txt))
+        used_sources.append(Path(fullpath).name)
+        total += len(txt)
+        if total >= MAX_TOTAL_CHARS:
+            break
+
+    # dedup sources
+    out_sources, seen = [], set()
+    for s in used_sources:
+        if s not in seen:
+            seen.add(s)
+            out_sources.append(s)
+    return picked, out_sources
+
+def find_definition_in_snippets(term: str, snippets: list[tuple[str,str]]) -> str | None:
+    """
+    Try to extract a definition sentence/line for TERM from snippets.
+    Patterns:
+      - TERM (Expansion ...)
+      - TERM stands for ...
+      - TERM = ...
+      - Definition ... TERM ...
+      - TERM steht für ...
+    """
+    if not term:
+        return None
+    term_esc = re.escape(term)
+    patterns = [
+        re.compile(rf"(?i)\b{term_esc}\b\s*\(([^){{}}]{{4,120}})\)"),
+        re.compile(rf"(?i)\b{term_esc}\b\s*(?:stands\s+for|steht\s+für)\s+([^\.:\n]{{4,160}})"),
+        re.compile(rf"(?i)\b{term_esc}\b\s*=\s*([^\.:\n]{{4,160}})"),
+        re.compile(rf"(?i)\bdefinition\b.*?\b{term_esc}\b.*?(?:[:\-])\s*([^\.:\n]{{4,200}})"),
+    ]
+
+    candidates = []
+    for name, txt in snippets:
+        # search line-wise first (often cleaner)
+        for line in txt.splitlines():
+            line = clean_ws(line)
+            if not line or len(line) < 8:
+                continue
+            for pat in patterns:
+                m = pat.search(line)
+                if m:
+                    # Build a compact definition
+                    rhs = clean_ws(m.group(1))
+                    if rhs:
+                        candidates.append(f"{term}: {rhs}")
+        # then sentence-wise
+        text = re.sub(r"\s+", " ", txt)
+        for sent in re.split(r"(?<=[\.\!\?])\s+", text):
+            sent = clean_ws(sent)
+            if len(sent) < 20:
+                continue
+            for pat in patterns:
+                m = pat.search(sent)
+                if m:
+                    rhs = clean_ws(m.group(1))
+                    if rhs:
+                        candidates.append(f"{term}: {rhs}")
+
+    # pick shortest “good” candidate (definitions should be concise)
+    candidates = [c for c in candidates if 10 <= len(c) <= 220]
+    if not candidates:
+        return None
+    candidates.sort(key=len)
+    return candidates[0]
+
+def build_bilingual_definition(term: str, definition: str, sources: list[str]) -> str:
+    # DE + EN without pretending full translation if unknown language
+    # For known pattern "X: Power Purchase Agreement" we can translate EN side trivially.
+    de = [
+        "Hallo Sustainable-procurement,",
+        "ich hoffe, es geht Ihnen gut.",
+        "",
+        f"Definition:",
+        f"- {definition}",
+    ]
+    if INCLUDE_SOURCES_LINE and sources:
+        de += ["", "Interne Quellen (Dokumente): " + ", ".join(sources[:MAX_SOURCES])]
+    de += ["", "Mit freundlichen Grüßen", SIGNATURE_NAME]
+
+    # EN: if the definition already contains an English expansion, keep it.
+    en_def = definition
+    # small German-to-English hint if it contains "steht für"
+    en_def = re.sub(r"(?i)\bsteht\s+für\b", "stands for", en_def)
+
+    en = [
+        "Hello Sustainable-procurement,",
+        "I hope you are doing well.",
+        "",
+        "Definition:",
+        f"- {en_def}",
+        "",
+        "Best regards,",
+        SIGNATURE_NAME,
+    ]
+    return redact_sensitive("\n".join(de).strip() + "\n\n---\n\n" + "\n".join(en).strip())
+
+def build_bilingual_bullets(bullets: list[str], sources: list[str]) -> str:
+    de = [
+        "Hallo Sustainable-procurement,",
+        "ich hoffe, es geht Ihnen gut.",
+        "",
+    ] + [f"- {b}" for b in bullets if b.strip()]
+
+    if INCLUDE_SOURCES_LINE and sources:
+        de += ["", "Interne Quellen (Dokumente): " + ", ".join(sources[:MAX_SOURCES])]
+
+    de += ["", "Mit freundlichen Grüßen", SIGNATURE_NAME]
+
+    # EN: conservative — do not fake translate; repeat content but label as is if it looks German-heavy
+    def looks_german(s: str) -> bool:
+        s2 = " " + s.lower() + " "
+        return sum(x in s2 for x in [" der ", " die ", " das ", " und ", " nicht ", " wird ", " soll ", " muss "]) >= 2
+
+    en = [
+        "Hello Sustainable-procurement,",
+        "I hope you are doing well.",
+        "",
+        "Key points:",
+    ]
+    for b in bullets[:8]:
+        b = clean_ws(b)
+        if not b:
+            continue
+        en.append(f"- {(b if not looks_german(b) else '(DE original) ' + b)}")
+
+    en += ["", "Best regards,", SIGNATURE_NAME]
+
+    return redact_sensitive("\n".join(de).strip() + "\n\n---\n\n" + "\n".join(en).strip())
+
+def build_answer(question_text: str, kb_chunks):
+    q = clean_ws(question_text)
+    term = extract_definition_term(q) if DEF_INTENT_RE.search(q) else None
+
+    # get relevant snippets
+    snippets, sources = pick_relevant_chunks(kb_chunks, query=q, max_files=MAX_FILES)
+
+    # Definition mode
+    if term:
+        definition = find_definition_in_snippets(term, snippets)
+        if definition:
+            return build_bilingual_definition(term, definition, sources)
+
+    # Retrieval bullets mode
+    q_tokens = set(tokenize(q))
+    candidates = []
+    for name, txt in snippets:
+        # split into candidate lines
+        lines = [clean_ws(x) for x in re.split(r"[\n\r]+", txt) if clean_ws(x)]
+        for line in lines:
+            ltoks = set(tokenize(line))
+            overlap = len(q_tokens & ltoks)
+            if overlap <= 0:
+                continue
+            bonus = 2 if re.search(r"(?i)\b(must|shall|require|requirement|muss|soll|erforder|anforder)\b", line) else 0
+            candidates.append((overlap + bonus, line))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    bullets = []
+    seen = set()
+    for score, line in candidates:
+        key = line.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        # avoid ultra-long copy
+        if len(line) > 260:
+            line = line[:260].rsplit(" ", 1)[0] + "…"
+        bullets.append(line)
+        if len(bullets) >= 6:
+            break
+
+    if not bullets:
+        bullets = ["Ich konnte in den verfügbaren Dokumenten keine eindeutige, explizite Antwort finden."]
+
+    return build_bilingual_bullets(bullets, sources)
+
+
+# =========================================================
+# OUTLOOK HELPERS
+# =========================================================
+def get_sender_smtp(mail) -> str:
+    try:
+        addr = (mail.SenderEmailAddress or "").lower()
+        if addr.startswith("/o="):
+            ex = mail.Sender.GetExchangeUser()
+            if ex:
+                return (ex.PrimarySmtpAddress or "").lower()
+        return addr
+    except Exception:
+        return (mail.SenderEmailAddress or "").lower()
+
+def add_processed_category(mail):
+    try:
+        cats = mail.Categories or ""
+        if PROCESSED_CATEGORY.lower() not in cats.lower():
+            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
+        mail.Save()
+    except Exception:
+        pass
+
+def mark_read(mail):
+    try:
+        mail.UnRead = False
+        mail.Save()
+    except Exception:
+        pass
+
+def get_target_folder():
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    target_store = None
+    for st in ns.Stores:
+        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
+            target_store = st
+            break
+    if not target_store:
+        print("Available stores:")
+        for st in ns.Stores:
+            print(" -", st.DisplayName)
+        raise SystemExit("Target mailbox not found. Adjust TARGET_MAILBOX.")
+
+    inbox = target_store.GetDefaultFolder(6)  # Inbox
+    if WATCH_FOLDER_NAME.lower() == "inbox":
+        return ns, inbox, target_store.DisplayName, "Inbox"
+
+    for f in inbox.Folders:
+        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
+            return ns, f, target_store.DisplayName, f.Name
+    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox.")
+
+
+# =========================================================
+# MAIN RUN (ONE PASS)
+# =========================================================
+def run_bot_once():
+    time.sleep(STARTUP_DELAY_SEC)
+
+    print("Loading KB from:", KB_DIR)
+    kb_chunks = load_kb(KB_DIR)
+    print("KB loaded (chunks):", len(kb_chunks))
+
+    ns, folder, store_name, folder_name = get_target_folder()
+    print(f"Mailbox={store_name} | Folder={folder_name}")
+
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True)
+
+    drafted = 0
+    checked = 0
+
+    for mail in items:
+        checked += 1
+        if checked > SCAN_LIMIT:
+            break
+        if drafted >= PROCESS_PER_RUN:
+            break
+
+        try:
+            if getattr(mail, "Class", None) != 43:
+                continue
+
+            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
+                continue
+
+            if REQUIRE_UNREAD and not mail.UnRead:
+                continue
+
+            subject = mail.Subject or ""
+            if REQUIRE_STRICT_SUBJECT and not strict_subject_is_bot(subject):
+                continue
+
+            body_text = clean_html_to_text(getattr(mail, "HTMLBody", "") or "")
+
+            # Build answer
+            reply_text = build_answer(body_text, kb_chunks)
+
+            # Final redaction sweep (no placeholders)
+            reply_text = redact_sensitive(reply_text)
+
+            # Create reply draft
+            reply = mail.Reply()
+            reply.HTMLBody = f"<div>{format_outlook_html(reply_text)}</div><hr>" + reply.HTMLBody
+            reply.Save()
+
+            mark_read(mail)
+            add_processed_category(mail)
+
+            drafted += 1
+            print("Draft created for subject:", subject)
+
+        except Exception as e:
+            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", repr(e))
+
+    print(f"Done. Checked={checked}, Drafted={drafted}")
+
+# Run:
+# run_bot_once()
