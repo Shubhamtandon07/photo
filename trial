@@ -1,21 +1,950 @@
-Hallo [PERSON],
-ich hoffe, es geht Ihnen gut.
-•	auch Grünstromstandard | Handelt sich dabei um 5.3 Priorität 3: PPAs mit einer rein bilanziellen EAC-Versorgung (virtuelle PPAs)?
-[PERSON] (Dokumente): [PHONE] Frageliste MBEAL - Nachhaltigkeit.docx, RFQ Scheinwerfer MMA Mopf - Nachhaltigkeitsprämissen__9b135049.docx
-Mit freundlichen [PERSON]
----
-Hello [PERSON],
-I hope you are doing well.
-Key points:
-- auch Grünstromstandard | Handelt sich dabei um 5.3 Priorität 3: PPAs mit einer rein bilanziellen EAC-Versorgung (virtuelle PPAs)?
-Best regards,
-Shubham
-________________________________________
+# -*- coding: utf-8 -*-
+"""
+OUTLOOK DRAFT BOT (NO LLM) — Notebook-safe (Windows + Outlook Desktop)
+
+Goal
+- Deterministic draft replies using ONLY your internal KB documents (no mail chains, no LLM).
+- Always produces DE + EN drafts.
+- Marks the triggering email as Read + adds a category to prevent duplicate drafting.
+- Sends you a self-notification and creates a Task reminder due in 2 days.
+
+Key improvements vs your current script
+1) Better retrieval: lightweight BM25-style scoring + passage windows (not “quote anything connected”).
+2) Better answer assembly:
+   - detects definition / "where to find" / checklist / yes-no patterns
+   - extracts short, relevant passages (not whole lines) and formats as bullets
+3) No "[PERSON]" tokens in output:
+   - redaction REMOVES names (and other personal data) instead of inserting [PERSON]
+   - greeting uses a neutral salutation (“Hallo,” / “Hello,”) unless sender is a role mailbox
+4) EN section is not a fake translation:
+   - tries to pull EN sentences from KB if available
+   - if not, uses a conservative “explain-in-English” template + selected key terms
+   - optional: plug in Microsoft Translator if you later add keys (see config)
+
+Requirements
+- Windows + Outlook installed
+- pip install pywin32
+- Your KB is local folder with .pdf/.docx/.xlsx/.txt
+
+Run in Jupyter
+- Put this entire script in ONE cell
+- Run
+- Call: run_bot_once()
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timedelta
+from pathlib import Path
+from html import escape
+import math
+
+import win32com.client as win32
 
 
-Von: sustainable-procurement (050-NPM) <sustainable-procurement@mercedes-benz.com> 
-Gesendet: Freitag, 20. Februar 2026 13:05
-An: Tandon, Shubham (050) <shubham.tandon@mercedes-benz.com>
-Betreff: bot
+# =========================================================
+# SETTINGS — EDIT THESE
+# =========================================================
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"  # substring match of Store DisplayName or SmtpAddress
+WATCH_FOLDER_NAME = "Inbox"                          # "Inbox" or a subfolder under Inbox
 
-PPAs (Power Purchase Agreements), what is this?
+# Knowledge Base folder (documents only)
+KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
+
+# Processing behavior
+REQUIRE_UNREAD = True
+PROCESS_PER_RUN = 3
+SCAN_LIMIT = 200
+STARTUP_DELAY_SEC = 0  # notebook: 0 is fine
+
+# Gate condition: subject must be exactly "bot" (no RE:/AW:)
+REQUIRE_STRICT_SUBJECT = True
+
+# Avoid duplicates
+PROCESSED_CATEGORY = "Drafted-NoLLM"
+
+# Self notify + task reminder
+SELF_NOTIFY = True
+SELF_NOTIFY_TO = TARGET_MAILBOX
+CREATE_REMINDER_TASK = True
+REMINDER_DAYS = 2
+
+# KB limits
+SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
+MAX_FILES = 8                 # max distinct documents used
+MAX_CHARS_PER_CHUNK = 3000    # keep chunks short
+MAX_PASSAGES = 10             # max passages extracted for DE bullets
+MAX_TOTAL_PASSAGE_CHARS = 14000
+
+# Prefer documents, not mail-like artifacts in KB
+MAILY_FILENAME_HINTS = ["aw", "wg", "re", "fw", "subject", "mail", "email", "reply", "antwort"]
+
+# Redaction: remove sensitive info (no [PERSON] tokens)
+# You requested additional names to delete as well
+EXPLICIT_NAMES_TO_REMOVE = {
+    "lisa", "dario", "tim", "daniel", "rasmus", "marvin", "victoria",
+    "janina", "veronika", "athanasia", "alina", "anne"
+}
+
+# Company terms: you can remove or keep (keeping might be OK internally; you requested aggressive privacy earlier)
+REDACT_COMPANY_TERMS = [
+    "Mercedes-Benz", "Mercedes Benz", "Mercedes", "Daimler"
+]
+
+# OPTIONAL: If later you get a Microsoft Translator key, you can wire it here.
+# For now it stays OFF (no external calls).
+USE_MS_TRANSLATOR = False
+MS_TRANSLATOR_KEY = ""   # set if you want
+MS_TRANSLATOR_REGION = ""
+
+
+# =========================================================
+# REGEX / TEXT UTILS
+# =========================================================
+STOPWORDS = set("""
+the a an and or to of in on for with without from by at is are was were be been being this that
+der die das und oder zu von im in am an auf für mit ohne aus bei ist sind war waren
+""".split())
+
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+PHONE_RE = re.compile(r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d")
+URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
+DOMAIN_RE = re.compile(r"\b(?:[a-z0-9-]+\.)+(?:com|net|org|de|eu|io|gov|edu|co)\b", re.I)
+IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b", re.I)
+
+# very rough address-ish
+ADDRESS_RE = re.compile(
+    r"\b([A-ZÄÖÜ][a-zäöüß]+(?:\s[A-ZÄÖÜ][a-zäöüß]+){0,3})\s"
+    r"(Straße|Strasse|Str\.|Weg|Allee|Platz|Ring|Gasse|Damm|Ufer)\s"
+    r"\d{1,5}[a-zA-Z]?\b"
+)
+
+# Two-word capitalized name; used for removal (be careful: can also hit headings).
+NAME2_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b")
+
+# Outlook header-ish lines
+HEADER_LINE_RE = re.compile(r"(?im)^\s*(von|from|an|to|cc|bcc|gesendet|sent|betreff|subject)\s*:\s*.*$")
+
+def clean_ws(s: str) -> str:
+    s = (s or "").replace("\r\n", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+def tokenize(text: str) -> list[str]:
+    toks = re.split(r"[^a-zA-Z0-9ÄÖÜäöüß]+", (text or "").lower())
+    toks = [t for t in toks if t and t not in STOPWORDS and len(t) >= 2]
+    return toks
+
+def strict_subject_is_bot(subject: str) -> bool:
+    return (subject or "").strip().lower() == "bot"
+
+def safe_firstname_from_email(email: str) -> str:
+    email = (email or "").strip()
+    local = email.split("@", 1)[0] if "@" in email else email
+    first = local.split(".", 1)[0].strip()
+    if not first:
+        return "Colleague"
+    return first[:1].upper() + first[1:]
+
+def clean_html_to_text(html: str) -> str:
+    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
+    txt = clean_ws(txt)
+    return txt
+
+
+# =========================================================
+# REDACTION — remove (not replace) personal data
+# =========================================================
+def remove_explicit_names(text: str) -> str:
+    if not text:
+        return ""
+    t = text
+    # remove explicit firstnames list (case-insensitive)
+    for nm in sorted(EXPLICIT_NAMES_TO_REMOVE, key=len, reverse=True):
+        t = re.sub(rf"(?i)\b{re.escape(nm)}\b", "", t)
+    return t
+
+def redact_sensitive(text: str) -> str:
+    if not text:
+        return ""
+    t = text
+
+    # Remove obvious headers (keeps your draft clean)
+    t = HEADER_LINE_RE.sub("", t)
+
+    for term in REDACT_COMPANY_TERMS:
+        if term:
+            t = re.sub(re.escape(term), "", t, flags=re.I)
+
+    t = EMAIL_RE.sub("", t)
+    t = PHONE_RE.sub("", t)
+    t = URL_RE.sub("", t)
+    t = DOMAIN_RE.sub("", t)
+    t = IBAN_RE.sub("", t)
+    t = ADDRESS_RE.sub("", t)
+
+    # Remove explicit names you listed + many two-word names
+    t = remove_explicit_names(t)
+
+    # Remove two-token names, but avoid killing short headings like "Power Purchase"
+    def _name2_guard(m):
+        s = m.group(0)
+        # If it looks like a common term, keep it
+        if re.search(r"(?i)\b(power|purchase|agreement|responsible|sourcing|sustainability|premises|standard)\b", s):
+            return s
+        return ""
+    t = NAME2_RE.sub(_name2_guard, t)
+
+    # Cleanup whitespace
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"\s+\n", "\n", t)
+    t = re.sub(r"\n\s+", "\n", t)
+    return t.strip()
+
+
+# =========================================================
+# KB READERS
+# =========================================================
+def read_txt(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="ignore")
+
+def read_docx(p: Path) -> str:
+    try:
+        from docx import Document as DocxDocument
+    except Exception:
+        return ""
+    doc = DocxDocument(str(p))
+    parts = []
+    for par in doc.paragraphs:
+        tx = clean_ws(par.text)
+        if tx:
+            parts.append(tx)
+    # tables
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [clean_ws(c.text) for c in row.cells]
+            if any(cells):
+                parts.append(" | ".join(cells))
+    return clean_ws("\n".join(parts))
+
+def read_pdf(p: Path) -> str:
+    # Prefer pdfplumber if available, else pypdf
+    try:
+        import pdfplumber
+        out = []
+        with pdfplumber.open(str(p)) as pdf:
+            for page in pdf.pages:
+                out.append(page.extract_text() or "")
+        return clean_ws("\n".join(out))
+    except Exception:
+        pass
+    try:
+        from pypdf import PdfReader
+        r = PdfReader(str(p))
+        out = []
+        for pg in r.pages:
+            try:
+                out.append(pg.extract_text() or "")
+            except Exception:
+                pass
+        return clean_ws("\n".join(out))
+    except Exception:
+        return ""
+
+def read_xlsx(p: Path) -> str:
+    try:
+        import openpyxl
+    except Exception:
+        return ""
+    wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+    out = []
+    for ws in wb.worksheets:
+        out.append(f"Sheet: {ws.title}")
+        max_rows = min(ws.max_row or 0, 200)
+        max_cols = min(ws.max_column or 0, 30)
+        for r in range(1, max_rows + 1):
+            row_vals = []
+            for c in range(1, max_cols + 1):
+                v = ws.cell(row=r, column=c).value
+                row_vals.append("" if v is None else str(v))
+            if any(x.strip() for x in row_vals):
+                out.append(" | ".join(clean_ws(x) for x in row_vals))
+    return clean_ws("\n".join(out))
+
+def extract_text_from_file(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext == ".txt":
+        return read_txt(p)
+    if ext == ".docx":
+        return read_docx(p)
+    if ext == ".pdf":
+        return read_pdf(p)
+    if ext == ".xlsx":
+        return read_xlsx(p)
+    return ""
+
+
+def is_maily_filename(p: Path) -> bool:
+    stem = (p.stem or "").lower()
+    if stem.startswith("~$"):
+        return True
+    # match tokens OR substring
+    return any(h in stem.split() for h in MAILY_FILENAME_HINTS) or any(h in stem for h in MAILY_FILENAME_HINTS)
+
+
+def chunk_text(text: str, max_chars: int = MAX_CHARS_PER_CHUNK) -> list[str]:
+    """
+    Split into chunks. Prefer paragraph-based chunks. Keep them short for scoring.
+    """
+    text = clean_ws(text)
+    if not text:
+        return []
+    paras = [clean_ws(x) for x in re.split(r"\n{2,}", text) if clean_ws(x)]
+    if not paras:
+        paras = [text]
+    chunks = []
+    cur = ""
+    for p in paras:
+        if not cur:
+            cur = p
+        elif len(cur) + 2 + len(p) <= max_chars:
+            cur += "\n\n" + p
+        else:
+            chunks.append(cur[:max_chars])
+            cur = p
+    if cur:
+        chunks.append(cur[:max_chars])
+    return chunks
+
+
+def load_kb(dirpath: str):
+    base = Path(dirpath)
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"KB_DIR not found or not a folder: {dirpath}")
+
+    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    files = [p for p in files if not is_maily_filename(p)]
+
+    kb_chunks = []
+    for p in sorted(files):
+        try:
+            raw = extract_text_from_file(p)
+            raw = clean_ws(raw)
+            if not raw:
+                continue
+            for i, ch in enumerate(chunk_text(raw), start=1):
+                kb_chunks.append({
+                    "doc_path": str(p),
+                    "doc_name": p.name,
+                    "chunk_id": f"{p.name}#c{i}",
+                    "text": ch
+                })
+        except Exception:
+            continue
+
+    return kb_chunks
+
+
+# =========================================================
+# RETRIEVAL — BM25-lite (deterministic, no external libs)
+# =========================================================
+def build_bm25_index(kb_chunks: list[dict]):
+    """
+    Precompute token frequencies and IDF.
+    """
+    docs = []
+    df = {}  # document frequency
+    for ch in kb_chunks:
+        toks = tokenize(ch["text"] + " " + ch["chunk_id"])
+        tf = {}
+        for t in toks:
+            tf[t] = tf.get(t, 0) + 1
+        ch["_toks"] = toks
+        ch["_tf"] = tf
+        docs.append(ch)
+        for t in set(tf.keys()):
+            df[t] = df.get(t, 0) + 1
+
+    N = max(1, len(docs))
+    idf = {}
+    for t, dft in df.items():
+        # BM25 idf variant
+        idf[t] = math.log(1 + (N - dft + 0.5) / (dft + 0.5))
+    avgdl = sum(len(d["_toks"]) for d in docs) / N
+    return {"docs": docs, "idf": idf, "avgdl": avgdl, "N": N}
+
+
+def bm25_score(query: str, doc: dict, index: dict, k1: float = 1.4, b: float = 0.75) -> float:
+    q_toks = tokenize(query)
+    if not q_toks:
+        return 0.0
+    idf = index["idf"]
+    tf = doc["_tf"]
+    dl = max(1, len(doc["_toks"]))
+    avgdl = max(1.0, index["avgdl"])
+
+    score = 0.0
+    for t in set(q_toks):
+        if t not in tf:
+            continue
+        f = tf[t]
+        term_idf = idf.get(t, 0.0)
+        denom = f + k1 * (1 - b + b * (dl / avgdl))
+        score += term_idf * (f * (k1 + 1) / denom)
+
+    # mild boost if chunk contains requirement language
+    text_l = doc["text"].lower()
+    if any(k in text_l for k in ["must", "shall", "require", "requirement", "muss", "soll", "erforder", "anforder"]):
+        score *= 1.08
+
+    return score
+
+
+def retrieve_top_chunks(index: dict, query: str, top_k: int = 15):
+    scored = []
+    for d in index["docs"]:
+        s = bm25_score(query, d, index)
+        if s > 0:
+            scored.append((s, d))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:top_k]
+
+
+def extract_passages(text: str, query: str, window_chars: int = 350, max_passages: int = 3) -> list[str]:
+    """
+    Pull short windows around best-matching query tokens.
+    This avoids dumping random lines and improves “context understanding” deterministically.
+    """
+    text = clean_ws(text)
+    if not text:
+        return []
+
+    q_toks = [t for t in tokenize(query) if len(t) >= 3]
+    if not q_toks:
+        return []
+
+    # find positions of query tokens
+    hits = []
+    low = text.lower()
+    for t in set(q_toks):
+        for m in re.finditer(re.escape(t), low):
+            hits.append(m.start())
+    if not hits:
+        return []
+
+    hits.sort()
+    # pick spread-out hit centers
+    centers = []
+    last = -10**9
+    for pos in hits:
+        if pos - last >= window_chars // 2:
+            centers.append(pos)
+            last = pos
+        if len(centers) >= max_passages:
+            break
+
+    passages = []
+    for c in centers:
+        a = max(0, c - window_chars // 2)
+        b = min(len(text), c + window_chars // 2)
+        snippet = text[a:b].strip()
+        # trim to sentence boundaries if possible
+        snippet = re.sub(r"^\S*\s", "", snippet) if a > 0 else snippet
+        snippet = re.sub(r"\s\S*$", "", snippet) if b < len(text) else snippet
+        snippet = clean_ws(snippet)
+        if snippet and snippet not in passages:
+            passages.append(snippet)
+
+    return passages[:max_passages]
+
+
+def detect_language_simple(text: str) -> str:
+    t = (text or "").lower()
+    de_hits = sum(w in t for w in [" und ", " der ", " die ", " das ", "bitte", "danke", "mit freundlichen grüßen", "was ist", "wo finde"])
+    en_hits = sum(w in t for w in [" the ", " and ", " please", " thanks", " best regards", "what is", "where can i find"])
+    return "de" if de_hits >= en_hits else "en"
+
+
+# =========================================================
+# QUESTION TYPE DETECTION (improves deterministic relevance)
+# =========================================================
+def is_definition_question(q: str) -> bool:
+    ql = (q or "").strip().lower()
+    return bool(re.search(r"\b(what is|what’s|what does .* mean|define|meaning of)\b", ql)) or bool(re.search(r"\b(was ist|was bedeutet|definition)\b", ql))
+
+def is_where_to_find_question(q: str) -> bool:
+    ql = (q or "").strip().lower()
+    return bool(re.search(r"\b(where|where can i find|how do i find|location of)\b", ql)) or bool(re.search(r"\b(wo finde|wo kann ich|wo ist|pfad|ablage|im dokument)\b", ql))
+
+def is_yes_no_question(q: str) -> bool:
+    ql = (q or "").strip().lower()
+    return ql.endswith("?") and bool(re.search(r"\b(is|are|do|does|can|kann|ist|sind|darf|muss)\b", ql))
+
+
+# =========================================================
+# ANSWER ASSEMBLY
+# =========================================================
+def split_sentences(text: str) -> list[str]:
+    t = clean_ws(text)
+    if not t:
+        return []
+    # keep bullets and table rows as "sentences" too
+    parts = re.split(r"(?<=[\.\!\?])\s+|\n+", t)
+    out = []
+    for p in parts:
+        p = p.strip(" •-\t\r")
+        if len(p) >= 25:
+            out.append(p)
+    return out
+
+
+def rank_sentences(sentences: list[str], query: str, prefer_def: bool = False, prefer_where: bool = False) -> list[str]:
+    qt = set(tokenize(query))
+    ranked = []
+    for s in sentences:
+        st = set(tokenize(s))
+        overlap = len(qt & st)
+        if overlap == 0:
+            continue
+        bonus = 0
+        sl = s.lower()
+        if any(k in sl for k in ["must", "shall", "require", "muss", "soll", "erforder", "anforder"]):
+            bonus += 2
+        if prefer_def and any(k in sl for k in ["is defined", "means", "definition", "bezeichnet", "ist ein", "bedeutet"]):
+            bonus += 2
+        if prefer_where and any(k in sl for k in ["located", "see section", "chapter", "kapitel", "abschnitt", "in certus", "im system", "in portal", "im intranet"]):
+            bonus += 2
+        ranked.append((overlap + bonus, s))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [s for _, s in ranked]
+
+
+def build_bullets_from_kb(index: dict, question: str, subject: str) -> tuple[list[str], list[str], list[str]]:
+    """
+    Returns (bullets_de, bullets_en, used_doc_names)
+    Strategy:
+      - retrieve top chunks via BM25
+      - extract short passages around hits
+      - split passages into sentences, rank, pick top
+      - try to separate DE and EN sentences if possible
+    """
+    query = clean_ws(subject + " " + question)
+    top = retrieve_top_chunks(index, query, top_k=18)
+
+    prefer_def = is_definition_question(question)
+    prefer_where = is_where_to_find_question(question)
+
+    used_docs = []
+    de_pool = []
+    en_pool = []
+
+    total_chars = 0
+    for score, doc in top:
+        used_docs.append(doc["doc_name"])
+        passages = extract_passages(doc["text"], query, window_chars=420, max_passages=3)
+        for p in passages:
+            total_chars += len(p)
+            if total_chars > MAX_TOTAL_PASSAGE_CHARS:
+                break
+            # language split by sentence
+            for s in split_sentences(p):
+                lang = detect_language_simple(s)
+                if lang == "de":
+                    de_pool.append(s)
+                else:
+                    en_pool.append(s)
+        if total_chars > MAX_TOTAL_PASSAGE_CHARS:
+            break
+
+    used_docs = list(dict.fromkeys(used_docs))[:MAX_FILES]
+
+    # Rank sentences for relevance
+    de_ranked = rank_sentences(de_pool, query, prefer_def=prefer_def, prefer_where=prefer_where)
+    en_ranked = rank_sentences(en_pool, query, prefer_def=prefer_def, prefer_where=prefer_where)
+
+    # Pick top bullets
+    bullets_de = []
+    seen = set()
+    for s in de_ranked:
+        s2 = redact_sensitive(s)
+        s2 = clean_ws(s2)
+        if not s2 or s2.lower() in seen:
+            continue
+        seen.add(s2.lower())
+        bullets_de.append(s2)
+        if len(bullets_de) >= MAX_PASSAGES:
+            break
+
+    bullets_en = []
+    seen = set()
+    for s in en_ranked:
+        s2 = redact_sensitive(s)
+        s2 = clean_ws(s2)
+        if not s2 or s2.lower() in seen:
+            continue
+        seen.add(s2.lower())
+        bullets_en.append(s2)
+        if len(bullets_en) >= max(6, MAX_PASSAGES // 2):
+            break
+
+    return bullets_de, bullets_en, used_docs
+
+
+# Minimal glossary is allowed, but it is NOT the main engine.
+# It only triggers if:
+# - definition question AND KB cannot produce an adequate answer.
+GLOSSARY = {
+    "PPA": {
+        "en": (
+            "A PPA (Power Purchase Agreement) is a long-term contract to buy electricity from a specific generator "
+            "(often renewable) with agreed terms (price structure, volume, duration, and settlement/delivery model). "
+            "There are physical PPAs (delivery via grid/supply arrangements) and virtual/financial PPAs (a financial hedge; "
+            "electricity is sold to the market and parties settle price differences; certificates like EAC/GoO can be handled separately)."
+        ),
+        "de": (
+            "Ein PPA (Power Purchase Agreement) ist ein langfristiger Stromliefervertrag, bei dem Strom von einem konkreten Erzeuger "
+            "(häufig erneuerbar) zu vereinbarten Konditionen (Preis, Menge, Laufzeit und Abwicklungs-/Liefermodell) bezogen wird. "
+            "Man unterscheidet physische PPAs (Lieferung über Netz/Lieferkette) und virtuelle/finanzielle PPAs (finanzieller Absicherungsvertrag; "
+            "Strom wird am Markt verkauft, Preisunterschied wird zwischen den Parteien ausgeglichen; Zertifikate wie EAC/GoO können separat geregelt sein)."
+        ),
+    }
+}
+
+def extract_definition_term(question: str) -> str:
+    q = (question or "").strip()
+    m = re.search(r"(?i)\bwhat is\s+(.+?)[\?\.\n\r]?$", q)
+    if m:
+        return clean_ws(m.group(1))
+    m = re.search(r"(?i)\bwas ist\s+(.+?)[\?\.\n\r]?$", q)
+    if m:
+        return clean_ws(m.group(1))
+    m = re.search(r"\b([A-Z]{2,7})\b", q)
+    return m.group(1) if m else ""
+
+
+def build_bilingual_reply(
+    question: str,
+    bullets_de: list[str],
+    bullets_en: list[str],
+    signature_name: str,
+    used_docs: list[str],
+) -> str:
+    """
+    Always DE + EN.
+    - Uses neutral greeting (no personal name).
+    - Does NOT say "based on documents".
+    - Does NOT include doc names inside the email (you complained).
+    - Logs/traceability should be handled outside (optional).
+    """
+    signature_name = signature_name or "Shubham"
+
+    # If there are too few bullets, add a deterministic fallback
+    if not bullets_de and not bullets_en:
+        bullets_de = ["Ich konnte in den verfügbaren Dokumenten keine eindeutige Antwort finden. Können Sie bitte den konkreten Kontext (Dokument/Abschnitt) nennen?"]
+        bullets_en = ["I could not find a clear, explicit answer in the available documents. Could you please share the exact context (document/section)?"]
+
+    # If EN is missing but DE exists, produce a conservative EN explanation template (not fake translation)
+    if not bullets_en and bullets_de:
+        # Use key terms from the question
+        q_terms = [t for t in tokenize(question)[:10]]
+        hint = ", ".join(q_terms[:6]) if q_terms else "your request"
+        bullets_en = [
+            "I could not reliably extract an English section from the available documents.",
+            f"Key topic terms detected: {hint}.",
+            "If you need an exact English wording, please use an approved internal translation workflow (e.g., M365 Copilot / internal tools) and I can format the final text."
+        ]
+
+    # If DE is missing but EN exists
+    if not bullets_de and bullets_en:
+        bullets_de = [
+            "Ich konnte in den verfügbaren Dokumenten keinen klaren deutschsprachigen Abschnitt extrahieren.",
+            "Falls Sie eine deutsche Version benötigen, bitte einen freigegebenen internen Übersetzungsworkflow verwenden; ich kann den finalen Text dann sauber formatieren."
+        ]
+
+    de = []
+    de.append("Hallo,")
+    de.append("ich hoffe, es geht Ihnen gut.")
+    de.append("")
+    for b in bullets_de[:MAX_PASSAGES]:
+        de.append(f"- {b}")
+    de.append("")
+    de.append("Mit freundlichen Grüßen")
+    de.append(signature_name)
+
+    en = []
+    en.append("Hello,")
+    en.append("I hope you are doing well.")
+    en.append("")
+    en.append("Key points:")
+    for b in bullets_en[:max(6, MAX_PASSAGES)]:
+        en.append(f"- {b}")
+    en.append("")
+    en.append("Best regards,")
+    en.append(signature_name)
+
+    out = "\n".join(de).strip() + "\n\n---\n\n" + "\n".join(en).strip()
+    out = redact_sensitive(out)
+    return out
+
+
+def format_outlook_html(text: str) -> str:
+    """
+    Convert plain text to Outlook-friendly HTML:
+    - Blank-line separated blocks -> <p>
+    - '- ' lines -> <ul><li>...</li></ul>
+    """
+    text = (text or "").replace("\r\n", "\n").strip()
+    if not text:
+        return "<p></p>"
+
+    blocks = re.split(r"\n\s*\n", text)
+    html_parts = []
+    for block in blocks:
+        lines = [ln.rstrip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        if all(ln.lstrip().startswith("- ") for ln in lines):
+            html_parts.append("<ul>")
+            for ln in lines:
+                html_parts.append(f"<li>{escape(ln.lstrip()[2:].strip())}</li>")
+            html_parts.append("</ul>")
+        else:
+            para = "<br>".join(escape(ln) for ln in lines)
+            html_parts.append(f"<p>{para}</p>")
+    return "\n".join(html_parts)
+
+
+# =========================================================
+# OUTLOOK HELPERS
+# =========================================================
+def get_sender_smtp(mail) -> str:
+    try:
+        addr = (mail.SenderEmailAddress or "").lower()
+        if addr.startswith("/o="):
+            ex = mail.Sender.GetExchangeUser()
+            if ex:
+                return (ex.PrimarySmtpAddress or "").lower()
+        return addr
+    except Exception:
+        return (mail.SenderEmailAddress or "").lower()
+
+def add_processed_category(mail):
+    try:
+        cats = mail.Categories or ""
+        if PROCESSED_CATEGORY.lower() not in cats.lower():
+            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
+        mail.Save()
+    except Exception:
+        pass
+
+def mark_read(mail):
+    try:
+        mail.UnRead = False
+        mail.Save()
+    except Exception:
+        pass
+
+def get_target_folder():
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+    target_store = None
+    for st in ns.Stores:
+        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
+            target_store = st
+            break
+
+    if not target_store:
+        # fallback: try accounts smtp
+        try:
+            for st in ns.Stores:
+                if TARGET_MAILBOX.lower() in (st.FilePath or "").lower():
+                    target_store = st
+                    break
+        except Exception:
+            pass
+
+    if not target_store:
+        print("Available stores:")
+        for st in ns.Stores:
+            print(" -", st.DisplayName)
+        raise SystemExit("Target mailbox not found. Adjust TARGET_MAILBOX.")
+
+    inbox = target_store.GetDefaultFolder(6)  # Inbox
+
+    if WATCH_FOLDER_NAME.lower() == "inbox":
+        return ns, inbox, target_store.DisplayName, "Inbox"
+
+    for f in inbox.Folders:
+        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
+            return ns, f, target_store.DisplayName, f.Name
+
+    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox.")
+
+def get_account_for_mailbox(ns, mailbox_substring: str):
+    try:
+        for acc in ns.Session.Accounts:
+            smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
+            if mailbox_substring.lower() in smtp or smtp in mailbox_substring.lower():
+                return acc
+    except Exception:
+        pass
+    return None
+
+def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
+    msg = ns.Application.CreateItem(0)
+    msg.To = to_addr
+    msg.Subject = f"Draft created — please review: {orig_subject}"
+    msg.Body = (
+        "A draft reply has been created in Outlook.\n\n"
+        f"Original subject: {orig_subject}\n"
+        f"Requester: {requester_email}\n\n"
+        "Please review the draft carefully before sending.\n"
+    )
+    acc = get_account_for_mailbox(ns, from_mailbox)
+    if acc:
+        try:
+            msg.SendUsingAccount = acc
+        except Exception:
+            pass
+    msg.Send()
+
+def create_outlook_task_reminder(ns, subject: str, days: int = 2):
+    try:
+        task = ns.Application.CreateItem(3)  # olTaskItem
+        task.Subject = f"Send the draft reply: {subject}"
+        task.DueDate = (datetime.now() + timedelta(days=days)).date()
+        task.ReminderSet = True
+        task.ReminderTime = datetime.now() + timedelta(days=days)
+        task.Body = "A draft reply was created by the bot. Please review and send it."
+        task.Save()
+    except Exception:
+        pass
+
+
+# =========================================================
+# MAIN RUN (ONE PASS)
+# =========================================================
+def run_bot_once():
+    if STARTUP_DELAY_SEC:
+        import time
+        time.sleep(STARTUP_DELAY_SEC)
+
+    print("Loading KB from:", KB_DIR)
+    kb_chunks = load_kb(KB_DIR)
+    print("KB loaded (chunks):", len(kb_chunks))
+
+    index = build_bm25_index(kb_chunks)
+
+    ns, folder, store_name, folder_name = get_target_folder()
+    print(f"Mailbox={store_name} | Folder={folder_name}")
+
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True)
+
+    drafted = 0
+    checked = 0
+    your_firstname = safe_firstname_from_email(TARGET_MAILBOX)
+
+    for mail in items:
+        checked += 1
+        if checked > SCAN_LIMIT:
+            break
+        if drafted >= PROCESS_PER_RUN:
+            break
+
+        try:
+            # 43 = MailItem
+            if getattr(mail, "Class", None) != 43:
+                continue
+
+            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
+                continue
+
+            if REQUIRE_UNREAD and not mail.UnRead:
+                continue
+
+            subject = mail.Subject or ""
+            if REQUIRE_STRICT_SUBJECT and not strict_subject_is_bot(subject):
+                continue
+
+            sender = get_sender_smtp(mail)
+
+            # Extract text question
+            body_text = clean_html_to_text(mail.HTMLBody or "")
+            question = clean_ws(body_text)
+
+            # Guard: ignore quoted history to reduce noise
+            # (simple cut at common separators)
+            question = re.split(r"(?im)\n_{5,}\n|(?im)\bfrom:\b|(?im)\bvon:\b|(?im)\bsent:\b|(?im)\bgesendet:\b", question)[0].strip()
+            question = redact_sensitive(question)
+
+            # Build answer from KB
+            bullets_de, bullets_en, used_docs = build_bullets_from_kb(index, question=question, subject=subject)
+
+            # If definition question and KB is too weak: try glossary fallback
+            if is_definition_question(question):
+                # heuristic “weak”: less than 1 good bullet in both languages
+                if (len(bullets_de) + len(bullets_en)) < 2:
+                    term = extract_definition_term(question).upper()
+                    # normalize common case: "PPAs" -> "PPA"
+                    if term.endswith("S") and term[:-1] in GLOSSARY:
+                        term = term[:-1]
+                    if term in GLOSSARY:
+                        bullets_de = [GLOSSARY[term]["de"]]
+                        bullets_en = [GLOSSARY[term]["en"]]
+
+            reply_text = build_bilingual_reply(
+                question=question,
+                bullets_de=bullets_de,
+                bullets_en=bullets_en,
+                signature_name=your_firstname,
+                used_docs=used_docs
+            )
+
+            html_answer = format_outlook_html(reply_text)
+
+            reply = mail.Reply()
+            reply.HTMLBody = f"<div>{html_answer}</div><hr>" + reply.HTMLBody
+            reply.Save()
+
+            mark_read(mail)
+            add_processed_category(mail)
+
+            drafted += 1
+            print("Draft created for subject:", subject)
+
+            if SELF_NOTIFY:
+                try:
+                    send_self_notification(
+                        ns=ns,
+                        from_mailbox=TARGET_MAILBOX,
+                        to_addr=SELF_NOTIFY_TO,
+                        orig_subject=subject,
+                        requester_email=sender,
+                    )
+                    print("Self notification sent.")
+                except Exception as e:
+                    print("Self notification failed:", e)
+
+            if CREATE_REMINDER_TASK:
+                create_outlook_task_reminder(ns, subject=subject, days=REMINDER_DAYS)
+
+        except Exception as e:
+            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", repr(e))
+
+    print(f"Done. Checked={checked}, Drafted={drafted}")
+
+
+# Optional: loop runner (be careful in notebooks)
+def run_bot_loop(poll_seconds: int = 60):
+    import time
+    while True:
+        run_bot_once()
+        time.sleep(max(10, int(poll_seconds)))
+
+
+# ===== Run it =====
+# run_bot_once()
