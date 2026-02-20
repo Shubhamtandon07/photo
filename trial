@@ -2,28 +2,27 @@
 """
 OUTLOOK DRAFT BOT (NO LLM) — Notebook-safe (Python 3.14+)
 
-Core idea:
-- Deterministic answer generation using internal KB docs only.
-- Intent-aware:
-  - Definition questions ("what is X", "what does X mean", "X?") -> definition-first pipeline
-  - Requirement/procedure questions -> requirement-focused extraction
-- Retrieval improvements:
-  - Two-stage ranking: documents -> chunks
-  - TF-IDF similarity (fallback to token scoring if sklearn not available)
-  - Heavy de-prioritization for mail-chain-like docs: AW_/RE_/FW_/WG_
-- Output:
-  - Bilingual (DE + EN) without external translation
-  - English is "safe" (not pretending to be perfect), but for definition questions it is usually exact.
-- Outlook actions:
-  - Create draft reply
-  - Mark source email as read
-  - Add category to prevent duplicates
-  - Optional: self-notify + task reminder
+Improvements included:
+- Cached KB line index: read all docs once -> compare candidates across all docs/lines.
+- Cross-lingual retrieval: EN question -> DE query expansion (small deterministic dictionary).
+- Intent constraints:
+  - "which standard?" -> answer must contain ISO/DIN/MBN/MBN/IEC/EN/SAE/VDA/etc.
+  - "definition" -> answer must match explicit definition patterns if possible.
+- Strong de-prioritization for mail-like docs: AW_/RE_/FW_/WG_.
+- Redaction removes PII ONLY from extracted bullets/definition, not greeting/signature.
+
+Run in Jupyter:
+1) (Optional) build index once:
+   build_or_load_kb_index(force_rebuild=True)
+2) Run bot:
+   run_bot_once()
 """
 
 from __future__ import annotations
 
 import re
+import pickle
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from html import escape
@@ -34,42 +33,36 @@ import win32com.client as win32
 # =========================================================
 # SETTINGS — EDIT THESE
 # =========================================================
-TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"  # Outlook store match (substring)
-WATCH_FOLDER_NAME = "Inbox"                          # "Inbox" or a subfolder under Inbox
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"
+WATCH_FOLDER_NAME = "Inbox"  # Inbox or subfolder under Inbox
 
-# Knowledge Base folder (documents only)
 KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
 
-# Processing behavior
 REQUIRE_UNREAD = True
 PROCESS_PER_RUN = 3
 SCAN_LIMIT = 250
 STARTUP_DELAY_SEC = 1
 
-# Gate condition: subject must be exactly "bot" (case-insensitive)
-REQUIRE_STRICT_SUBJECT = True
-
-# Avoid duplicates
+REQUIRE_STRICT_SUBJECT = True  # subject must be exactly "bot"
 PROCESSED_CATEGORY = "Drafted-NoLLM"
 
-# Self notify + task reminder
 SELF_NOTIFY = True
 SELF_NOTIFY_TO = TARGET_MAILBOX
 CREATE_REMINDER_TASK = True
 REMINDER_DAYS = 2
 
-
-# =========================================================
-# KB limits / filters
-# =========================================================
 SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
-MAX_DOCS_TO_RANK = 10               # doc-stage top-K
-MAX_CHUNKS_TO_RANK = 40             # chunk-stage top-K
-MAX_CHARS_PER_DOC = 150000          # avoid huge parsing
-MAX_CHARS_PER_CHUNK = 1200
-MAX_CHUNKS_PER_DOC = 120
 
-# Prefer documents, not mail-like artifacts in KB
+# Cache folder for index
+CACHE_DIR = Path(KB_DIR) / "_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+KB_INDEX_PATH = CACHE_DIR / "kb_index.pkl"
+
+# Limits
+MAX_CHARS_PER_DOC = 200000  # avoid massive docs
+MAX_LINES_PER_DOC = 6000    # guardrail for line explosion
+
+# De-prioritize mail-like docs
 MAILY_PREFIXES = ("aw_", "re_", "fw_", "wg_")
 MAILY_HINTS = ["subject", "mail", "email", ".msg", "inbox", "outlook", "conversation"]
 
@@ -79,43 +72,66 @@ EXTRA_NAMES_TO_DELETE = [
     "veronika", "athanasia", "alina", "anne"
 ]
 
-# Redaction targets (remove sensitive info)
+
+# =========================================================
+# REDACTION (remove sensitive tokens; do NOT insert [PERSON])
+# =========================================================
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 PHONE_RE = re.compile(r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d")
 URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
 DOMAIN_RE = re.compile(r"\b(?:[a-z0-9-]+\.)+(?:com|net|org|de|eu|io|gov|edu|co)\b", re.I)
 IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b", re.I)
-
-# Remove typical header lines
 HEADER_LINE_RE = re.compile(r"(?im)^\s*(von|from|an|to|cc|bcc|gesendet|sent|betreff|subject)\s*:\s*.*$", re.M)
 
-# Heuristic "person name" patterns (DELETE, not replace):
 TITLE_NAME_RE = re.compile(r"\b(?:Mr|Mrs|Ms|Miss|Dr|Prof|Herr|Frau)\.?\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b")
 FIRST_LAST_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b")
 
 
-# =========================================================
-# Optional TF-IDF
-# =========================================================
-def _try_import_sklearn():
-    try:
-        from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
-        from sklearn.metrics.pairwise import cosine_similarity       # type: ignore
-        return TfidfVectorizer, cosine_similarity
-    except Exception:
-        return None, None
-
-TFIDF_VECTORIZER, COSINE_SIM = _try_import_sklearn()
-
-
-# =========================================================
-# UTIL
-# =========================================================
 def clean_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
+
+def _remove_names_case_insensitive(text: str, names: list[str]) -> str:
+    out = text
+    for n in names:
+        if not n:
+            continue
+        out = re.sub(rf"\b{re.escape(n)}\b", "", out, flags=re.I)
+    return out
+
+
+def redact_sensitive_remove(text: str) -> str:
+    if not text:
+        return ""
+    t = text
+    t = HEADER_LINE_RE.sub("", t)
+    t = EMAIL_RE.sub("", t)
+    t = PHONE_RE.sub("", t)
+    t = URL_RE.sub("", t)
+    t = DOMAIN_RE.sub("", t)
+    t = IBAN_RE.sub("", t)
+
+    t = TITLE_NAME_RE.sub("", t)
+    t = FIRST_LAST_RE.sub("", t)
+    t = _remove_names_case_insensitive(t, EXTRA_NAMES_TO_DELETE)
+
+    # cleanup
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"\s+,", ",", t)
+    t = re.sub(r"\(\s*\)", "", t)
+    t = re.sub(r"\s+\.", ".", t)
+    t = re.sub(r"\s+\)", ")", t)
+    t = re.sub(r"\(\s+", "(", t)
+    return t.strip()
+
+
+# =========================================================
+# OUTLOOK formatting
+# =========================================================
 def strict_subject_is_bot(subject: str) -> bool:
     return (subject or "").strip().lower() == "bot"
+
 
 def safe_firstname_from_email(email: str) -> str:
     email = (email or "").strip()
@@ -125,14 +141,13 @@ def safe_firstname_from_email(email: str) -> str:
         return "Colleague"
     return first[:1].upper() + first[1:]
 
+
 def clean_html_to_text(html: str) -> str:
     txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
     return clean_ws(txt)
 
+
 def format_outlook_html(text: str) -> str:
-    """
-    plain -> HTML
-    """
     text = (text or "").replace("\r\n", "\n").strip()
     if not text:
         return "<p></p>"
@@ -153,57 +168,13 @@ def format_outlook_html(text: str) -> str:
             html_parts.append(f"<p>{para}</p>")
     return "\n".join(html_parts)
 
-def _remove_names_case_insensitive(text: str, names: list[str]) -> str:
-    out = text
-    for n in names:
-        if not n:
-            continue
-        out = re.sub(rf"\b{re.escape(n)}\b", "", out, flags=re.I)
-    return out
-
-def redact_sensitive_remove(text: str) -> str:
-    """
-    Remove sensitive tokens WITHOUT inserting placeholders like [PERSON].
-    """
-    if not text:
-        return ""
-
-    t = text
-
-    # Remove header lines
-    t = HEADER_LINE_RE.sub("", t)
-
-    # Remove explicit patterns
-    t = EMAIL_RE.sub("", t)
-    t = PHONE_RE.sub("", t)
-    t = URL_RE.sub("", t)
-    t = DOMAIN_RE.sub("", t)
-    t = IBAN_RE.sub("", t)
-
-    # Remove common name patterns
-    t = TITLE_NAME_RE.sub("", t)
-    t = FIRST_LAST_RE.sub("", t)
-
-    # Remove provided name list (first names etc.)
-    t = _remove_names_case_insensitive(t, EXTRA_NAMES_TO_DELETE)
-
-    # Cleanup punctuation/spacing after deletions
-    t = re.sub(r"[ \t]{2,}", " ", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    t = re.sub(r"\s+,", ",", t)
-    t = re.sub(r"\(\s*\)", "", t)
-    t = re.sub(r"\s+\.", ".", t)
-    t = re.sub(r"\s+\)", ")", t)
-    t = re.sub(r"\(\s+", "(", t)
-
-    return t.strip()
-
 
 # =========================================================
-# KB READERS (safe, skip if missing libs)
+# KB READERS
 # =========================================================
 def read_txt(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="ignore")
+
 
 def read_docx(p: Path) -> str:
     try:
@@ -211,18 +182,25 @@ def read_docx(p: Path) -> str:
     except Exception:
         return ""
     doc = DocxDocument(str(p))
-    paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
-    # tables
-    table_lines = []
+    out = []
+
+    # paragraphs
+    for par in doc.paragraphs:
+        t = par.text.strip()
+        if t:
+            out.append(t)
+
+    # tables (serialize)
     for table in doc.tables:
         for row in table.rows:
-            cells = [clean_ws(c.text) for c in row.cells]
+            cells = [c.text.strip() for c in row.cells]
             if any(cells):
-                table_lines.append(" | ".join(cells))
-    return (paras + "\n" + "\n".join(table_lines)).strip()
+                out.append(" | ".join(cells))
+
+    return "\n".join(out).strip()
+
 
 def read_pdf(p: Path) -> str:
-    # Prefer pdfplumber, else pypdf
     try:
         import pdfplumber  # type: ignore
         out = []
@@ -245,6 +223,7 @@ def read_pdf(p: Path) -> str:
     except Exception:
         return ""
 
+
 def read_xlsx(p: Path) -> str:
     try:
         import openpyxl  # type: ignore
@@ -264,6 +243,7 @@ def read_xlsx(p: Path) -> str:
             if any(cell.strip() for cell in row_vals):
                 out.append(" | ".join(clean_ws(x) for x in row_vals))
     return "\n".join(out).strip()
+
 
 def extract_text_from_file(p: Path) -> str:
     ext = p.suffix.lower()
@@ -291,16 +271,12 @@ def is_maily_filename(p: Path) -> bool:
 
 
 def load_kb_docs(dirpath: str) -> list[tuple[str, str, str]]:
-    """
-    Returns list of docs: (fullpath, filename, fulltext)
-    """
     base = Path(dirpath)
     if not base.exists() or not base.is_dir():
         raise SystemExit(f"KB_DIR not found or not a folder: {dirpath}")
 
     files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
-
-    docs: list[tuple[str, str, str]] = []
+    docs = []
     for p in sorted(files):
         try:
             txt = extract_text_from_file(p)
@@ -311,12 +287,70 @@ def load_kb_docs(dirpath: str) -> list[tuple[str, str, str]]:
             docs.append((str(p), p.name, txt))
         except Exception:
             continue
-
     return docs
 
 
 # =========================================================
-# QUESTION INTENT + TERM EXTRACTION
+# TOKENIZATION + CROSS-LINGUAL EXPANSION
+# =========================================================
+STOPWORDS = set("""
+the a an and or to of in on for with without from by at is are was were be been being
+der die das und oder zu von im in am an auf für mit ohne aus bei ist sind war waren
+""".split())
+
+
+def tokenize(s: str) -> list[str]:
+    toks = re.split(r"[^a-zA-Z0-9ÄÖÜäöüß]+", (s or "").lower())
+    return [t for t in toks if t and t not in STOPWORDS and len(t) >= 2]
+
+
+# Minimal EN->DE mapping for retrieval (not translation; just query expansion)
+EN2DE = {
+    "standard": ["standard", "norm", "mbn", "din", "iso", "iec", "en", "vda", "sae"],
+    "standards": ["standard", "norm", "mbn", "din", "iso", "iec", "en", "vda", "sae"],
+    "which": ["welche", "welcher", "welches"],
+    "according": ["gemäß", "nach", "entsprechend"],
+    "in": ["in", "im"],
+    "accordance": ["gemäß", "nach", "entsprechend", "übereinstimmung"],
+    "document": ["dokument", "unterlage", "nachweis"],
+    "documentation": ["dokumentation", "dokumentieren", "nachweis"],
+    "recycled": ["recyc", "rezykl", "recycling"],
+    "proportion": ["anteil", "quote"],
+    "evidence": ["nachweis", "beleg"],
+    "requirement": ["anforderung", "erforderlich", "muss", "soll"],
+    "required": ["erforderlich", "muss", "soll"],
+    "shall": ["soll", "muss"],
+    "must": ["muss", "erforderlich"],
+    "where": ["wo", "wobei", "in welchem"],
+    "how": ["wie"],
+    "definition": ["definition", "begriff", "abkürzung", "steht für", "bedeutet"],
+    "means": ["bedeutet", "steht für"],
+}
+
+
+def expand_query_tokens(question: str) -> set[str]:
+    """
+    For EN questions, add DE-ish tokens to improve retrieval against German docs.
+    Also keep acronyms as anchors.
+    """
+    base = tokenize(question)
+    out = set(base)
+
+    # add expansions
+    for tk in base:
+        if tk in EN2DE:
+            for x in EN2DE[tk]:
+                out.add(x.lower())
+
+    # keep acronyms (PPA, MBN, etc.)
+    for m in re.findall(r"\b[A-Z]{2,10}\b", question or ""):
+        out.add(m.lower())
+
+    return out
+
+
+# =========================================================
+# INTENT DETECTION
 # =========================================================
 DEF_PATTERNS = [
     re.compile(r"(?i)\bwhat\s+is\s+([A-Za-z][A-Za-z0-9\-\s_/]{1,50})\??\b"),
@@ -325,18 +359,30 @@ DEF_PATTERNS = [
     re.compile(r"(?i)\bwas\s+bedeutet\s+([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß0-9\-\s_/]{1,50})\??\b"),
 ]
 
+WHICH_STANDARD_PATTERNS = [
+    re.compile(r"(?i)\bwhich\s+standard(s)?\b"),
+    re.compile(r"(?i)\bwhich\s+norm(s)?\b"),
+    re.compile(r"(?i)\bin\s+accordance\s+with\s+which\b"),
+    re.compile(r"(?i)\bgemäß\s+welch"),
+    re.compile(r"(?i)\bnach\s+welch"),
+]
+
 REQ_HINTS = [
-    "must", "shall", "required", "requirement", "how to", "where", "which document", "what evidence", "proof",
+    "must", "shall", "required", "requirement", "how", "where", "which document", "evidence", "proof",
     "muss", "soll", "erforder", "anforder", "wie", "wo", "welches dokument", "nachweis", "beleg"
 ]
+
 
 def detect_intent(question: str) -> str:
     q = clean_ws(question).lower()
     if any(p.search(q) for p in DEF_PATTERNS):
         return "definition"
+    if any(p.search(q) for p in WHICH_STANDARD_PATTERNS):
+        return "which_standard"
     if any(h in q for h in REQ_HINTS):
         return "requirement"
     return "general"
+
 
 def extract_focus_term(question: str) -> str | None:
     q = clean_ws(question)
@@ -344,81 +390,237 @@ def extract_focus_term(question: str) -> str | None:
         m = pat.search(q)
         if m:
             term = clean_ws(m.group(1))
-            if 1 <= len(term) <= 60:
-                # try to keep just acronym if present
-                m2 = re.search(r"\b([A-Z]{2,8})\b", term)
-                return m2.group(1) if m2 else term
-    # fallback: pick first acronym in question
-    m = re.search(r"\b([A-Z]{2,8})\b", q)
-    if m:
-        return m.group(1)
-    return None
+            m2 = re.search(r"\b([A-Z]{2,10})\b", term)
+            return m2.group(1) if m2 else term
+    # fallback acronym
+    m = re.search(r"\b([A-Z]{2,10})\b", q)
+    return m.group(1) if m else None
 
 
 # =========================================================
-# DOC PRIORITY (AW_/RE_ last)
+# DOC PRIORITY
 # =========================================================
 def doc_priority_adjustment(filename: str) -> float:
-    """
-    Negative = worse priority
-    """
     name = (filename or "").lower()
-
     adj = 0.0
 
-    # mail-chain prefixes strongly penalized
     if name.startswith(MAILY_PREFIXES):
-        adj -= 0.20
-
-    # other mail-ish hints penalized
+        adj -= 0.35  # strong penalty
     if is_maily_filename(Path(filename)):
-        adj -= 0.10
+        adj -= 0.15
 
-    # boost authoritative docs
-    boosts = [
-        "standard", "policy", "guideline", "handbook", "requirements", "requirement",
-        "glossary", "definition", "kapitel", "chapter", "responsible sourcing",
-        "sustainability premises", "premises", "rfq", "saq"
-    ]
+    # boost likely authoritative docs
+    boosts = ["standard", "norm", "mbn", "iso", "din", "guideline", "handbook", "kapitel", "chapter", "requirements", "requirement", "glossary", "definition", "begriffe", "abkürz"]
     if any(b in name for b in boosts):
-        adj += 0.08
-
+        adj += 0.10
     return adj
 
 
 # =========================================================
-# DEFINITION-EXTRACTION (deterministic, no LLM)
+# INDEX STRUCTURE
 # =========================================================
-def find_explicit_definition_in_text(term: str, text: str) -> str | None:
+STD_TOKEN_RE = re.compile(r"(?i)\b(ISO\s*\d+|DIN\s*\w+\d+|EN\s*\d+|IEC\s*\d+|SAE\s*\w+\d+|VDA\s*\d+|MBN\s*\d+|MBN\s*\w+)\b")
+STD_CONTEXT_RE = re.compile(r"(?i)\b(in\s+accordance\s+with|according\s+to|gemäß|nach|entsprechend)\b")
+
+DEF_CONTEXT_RE = re.compile(r"(?i)\b(stands\s+for|steht\s+für|means|bedeutet|refers\s+to|=)\b")
+REQ_CONTEXT_RE = re.compile(r"(?i)\b(must|shall|required|requirement|muss|soll|erforder|anforder|nachweis|beleg)\b")
+
+
+@dataclass
+class KBLine:
+    doc: str
+    fullpath: str
+    text: str
+    tokens: frozenset[str]
+    has_std: bool
+    has_std_context: bool
+    has_def_context: bool
+    has_req_context: bool
+
+
+def split_to_lines(text: str) -> list[str]:
     """
-    Look for explicit definition patterns.
-    Examples:
-      - "PPA (Power Purchase Agreement)"
-      - "PPA stands for Power Purchase Agreement"
-      - "PPA = Power Purchase Agreement"
-      - German: "PPA steht für ..."
+    Conservative splitting:
+    - keep bullet lines
+    - also split long paragraphs into sentences
     """
+    text = text or ""
+    raw_lines = [ln.strip() for ln in text.splitlines()]
+    raw_lines = [ln for ln in raw_lines if ln]
+
+    out = []
+    for ln in raw_lines:
+        # If it's short, keep it
+        if len(ln) <= 220:
+            out.append(ln)
+            continue
+        # Otherwise split into sentences
+        parts = re.split(r"(?<=[\.\!\?])\s+", ln)
+        for p in parts:
+            p = p.strip()
+            if p and len(p) >= 25:
+                out.append(p)
+    return out
+
+
+def build_kb_index(kb_docs: list[tuple[str, str, str]]) -> list[KBLine]:
+    idx: list[KBLine] = []
+    for fullpath, filename, text in kb_docs:
+        lines = split_to_lines(text)
+        if len(lines) > MAX_LINES_PER_DOC:
+            lines = lines[:MAX_LINES_PER_DOC]
+
+        for ln in lines:
+            ln_clean = clean_ws(ln)
+            if len(ln_clean) < 15:
+                continue
+
+            toks = frozenset(tokenize(ln_clean))
+            has_std = bool(STD_TOKEN_RE.search(ln_clean))
+            has_std_ctx = bool(STD_CONTEXT_RE.search(ln_clean))
+            has_def_ctx = bool(DEF_CONTEXT_RE.search(ln_clean))
+            has_req_ctx = bool(REQ_CONTEXT_RE.search(ln_clean))
+
+            idx.append(
+                KBLine(
+                    doc=filename,
+                    fullpath=fullpath,
+                    text=ln_clean,
+                    tokens=toks,
+                    has_std=has_std,
+                    has_std_context=has_std_ctx,
+                    has_def_context=has_def_ctx,
+                    has_req_context=has_req_ctx,
+                )
+            )
+    return idx
+
+
+def build_or_load_kb_index(force_rebuild: bool = False) -> tuple[list[tuple[str, str, str]], list[KBLine]]:
+    kb_docs = load_kb_docs(KB_DIR)
+
+    if (not force_rebuild) and KB_INDEX_PATH.exists():
+        try:
+            with open(KB_INDEX_PATH, "rb") as f:
+                cached = pickle.load(f)
+            # basic sanity
+            if isinstance(cached, list) and cached and isinstance(cached[0], KBLine):
+                return kb_docs, cached
+        except Exception:
+            pass
+
+    idx = build_kb_index(kb_docs)
+    with open(KB_INDEX_PATH, "wb") as f:
+        pickle.dump(idx, f)
+    return kb_docs, idx
+
+
+# =========================================================
+# CANDIDATE SCORING (compare all lines)
+# =========================================================
+def score_line(q_tokens: set[str], line: KBLine) -> float:
+    if not q_tokens:
+        return 0.0
+    overlap = len(q_tokens & set(line.tokens))
+    if overlap <= 0:
+        return 0.0
+
+    base = overlap / max(3, len(q_tokens))  # normalized
+    base += doc_priority_adjustment(line.doc)
+
+    # bonus for requirement language
+    if line.has_req_context:
+        base += 0.06
+
+    return base
+
+
+def passes_intent_constraints(intent: str, line: KBLine, focus_term: str | None, q_raw: str) -> bool:
+    t = line.text
+
+    if intent == "which_standard":
+        # Must mention a standard token (MBN/ISO/DIN...) and ideally the "according to/gemäß/nach" context
+        if not line.has_std:
+            return False
+        # if question contains "in accordance/according/gemäß/nach", demand context too
+        if any(p.search(q_raw) for p in WHICH_STANDARD_PATTERNS):
+            if not (line.has_std_context or "in accordance" in q_raw.lower() or "according" in q_raw.lower()):
+                # allow if line has explicit "nach/gemäß/according" anyway; already covered by has_std_context
+                pass
+        return True
+
+    if intent == "definition":
+        # Prefer explicit definition contexts if focus term exists
+        if focus_term:
+            if re.search(rf"(?i)\b{re.escape(focus_term)}\b", t) is None:
+                return False
+        return True
+
+    if intent == "requirement":
+        # Prefer lines with requirement markers
+        return True
+
+    return True
+
+
+def pick_best_candidates(index: list[KBLine], question: str, intent: str, focus_term: str | None, top_k: int = 8) -> list[KBLine]:
+    q_raw = question or ""
+    q_tokens = expand_query_tokens(q_raw)
+
+    scored = []
+    for line in index:
+        if not passes_intent_constraints(intent, line, focus_term, q_raw):
+            continue
+        s = score_line(q_tokens, line)
+        if s > 0:
+            # add intent-specific bonuses
+            if intent == "which_standard":
+                s += 0.20 if line.has_std_context else 0.08
+            if intent == "definition" and line.has_def_context:
+                s += 0.18
+            if intent == "requirement" and line.has_req_context:
+                s += 0.10
+            scored.append((s, line))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # de-duplicate identical lines
+    out = []
+    seen = set()
+    for s, line in scored:
+        key = (line.doc.lower(), line.text.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(line)
+        if len(out) >= top_k:
+            break
+
+    return out
+
+
+# =========================================================
+# DEFINITION EXTRACTION (explicit)
+# =========================================================
+def explicit_definition_from_text(term: str, text: str) -> str | None:
     if not term or not text:
         return None
 
-    t = text
-
-    # Pattern 1: TERM (Expansion)
-    # capture up to 120 chars inside parentheses
-    m = re.search(rf"(?i)\b{re.escape(term)}\b\s*\(\s*([^){{}}]]{{2,120}}?)\s*\)", t)
+    # TERM (Expansion)
+    m = re.search(rf"(?i)\b{re.escape(term)}\b\s*\(\s*([^){{}}]]{{2,120}}?)\s*\)", text)
     if m:
         exp = clean_ws(m.group(1))
         if exp and len(exp) <= 140:
             return f"{term} = {exp}"
 
-    # Pattern 2: TERM stands for X / steht für X
-    m = re.search(rf"(?i)\b{re.escape(term)}\b\s+(stands\s+for|steht\s+für)\s+([A-Za-zÄÖÜäöüß0-9][^.\n]{{3,140}})", t)
+    # TERM stands for / steht für
+    m = re.search(rf"(?i)\b{re.escape(term)}\b\s+(stands\s+for|steht\s+für)\s+([A-Za-zÄÖÜäöüß0-9][^.\n]{{3,140}})", text)
     if m:
         exp = clean_ws(m.group(2))
         return f"{term} = {exp}"
 
-    # Pattern 3: TERM = X
-    m = re.search(rf"(?i)\b{re.escape(term)}\b\s*[:=]\s*([A-Za-zÄÖÜäöüß0-9][^.\n]{{3,140}})", t)
+    # TERM = X
+    m = re.search(rf"(?i)\b{re.escape(term)}\b\s*[:=]\s*([A-Za-zÄÖÜäöüß0-9][^.\n]{{3,140}})", text)
     if m:
         exp = clean_ws(m.group(1))
         return f"{term} = {exp}"
@@ -426,339 +628,163 @@ def find_explicit_definition_in_text(term: str, text: str) -> str | None:
     return None
 
 
-def find_best_definition(docs: list[tuple[str, str, str]], term: str) -> tuple[str | None, str | None]:
-    """
-    Returns (definition_string, source_filename) deterministically.
-    Strategy: scan docs in priority order for explicit definition patterns.
-    """
-    if not term:
+def pick_definition(index: list[KBLine], focus_term: str) -> tuple[str | None, str | None]:
+    if not focus_term:
         return None, None
 
-    # prioritize docs by file priority, but still based on term presence
+    # scan best candidates only (fast and deterministic)
+    # prioritize lines that contain def context + term
     candidates = []
-    for fullpath, filename, text in docs:
-        # only consider docs that contain the term at all
-        if re.search(rf"(?i)\b{re.escape(term)}\b", text):
-            score = 1.0 + doc_priority_adjustment(filename)
-            # extra boost if filename suggests glossary/definition
-            if re.search(r"(?i)glossary|definition|begriffe|abk", filename):
-                score += 0.15
-            candidates.append((score, fullpath, filename, text))
-
+    for line in index:
+        if re.search(rf"(?i)\b{re.escape(focus_term)}\b", line.text) and line.has_def_context:
+            score = 1.0 + doc_priority_adjustment(line.doc)
+            candidates.append((score, line))
     candidates.sort(key=lambda x: x[0], reverse=True)
 
-    for _, _, filename, text in candidates[:40]:
-        d = find_explicit_definition_in_text(term, text)
+    for _, line in candidates[:120]:
+        d = explicit_definition_from_text(focus_term, line.text)
         if d:
-            return d, filename
+            return d, line.doc
+
+    # fallback: any line with TERM(...)
+    for _, line in candidates[:120]:
+        d = explicit_definition_from_text(focus_term, line.text)
+        if d:
+            return d, line.doc
 
     return None, None
 
 
 # =========================================================
-# RETRIEVAL (Two-stage: docs -> chunks)
+# SAFE EN output (no fake translation)
 # =========================================================
-STOPWORDS = set("""
-the a an and or to of in on for with without from by at is are was were be been being
-der die das und oder zu von im in am an auf für mit ohne aus bei ist sind war waren
-""".split())
-
-def tokenize(s: str) -> list[str]:
-    toks = re.split(r"[^a-zA-Z0-9ÄÖÜäöüß]+", (s or "").lower())
-    return [t for t in toks if t and t not in STOPWORDS and len(t) >= 3]
-
-def split_into_chunks(text: str) -> list[str]:
-    text = text or ""
-    paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
-    chunks: list[str] = []
-    for p in paras:
-        if len(p) <= MAX_CHARS_PER_CHUNK:
-            chunks.append(p)
-        else:
-            for i in range(0, len(p), MAX_CHARS_PER_CHUNK):
-                chunks.append(p[i:i+MAX_CHARS_PER_CHUNK])
-        if len(chunks) >= MAX_CHUNKS_PER_DOC:
-            break
-    return chunks
-
-def rank_docs(docs: list[tuple[str, str, str]], query: str, top_k: int) -> list[tuple[float, str, str, str]]:
-    """
-    Returns: [(score, fullpath, filename, fulltext), ...]
-    Uses TF-IDF if available, else fallback token scoring.
-    """
-    query = clean_ws(query)
-    if not query:
-        return []
-
-    # TF-IDF path
-    if TFIDF_VECTORIZER and COSINE_SIM:
-        filenames = [d[1] for d in docs]
-        texts = [d[2] for d in docs]
-        vec = TFIDF_VECTORIZER(min_df=1, ngram_range=(1,2), max_features=60000)
-        X = vec.fit_transform(texts)
-        qv = vec.transform([query])
-        sims = COSINE_SIM(qv, X).ravel()
-
-        scored = []
-        for (fullpath, filename, text), sim in zip(docs, sims):
-            score = float(sim) + doc_priority_adjustment(filename)
-            scored.append((score, fullpath, filename, text))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return scored[:top_k]
-
-    # fallback scoring
-    q_tokens = set(tokenize(query))
-    scored = []
-    for fullpath, filename, text in docs:
-        t_low = text.lower()
-        overlap = sum(1 for tk in q_tokens if tk in t_low)
-        score = overlap / max(1, len(q_tokens))
-        score += doc_priority_adjustment(filename)
-        scored.append((float(score), fullpath, filename, text))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[:top_k]
-
-def rank_chunks(top_docs: list[tuple[float, str, str, str]], query: str, top_k: int) -> list[tuple[float, str, str]]:
-    """
-    Returns [(score, filename, chunk_text), ...]
-    """
-    query = clean_ws(query)
-    if not query:
-        return []
-
-    chunks = []
-    meta = []
-    for doc_score, _, filename, fulltext in top_docs:
-        for ch in split_into_chunks(fulltext):
-            chunks.append(ch)
-            meta.append((doc_score, filename))
-
-    if not chunks:
-        return []
-
-    if TFIDF_VECTORIZER and COSINE_SIM:
-        vec = TFIDF_VECTORIZER(min_df=1, ngram_range=(1,2), max_features=60000)
-        X = vec.fit_transform(chunks)
-        qv = vec.transform([query])
-        sims = COSINE_SIM(qv, X).ravel()
-
-        scored = []
-        for sim, (doc_score, filename), ch in zip(sims, meta, chunks):
-            score = float(sim) + (doc_score * 0.05)
-            scored.append((score, filename, ch))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return scored[:top_k]
-
-    # fallback chunk scoring
-    q_tokens = set(tokenize(query))
-    scored = []
-    for (doc_score, filename), ch in zip(meta, chunks):
-        c_low = ch.lower()
-        overlap = sum(1 for tk in q_tokens if tk in c_low)
-        score = overlap / max(1, len(q_tokens)) + (doc_score * 0.05)
-        scored.append((float(score), filename, ch))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[:top_k]
-
-
-# =========================================================
-# ANSWER EXTRACTION (context-aware, deterministic)
-# =========================================================
-def sentence_split(text: str) -> list[str]:
-    txt = re.sub(r"\s+", " ", text or "").strip()
-    if not txt:
-        return []
-    parts = re.split(r"(?<=[\.\!\?])\s+", txt)
-    out = [p.strip(" -•\t\r\n") for p in parts if len(p.strip()) >= 15]
-    return out
-
-def choose_best_sentence(chunks_scored: list[tuple[float, str, str]], query: str, intent: str, focus_term: str | None) -> tuple[str | None, str | None]:
-    """
-    Pick a single best sentence (answer-like), anchored to key term(s).
-    Returns (sentence, source_filename)
-    """
-    q_tokens = set(tokenize(query))
-    anchors = []
-    if focus_term:
-        anchors.append(focus_term.lower())
-    anchors += tokenize(query)[:6]
-    anchors = [a for a in anchors if a]
-
-    def has_anchor(s: str) -> bool:
-        s_low = s.lower()
-        return any(a in s_low for a in anchors)
-
-    # definitional patterns (strong)
-    def_pat = re.compile(r"(?i)\b(stands\s+for|steht\s+für|is\s+a|refers\s+to|means|definition|definiert|bedeutet|=)\b")
-    req_pat = re.compile(r"(?i)\b(must|shall|required|requirement|muss|soll|erforder|anforder|nachweis|beleg)\b")
-
-    for score, filename, ch in chunks_scored:
-        for sent in sentence_split(ch):
-            if not has_anchor(sent):
-                continue
-
-            if intent == "definition":
-                if def_pat.search(sent):
-                    return sent, filename
-                # allow short definitional style if focus term present
-                if focus_term and re.search(rf"(?i)\b{re.escape(focus_term)}\b", sent) and len(sent) <= 220:
-                    return sent, filename
-
-            if intent == "requirement":
-                if req_pat.search(sent):
-                    return sent, filename
-
-            # general: accept first anchored
-            if intent == "general":
-                return sent, filename
-
-    return None, None
-
-
-def build_bullets_from_chunks(chunks_scored: list[tuple[float, str, str]], query: str, intent: str, focus_term: str | None, max_points: int = 5) -> list[str]:
-    """
-    Build a few bullets with anchor constraints.
-    """
-    bullets = []
-    used = set()
-
-    q_tokens = set(tokenize(query))
-    anchors = []
-    if focus_term:
-        anchors.append(focus_term.lower())
-    anchors += tokenize(query)[:8]
-    anchors = [a for a in anchors if a]
-
-    def anchored(s: str) -> bool:
-        s_low = s.lower()
-        return any(a in s_low for a in anchors)
-
-    for score, filename, ch in chunks_scored:
-        for sent in sentence_split(ch):
-            if not anchored(sent):
-                continue
-            key = sent.lower()
-            if key in used:
-                continue
-            used.add(key)
-            bullets.append(sent)
-            if len(bullets) >= max_points:
-                break
-        if len(bullets) >= max_points:
-            break
-
-    # fallback: if nothing anchored, take first reasonable sentences from best chunk
-    if not bullets and chunks_scored:
-        for sent in sentence_split(chunks_scored[0][2])[:max_points]:
-            bullets.append(sent)
-
-    return bullets[:max_points]
-
-
-# =========================================================
-# BILINGUAL OUTPUT (no external translation)
-# =========================================================
-def safe_en_from_definition(def_line: str) -> str:
-    """
-    Definition lines are typically already EN-friendly:
-      "PPA = Power Purchase Agreement"
-    Keep as-is.
-    """
-    return def_line.strip()
-
-def safe_en_from_de_bullet(line: str) -> str:
-    """
-    Minimal rule-based DE->EN for common procurement/sourcing wording.
-    If still clearly German, tag as "(DE original)" rather than fake-translate.
-    """
+def safe_en_from_de_line(line: str) -> str:
     s = clean_ws(line)
     if not s:
         return s
 
+    # minimal deterministic substitutions (extend as you like)
     repl = [
-        (r"\bBitte\b", "Please"),
         (r"\bNachweis\b", "evidence"),
         (r"\bAnforderung(en)?\b", "requirement(s)"),
-        (r"\bverbindlich\b", "binding"),
-        (r"\bPrüfung(en)?\b", "review(s)"),
-        (r"\bBewertung\b", "evaluation"),
-        (r"\bLieferant(en)?\b", "supplier(s)"),
-        (r"\bVertrag\b", "contract"),
-        (r"\bDokument(e|)\b", "document(s)"),
-        (r"\bKapitel\b", "chapter"),
-        (r"\bAbschnitt\b", "section"),
-        (r"\bBitte\s+prüfen\b", "Please review"),
-        (r"\binterne\s+Rücksprache\b", "internal follow-up"),
+        (r"\bDokumentation\b", "documentation"),
+        (r"\bdokumentiert\b", "documented"),
+        (r"\bentsprechend\b", "in accordance with"),
+        (r"\bgemäß\b", "in accordance with"),
+        (r"\bnach\b", "according to"),
+        (r"\bStandard\b", "standard"),
+        (r"\bNorm\b", "standard"),
     ]
     out = s
     for pat, rep in repl:
         out = re.sub(pat, rep, out, flags=re.IGNORECASE)
 
-    # detect still-German
+    # if still very German, tag as DE original
     de_markers = [" der ", " die ", " das ", " und ", " nicht ", " wird ", " wurde ", " kann ", " soll ", " muss "]
     if sum(m in (" " + out.lower() + " ") for m in de_markers) >= 2:
         return f"(DE original) {s}"
     return out
 
 
+# =========================================================
+# ANSWER ASSEMBLY (your approach: compare candidates then write)
+# =========================================================
 def build_bilingual_reply(greeting_name: str, signature_name: str, intent: str,
-                         definition: str | None,
                          bullets_de: list[str],
+                         definition_line: str | None = None,
                          ask_clarification: bool = False) -> str:
-    """
-    Always return DE + EN, no 'based on documents' phrase, with greeting + closing.
-    """
     greeting_name = greeting_name or "Sustainable-procurement"
     signature_name = signature_name or "Shubham"
 
-    # German
-    de = []
-    de.append(f"Hallo {greeting_name},")
-    de.append("ich hoffe, es geht Ihnen gut.")
-    de.append("")
+    # IMPORTANT: redact only content lines, not greeting/signature
+    def _redact_list(lines: list[str]) -> list[str]:
+        return [redact_sensitive_remove(x) for x in lines]
 
-    if intent == "definition" and definition:
-        de.append(definition)  # definition line is concise
+    de_lines = [
+        f"Hallo {greeting_name},",
+        "ich hoffe, es geht Ihnen gut.",
+        "",
+    ]
+
+    if intent == "definition" and definition_line:
+        de_lines += _redact_list([definition_line])
     else:
-        for b in bullets_de:
-            b = clean_ws(b)
-            if b:
-                de.append(f"- {b}")
+        de_lines += [f"- {x}" for x in _redact_list(bullets_de) if x]
 
     if ask_clarification:
-        de.append("")
-        de.append("Falls Sie mir den Dokumentennamen oder den relevanten Abschnitt nennen, kann ich die Antwort gezielt präzisieren.")
+        de_lines += ["", "Falls Sie mir den Dokumentennamen oder den relevanten Abschnitt nennen, kann ich die Antwort gezielt präzisieren."]
 
-    de.append("")
-    de.append("Mit freundlichen Grüßen")
-    de.append(signature_name)
+    de_lines += ["", "Mit freundlichen Grüßen", signature_name]
 
-    # English
-    en = []
-    en.append(f"Hello {greeting_name},")
-    en.append("I hope you are doing well.")
-    en.append("")
+    en_lines = [
+        f"Hello {greeting_name},",
+        "I hope you are doing well.",
+        "",
+    ]
 
-    if intent == "definition" and definition:
-        en.append(safe_en_from_definition(definition))
+    if intent == "definition" and definition_line:
+        en_lines += [definition_line]  # usually already clean: "PPA = Power Purchase Agreement"
     else:
-        en.append("Key points:")
-        for b in bullets_de:
-            b = clean_ws(b)
-            if b:
-                en.append(f"- {safe_en_from_de_bullet(b)}")
+        en_lines += ["Key points:"]
+        for b in bullets_de[:6]:
+            en_lines += [f"- {safe_en_from_de_line(redact_sensitive_remove(b))}"]
 
     if ask_clarification:
-        en.append("")
-        en.append("If you share the document name or the relevant section, I can refine the answer precisely.")
+        en_lines += ["", "If you share the document name or the relevant section, I can refine the answer precisely."]
 
-    en.append("")
-    en.append("Best regards,")
-    en.append(signature_name)
+    en_lines += ["", "Best regards,", signature_name]
 
-    out = "\n".join(de).strip() + "\n\n---\n\n" + "\n".join(en).strip()
-    # redact at the end (remove names/phones/emails/etc.)
-    return redact_sensitive_remove(out)
+    return "\n".join(de_lines).strip() + "\n\n---\n\n" + "\n".join(en_lines).strip()
+
+
+def build_answer_from_kb(index: list[KBLine], question_text: str) -> str:
+    q = clean_ws(question_text)
+    intent = detect_intent(q)
+    focus = extract_focus_term(q)
+
+    definition_line = None
+    ask_clarification = False
+
+    # Definition-first (explicit)
+    if intent == "definition" and focus:
+        definition_line, _src = pick_definition(index, focus)
+
+    # Compare candidates across ALL docs/lines (your requested approach)
+    cands = pick_best_candidates(index, q, intent=intent, focus_term=focus, top_k=8)
+
+    bullets = []
+    if intent == "definition":
+        if not definition_line:
+            # try turning top candidate into TERM = ...
+            for c in cands:
+                if focus:
+                    d = explicit_definition_from_text(focus, c.text)
+                    if d:
+                        definition_line = d
+                        break
+            if not definition_line:
+                bullets = [c.text for c in cands[:3]]
+                ask_clarification = True
+
+    elif intent == "which_standard":
+        # We want the most direct standard-containing line
+        bullets = [c.text for c in cands[:4]]
+        if not bullets:
+            ask_clarification = True
+
+    else:
+        bullets = [c.text for c in cands[:5]]
+        if not bullets:
+            ask_clarification = True
+
+    return build_bilingual_reply(
+        greeting_name="Sustainable-procurement",
+        signature_name=safe_firstname_from_email(TARGET_MAILBOX),
+        intent=intent,
+        bullets_de=bullets,
+        definition_line=definition_line,
+        ask_clarification=ask_clarification
+    )
 
 
 # =========================================================
@@ -775,6 +801,7 @@ def get_sender_smtp(mail) -> str:
     except Exception:
         return (mail.SenderEmailAddress or "").lower()
 
+
 def add_processed_category(mail):
     try:
         cats = mail.Categories or ""
@@ -784,12 +811,14 @@ def add_processed_category(mail):
     except Exception:
         pass
 
+
 def mark_read(mail):
     try:
         mail.UnRead = False
         mail.Save()
     except Exception:
         pass
+
 
 def get_target_folder():
     ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
@@ -817,6 +846,7 @@ def get_target_folder():
 
     raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox.")
 
+
 def get_account_for_mailbox(ns, mailbox_substring: str):
     try:
         for acc in ns.Session.Accounts:
@@ -826,6 +856,7 @@ def get_account_for_mailbox(ns, mailbox_substring: str):
     except Exception:
         pass
     return None
+
 
 def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
     msg = ns.Application.CreateItem(0)
@@ -845,6 +876,7 @@ def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: st
             pass
     msg.Send()
 
+
 def create_outlook_task_reminder(ns, subject: str, days: int = 2):
     try:
         task = ns.Application.CreateItem(3)  # olTaskItem
@@ -859,79 +891,16 @@ def create_outlook_task_reminder(ns, subject: str, days: int = 2):
 
 
 # =========================================================
-# MAIN: deterministic answer pipeline
+# BOT RUN
 # =========================================================
-def build_answer_from_kb(kb_docs: list[tuple[str, str, str]], question_text: str) -> str:
-    """
-    Returns full bilingual reply body (plain text) — no HTML here.
-    """
-    question_text = clean_ws(question_text)
-    intent = detect_intent(question_text)
-    focus_term = extract_focus_term(question_text)
-
-    # 1) Definition-first
-    definition, _def_src = (None, None)
-    if intent == "definition" and focus_term:
-        definition, _def_src = find_best_definition(kb_docs, focus_term)
-
-    # 2) Retrieval for non-definition or missing definition
-    top_docs = rank_docs(kb_docs, question_text, top_k=MAX_DOCS_TO_RANK)
-    chunks = rank_chunks(top_docs, question_text, top_k=MAX_CHUNKS_TO_RANK)
-
-    # 3) Compose bullets / direct sentence
-    ask_clarification = False
-    bullets_de: list[str] = []
-
-    if intent == "definition":
-        if definition:
-            # definition is enough
-            pass
-        else:
-            # try to pick a definition-like sentence from retrieved chunks
-            best_sent, _src = choose_best_sentence(chunks, question_text, intent="definition", focus_term=focus_term)
-            if best_sent:
-                # If we can produce "TERM = ..." from a sentence, do it
-                if focus_term:
-                    # try to extract expansion from sentence
-                    d = find_explicit_definition_in_text(focus_term, best_sent)
-                    definition = d if d else best_sent
-                else:
-                    definition = best_sent
-            else:
-                # fall back: bullets, and ask for doc/section
-                bullets_de = build_bullets_from_chunks(chunks, question_text, intent="definition", focus_term=focus_term, max_points=3)
-                ask_clarification = True
-
-    else:
-        # requirement/general
-        best_sent, _src = choose_best_sentence(chunks, question_text, intent=intent, focus_term=focus_term)
-        bullets_de = build_bullets_from_chunks(chunks, question_text, intent=intent, focus_term=focus_term, max_points=5)
-
-        # If bullets are too weak, ask clarification
-        if not best_sent and not bullets_de:
-            ask_clarification = True
-
-    # final assembly
-    reply = build_bilingual_reply(
-        greeting_name="Sustainable-procurement",
-        signature_name=safe_firstname_from_email(TARGET_MAILBOX),
-        intent=intent,
-        definition=definition,
-        bullets_de=bullets_de,
-        ask_clarification=ask_clarification
-    )
-
-    return reply
-
-
-def run_bot_once():
-    # startup delay (simple / notebook-safe)
+def run_bot_once(force_rebuild_index: bool = False):
     import time
     time.sleep(STARTUP_DELAY_SEC)
 
     print("Loading KB from:", KB_DIR)
-    kb_docs = load_kb_docs(KB_DIR)
-    print("KB loaded (docs):", len(kb_docs))
+    kb_docs, kb_index = build_or_load_kb_index(force_rebuild=force_rebuild_index)
+    print("KB docs:", len(kb_docs), "| KB indexed lines:", len(kb_index))
+    print("KB index cache:", KB_INDEX_PATH)
 
     ns, folder, store_name, folder_name = get_target_folder()
     print(f"Mailbox={store_name} | Folder={folder_name}")
@@ -950,7 +919,7 @@ def run_bot_once():
             break
 
         try:
-            if getattr(mail, "Class", None) != 43:  # MailItem
+            if getattr(mail, "Class", None) != 43:
                 continue
 
             subject = mail.Subject or ""
@@ -959,10 +928,8 @@ def run_bot_once():
 
             if PROCESSED_CATEGORY.lower() in cats.lower():
                 continue
-
             if REQUIRE_UNREAD and not unread:
                 continue
-
             if REQUIRE_STRICT_SUBJECT and not strict_subject_is_bot(subject):
                 continue
 
@@ -970,20 +937,13 @@ def run_bot_once():
             greeting_name = safe_firstname_from_email(sender)
 
             body_text = clean_html_to_text(mail.HTMLBody or "")
-            # remove quoted chain from the question area (keep only the top part)
-            # stop at common separators
+            # keep only top part (strip quoted chains)
             body_top = re.split(r"(?i)\b(von:|from:|gesendet:|sent:|-----original message-----)\b", body_text)[0].strip()
             question = body_top if body_top else body_text
 
-            # build answer
-            reply_text = build_answer_from_kb(kb_docs, question_text=question)
+            reply_text = build_answer_from_kb(kb_index, question_text=question)
 
-            # force greeting name into both languages (after redaction removed some tokens)
-            # We keep greeting_name simple (from email local-part), unlikely to be redacted.
-            # If it gets blank, fallback:
-            greeting_name = greeting_name or "Sustainable-procurement"
-
-            # Replace the default placeholder greeting target with actual greeting_name
+            # Insert real greeting_name deterministically
             reply_text = reply_text.replace("Hallo Sustainable-procurement", f"Hallo {greeting_name}")
             reply_text = reply_text.replace("Hello Sustainable-procurement", f"Hello {greeting_name}")
 
@@ -997,28 +957,23 @@ def run_bot_once():
             add_processed_category(mail)
 
             drafted += 1
-            print("Draft created for subject:", subject)
+            print("Draft created for:", subject)
 
             if SELF_NOTIFY:
                 try:
-                    send_self_notification(
-                        ns=ns,
-                        from_mailbox=TARGET_MAILBOX,
-                        to_addr=SELF_NOTIFY_TO,
-                        orig_subject=subject,
-                        requester_email=sender,
-                    )
+                    send_self_notification(ns, TARGET_MAILBOX, SELF_NOTIFY_TO, subject, sender)
                 except Exception as e:
                     print("Self notification failed:", e)
 
             if CREATE_REMINDER_TASK:
-                create_outlook_task_reminder(ns, subject=subject, days=REMINDER_DAYS)
+                create_outlook_task_reminder(ns, subject, REMINDER_DAYS)
 
         except Exception as e:
-            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", e)
+            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", repr(e))
 
     print(f"Done. Checked={checked}, Drafted={drafted}")
 
 
-# Run:
-# run_bot_once()
+# Usage:
+# run_bot_once(force_rebuild_index=True)   # first time or after KB changes
+# run_bot_once()                           # normal runs (uses cached index)
