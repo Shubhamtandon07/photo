@@ -1,637 +1,83 @@
-# -*- coding: utf-8 -*-
-"""
-OUTLOOK DRAFT BOT (NO LLM) — VSCode-friendly (Python 3.14)
-Purpose:
-- Creates a draft reply for emails whose subject is exactly "bot" (case-insensitive).
-- Uses ONLY KB documents (no email-chain docs) to extract relevant snippets.
-- Inserts a "Verification Pack" at the bottom of the draft so you can run Microsoft 365 Copilot
-  to verify + rewrite + translate (DE/EN) inside Outlook.
-
-How you use it:
-1) Run this script from VSCode (NOT a notebook).
-2) Send an email to yourself with subject "bot" and a question in body.
-3) Script creates a Draft reply + marks the original email as Read + categories it.
-4) Open the draft in Outlook → use Copilot with the included prompt.
-
-Dependencies:
-- pywin32
-- python-docx (only if you keep .docx in KB)
-- pdfplumber or pypdf (optional for PDF KB)
-- openpyxl (optional for Excel KB)
-"""
-
-from __future__ import annotations
-
-import os
-import re
-import time
-from pathlib import Path
-from datetime import datetime, timedelta
-from html import escape
-from typing import List, Tuple
-
-import win32com.client as win32
-
-# =========================
-# CONFIG — EDIT THESE
-# =========================
-TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"  # Outlook store DisplayName substring match
-WATCH_FOLDER_NAME = "Inbox"                          # "Inbox" or subfolder under Inbox
-
-KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
-
-# Processing controls
-STRICT_SUBJECT = "bot"          # subject must equal this (case-insensitive)
-REQUIRE_UNREAD = True
-PROCESS_PER_RUN = 3
-SCAN_LIMIT = 250
-STARTUP_DELAY_SEC = 1
-
-# Avoid duplicate processing
-PROCESSED_CATEGORY = "Drafted-CopilotPack"
-
-# Self notification + reminder
-SELF_NOTIFY = True
-SELF_NOTIFY_TO = TARGET_MAILBOX
-CREATE_REMINDER_TASK = True
-REMINDER_DAYS = 2
-
-# KB reading
-SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
-MAX_DOCS = 2000
-MAX_CHARS_PER_DOC = 180_000
-MAX_CHARS_PER_CHUNK = 1400
-MAX_CHUNKS_PER_DOC = 120
-
-# De-prioritize mail-chain-like documents
-MAILY_PREFIXES = ("aw_", "re_", "fw_", "wg_")
-MAILY_HINTS = ("subject", "mail", "email", "outlook", ".msg", "conversation")
-
-# Sources list in output should NOT include these docs
-EXCLUDE_AS_SOURCES_PREFIXES = ("aw_", "re_", "fw_", "wg_")
-
-# =========================
-# BASIC TEXT UTILS
-# =========================
-STOPWORDS = set("""
-the a an and or to of in on for with without from by at is are was were be been being
-der die das und oder zu von im in am an auf für mit ohne aus bei ist sind war waren
-""".split())
-
-def clean_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
-
-def strict_subject_ok(subject: str) -> bool:
-    return (subject or "").strip().casefold() == STRICT_SUBJECT.casefold()
-
-def clean_html_to_text(html: str) -> str:
-    # Simple HTML tag stripper
-    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
-    return clean_ws(txt)
-
-def safe_firstname_from_email(email: str) -> str:
-    email = (email or "").strip()
-    local = email.split("@", 1)[0] if "@" in email else email
-    first = local.split(".", 1)[0].strip()
-    if not first:
-        return "Colleague"
-    return first[:1].upper() + first[1:]
-
-def format_outlook_html(text: str) -> str:
-    """
-    Plain -> Outlook HTML:
-    - Blank-line blocks -> <p>
-    - Lines starting with '- ' -> <ul>
-    """
-    text = (text or "").replace("\r\n", "\n").strip()
-    if not text:
-        return "<p></p>"
-
-    blocks = re.split(r"\n\s*\n", text)
-    out = []
-    for block in blocks:
-        lines = [ln.rstrip() for ln in block.split("\n") if ln.strip()]
-        if not lines:
-            continue
-        if all(ln.lstrip().startswith("- ") for ln in lines):
-            out.append("<ul>")
-            for ln in lines:
-                ln2 = ln.lstrip()[2:].strip()
-                out.append(f"<li>{escape(ln2)}</li>")
-            out.append("</ul>")
-        else:
-            out.append("<p>" + "<br>".join(escape(ln.strip()) for ln in lines) + "</p>")
-    return "\n".join(out)
-
-def tokenize(s: str) -> List[str]:
-    toks = re.split(r"[^a-zA-Z0-9ÄÖÜäöüß]+", (s or "").lower())
-    return [t for t in toks if t and t not in STOPWORDS and len(t) >= 3]
-
-# =========================
-# KB READERS (skip missing libs)
-# =========================
-def read_txt(p: Path) -> str:
-    return p.read_text(encoding="utf-8", errors="ignore")
-
-def read_docx(p: Path) -> str:
-    try:
-        from docx import Document as DocxDocument  # type: ignore
-    except Exception:
-        return ""
-    doc = DocxDocument(str(p))
-    paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
-    table_lines = []
-    for t in doc.tables:
-        for row in t.rows:
-            cells = [clean_ws(c.text) for c in row.cells]
-            if any(cells):
-                table_lines.append(" | ".join(cells))
-    return (paras + "\n" + "\n".join(table_lines)).strip()
-
-def read_pdf(p: Path) -> str:
-    # prefer pdfplumber
-    try:
-        import pdfplumber  # type: ignore
-        out = []
-        with pdfplumber.open(str(p)) as pdf:
-            for page in pdf.pages:
-                out.append(page.extract_text() or "")
-        return "\n".join(out).strip()
-    except Exception:
-        pass
-    # fallback pypdf
-    try:
-        from pypdf import PdfReader  # type: ignore
-        r = PdfReader(str(p))
-        out = []
-        for pg in r.pages:
-            try:
-                out.append(pg.extract_text() or "")
-            except Exception:
-                pass
-        return "\n".join(out).strip()
-    except Exception:
-        return ""
-
-def read_xlsx(p: Path) -> str:
-    try:
-        import openpyxl  # type: ignore
-    except Exception:
-        return ""
-    wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
-    out = []
-    for ws in wb.worksheets:
-        out.append(f"Sheet: {ws.title}")
-        max_rows = min(ws.max_row or 0, 200)
-        max_cols = min(ws.max_column or 0, 40)
-        for r in range(1, max_rows + 1):
-            row_vals = []
-            for c in range(1, max_cols + 1):
-                v = ws.cell(row=r, column=c).value
-                row_vals.append("" if v is None else str(v))
-            if any(x.strip() for x in row_vals):
-                out.append(" | ".join(clean_ws(x) for x in row_vals))
-    return "\n".join(out).strip()
-
-def extract_text_from_file(p: Path) -> str:
-    ext = p.suffix.lower()
-    if ext == ".txt":
-        return read_txt(p)
-    if ext == ".docx":
-        return read_docx(p)
-    if ext == ".pdf":
-        return read_pdf(p)
-    if ext == ".xlsx":
-        return read_xlsx(p)
-    return ""
-
-def is_maily_filename(p: Path) -> bool:
-    name = (p.name or "").lower()
-    stem = (p.stem or "").lower()
-    if stem.startswith("~$"):
-        return True
-    if stem.startswith(MAILY_PREFIXES):
-        return True
-    if any(h in name for h in MAILY_HINTS):
-        return True
-    return False
-
-# =========================
-# BUILD KB INDEX (docs -> chunks)
-# =========================
-def split_into_chunks(text: str) -> List[str]:
-    text = text or ""
-    paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
-    chunks: List[str] = []
-    for p in paras:
-        if len(p) <= MAX_CHARS_PER_CHUNK:
-            chunks.append(p)
-        else:
-            for i in range(0, len(p), MAX_CHARS_PER_CHUNK):
-                chunks.append(p[i:i + MAX_CHARS_PER_CHUNK])
-        if len(chunks) >= MAX_CHUNKS_PER_DOC:
-            break
-    return chunks
-
-def doc_priority_adjustment(filename: str) -> float:
-    """
-    Higher is better.
-    Penalize AW_/RE_/FW_/WG_ heavily.
-    """
-    fn = (filename or "").lower()
-    score = 0.0
-    if fn.startswith(MAILY_PREFIXES):
-        score -= 0.35
-    if any(h in fn for h in MAILY_HINTS):
-        score -= 0.15
-    # small boost to "standards"/"mbn"/"policy"/"guideline"
-    if re.search(r"(?i)\b(mbn|standard|policy|guideline|kapitel|chapter|requirements)\b", fn):
-        score += 0.12
-    return score
-
-def build_kb_index(kb_dir: str) -> List[Tuple[str, str, str]]:
-    """
-    Returns list of chunks:
-      (source_file_fullpath, source_filename, chunk_text)
-    """
-    base = Path(kb_dir)
-    if not base.exists() or not base.is_dir():
-        raise SystemExit(f"KB_DIR not found: {kb_dir}")
-
-    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
-    files = files[:MAX_DOCS]
-
-    chunks: List[Tuple[str, str, str]] = []
-    for p in sorted(files):
-        try:
-            txt = extract_text_from_file(p)
-            txt = (txt or "").strip()
-            if not txt:
-                continue
-            txt = txt[:MAX_CHARS_PER_DOC]
-            for ch in split_into_chunks(txt):
-                if ch.strip():
-                    chunks.append((str(p), p.name, ch))
-        except Exception:
-            continue
-
-    return chunks
-
-# =========================
-# RETRIEVAL + ANSWER (deterministic)
-# =========================
-def score_chunk(query: str, chunk_text: str, filename: str) -> float:
-    q_toks = tokenize(query)
-    if not q_toks:
-        return 0.0
-
-    t = chunk_text.lower()
-    overlap = 0
-    for tk in set(q_toks):
-        if tk in t:
-            overlap += 1
-
-    # requirement bonus
-    req_bonus = 0
-    if re.search(r"(?i)\b(must|shall|required|requirement|muss|soll|erforder|anforder|nachweis|beleg)\b", chunk_text):
-        req_bonus = 2
-
-    base = overlap + req_bonus
-    # doc priority adjustment
-    base += doc_priority_adjustment(filename) * 10.0
-    return float(base)
-
-def pick_best_chunks(kb_chunks: List[Tuple[str, str, str]], query: str, top_k: int = 8):
-    scored = []
-    for fullpath, fname, ch in kb_chunks:
-        s = score_chunk(query, ch, fname)
-        if s > 0:
-            scored.append((s, fullpath, fname, ch))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[:top_k]
-
-def sentence_split(text: str) -> List[str]:
-    txt = re.sub(r"\s+", " ", text or "").strip()
-    if not txt:
-        return []
-    parts = re.split(r"(?<=[\.\!\?])\s+", txt)
-    out = [p.strip(" -•\t\r\n") for p in parts if len(p.strip()) >= 15]
-    return out
-
-def build_bullets_from_chunks(best_chunks, question: str, max_points: int = 5) -> List[str]:
-    q_tokens = set(tokenize(question))
-    bullets = []
-    used = set()
-
-    for score, fullpath, fname, ch in best_chunks:
-        for sent in sentence_split(ch):
-            stoks = set(tokenize(sent))
-            # require some overlap to avoid random quoting
-            if len(q_tokens & stoks) < max(1, min(2, len(q_tokens)//6)):
-                continue
-            key = sent.lower()
-            if key in used:
-                continue
-            used.add(key)
-            bullets.append(sent)
-            if len(bullets) >= max_points:
-                break
-        if len(bullets) >= max_points:
-            break
-
-    # fallback: first sentence of best chunk
-    if not bullets and best_chunks:
-        bullets = sentence_split(best_chunks[0][3])[:2]
-
-    # de-dup and trim
-    out = []
-    seen = set()
-    for b in bullets:
-        b = clean_ws(b)
-        if not b:
-            continue
-        k = b.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(b)
-    return out[:max_points]
-
-def sources_from_chunks(best_chunks) -> List[str]:
-    # Only include valid docs (not AW_/RE_/WG_/FW_)
-    srcs = []
-    for _, fullpath, fname, _ in best_chunks:
-        if fname.lower().startswith(EXCLUDE_AS_SOURCES_PREFIXES):
-            continue
-        if fname not in srcs:
-            srcs.append(fname)
-    return srcs[:8]
-
-def build_verification_pack(question: str, best_chunks, bullets: List[str], sources: List[str]) -> str:
-    """
-    This is what you feed to Copilot in Outlook.
-    """
-    lines = []
-    lines.append("=== VERIFICATION PACK (for M365 Copilot) ===")
-    lines.append("")
-    lines.append("Copilot prompt (paste into Copilot):")
-    lines.append(
-        "Use only the information in this Verification Pack and the listed documents.\n"
-        "1) Verify each bullet/claim: Supported / Not supported / Needs clarification.\n"
-        "2) Rewrite the email professionally.\n"
-        "3) Output German + English.\n"
-        "4) Do NOT include personal names, supplier names, emails, phones, IDs, or addresses.\n"
-        "5) Add 'Sources used' (document titles only, no emails).\n"
-    )
-    lines.append("")
-    lines.append("Question (cleaned):")
-    lines.append(question.strip())
-    lines.append("")
-    lines.append("Draft bullets (deterministic):")
-    for b in bullets:
-        lines.append(f"- {b}")
-    lines.append("")
-    lines.append("Top snippets (evidence):")
-    for i, (score, fullpath, fname, ch) in enumerate(best_chunks, start=1):
-        lines.append(f"[{i}] Source: {fname}")
-        # keep short
-        snip = ch.strip()
-        if len(snip) > 700:
-            snip = snip[:700] + "…"
-        lines.append(snip)
-        lines.append("")
-    lines.append("Candidate sources (documents):")
-    lines.append(", ".join(sources) if sources else "(none)")
-    lines.append("")
-    lines.append("=== END VERIFICATION PACK ===")
-    return "\n".join(lines)
-
-def build_email_body(greeting_name: str, signature_name: str, bullets: List[str], sources: List[str], verification_pack: str) -> str:
-    """
-    This is what goes into the draft.
-    We keep it readable, then add the pack at bottom.
-    """
-    greeting_name = greeting_name or "Sustainable-procurement"
-    signature_name = signature_name or "Shubham"
-
-    de = []
-    de.append(f"Hallo {greeting_name},")
-    de.append("ich hoffe, es geht Ihnen gut.")
-    de.append("")
-    if bullets:
-        for b in bullets:
-            de.append(f"- {b}")
-    else:
-        de.append("- Ich konnte in den verfügbaren Dokumenten keine eindeutige, explizite Antwort finden. Können Sie bitte den Dokumentennamen oder Abschnitt nennen?")
-    de.append("")
-    de.append("Mit freundlichen Grüßen")
-    de.append(signature_name)
-
-    # lightweight EN (Copilot will rewrite anyway)
-    en = []
-    en.append(f"Hello {greeting_name},")
-    en.append("I hope you are doing well.")
-    en.append("")
-    en.append("Key points (to be verified by Copilot):")
-    for b in bullets[:6]:
-        en.append(f"- {b}")
-    en.append("")
-    en.append("Best regards,")
-    en.append(signature_name)
-
-    src_line = ""
-    if sources:
-        src_line = "Interne Quellen (Dokumente): " + ", ".join(sources)
-
-    body = "\n".join(de)
-    if src_line:
-        body = body.replace("Mit freundlichen Grüßen", src_line + "\n\nMit freundlichen Grüßen")
-
-    return body + "\n\n---\n\n" + "\n".join(en) + "\n\n\n" + verification_pack
-
-# =========================
-# OUTLOOK HELPERS
-# =========================
-def get_sender_smtp(mail) -> str:
-    try:
-        addr = (mail.SenderEmailAddress or "").lower()
-        if addr.startswith("/o="):
-            ex = mail.Sender.GetExchangeUser()
-            if ex:
-                return (ex.PrimarySmtpAddress or "").lower()
-        return addr
-    except Exception:
-        return (mail.SenderEmailAddress or "").lower()
-
-def get_target_folder():
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-
-    target_store = None
-    for st in ns.Stores:
-        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
-            target_store = st
-            break
-
-    if not target_store:
-        print("Available stores (use one of these in TARGET_MAILBOX):")
-        for st in ns.Stores:
-            print(" -", st.DisplayName)
-        raise SystemExit("Target mailbox not found.")
-
-    inbox = target_store.GetDefaultFolder(6)  # Inbox
-    if WATCH_FOLDER_NAME.lower() == "inbox":
-        return ns, inbox, target_store.DisplayName, "Inbox"
-
-    for f in inbox.Folders:
-        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
-            return ns, f, target_store.DisplayName, f.Name
-
-    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
-
-def add_processed_category(mail):
-    try:
-        cats = mail.Categories or ""
-        if PROCESSED_CATEGORY.lower() not in cats.lower():
-            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
-        mail.Save()
-    except Exception:
-        pass
-
-def mark_read(mail):
-    try:
-        mail.UnRead = False
-        mail.Save()
-    except Exception:
-        pass
-
-def get_account_for_mailbox(ns, mailbox_substring: str):
-    try:
-        for acc in ns.Session.Accounts:
-            smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
-            if mailbox_substring.lower() in smtp or smtp in mailbox_substring.lower():
-                return acc
-    except Exception:
-        pass
-    return None
-
-def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
-    msg = ns.Application.CreateItem(0)
-    msg.To = to_addr
-    msg.Subject = f"Draft created (review needed): {orig_subject}"
-    msg.Body = (
-        "A draft reply has been created in Outlook.\n\n"
-        f"Original subject: {orig_subject}\n"
-        f"Requester: {requester_email}\n\n"
-        "Open the Draft and run Copilot using the Verification Pack.\n"
-    )
-    acc = get_account_for_mailbox(ns, from_mailbox)
-    if acc:
-        try:
-            msg.SendUsingAccount = acc
-        except Exception:
-            pass
-    msg.Send()
-
-def create_outlook_task_reminder(ns, subject: str, days: int = 2):
-    try:
-        task = ns.Application.CreateItem(3)  # olTaskItem
-        task.Subject = f"Reminder: review/send draft for '{subject}'"
-        task.DueDate = (datetime.now() + timedelta(days=days)).date()
-        task.ReminderSet = True
-        task.ReminderTime = datetime.now() + timedelta(days=days)
-        task.Body = "A draft reply was created. Please review and send it."
-        task.Save()
-    except Exception:
-        pass
-
-# =========================
-# MAIN
-# =========================
-def run_bot_once():
-    time.sleep(STARTUP_DELAY_SEC)
-
-    print("Loading KB from:", KB_DIR)
-    kb_chunks = build_kb_index(KB_DIR)
-    print("KB loaded (chunks):", len(kb_chunks))
-
-    ns, folder, store_name, folder_name = get_target_folder()
-    print(f"Mailbox={store_name} | Folder={folder_name}")
-
-    items = folder.Items
-    items.Sort("[ReceivedTime]", True)
-
-    drafted = 0
-    checked = 0
-
-    your_firstname = safe_firstname_from_email(TARGET_MAILBOX)
-
-    for mail in items:
-        checked += 1
-        if checked > SCAN_LIMIT:
-            break
-        if drafted >= PROCESS_PER_RUN:
-            break
-
-        try:
-            if getattr(mail, "Class", None) != 43:
-                continue
-
-            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
-                continue
-
-            if REQUIRE_UNREAD and not mail.UnRead:
-                continue
-
-            subject = mail.Subject or ""
-            if not strict_subject_ok(subject):
-                continue
-
-            sender = get_sender_smtp(mail)
-            greeting_name = safe_firstname_from_email(sender)
-
-            body_text = clean_html_to_text(mail.HTMLBody or "")
-
-            # remove quoted chain from the question (top block only)
-            question = re.split(r"(?i)\b(von:|from:|gesendet:|sent:|-----original message-----)\b", body_text)[0].strip()
-            if not question:
-                question = body_text.strip()
-
-            # retrieval
-            best = pick_best_chunks(kb_chunks, query=question, top_k=8)
-            bullets = build_bullets_from_chunks(best, question, max_points=5)
-            sources = sources_from_chunks(best)
-            pack = build_verification_pack(question, best, bullets, sources)
-
-            reply_text = build_email_body(
-                greeting_name=greeting_name,
-                signature_name=your_firstname,
-                bullets=bullets,
-                sources=sources,
-                verification_pack=pack,
-            )
-
-            # draft
-            reply = mail.Reply()
-            reply.HTMLBody = f"<div>{format_outlook_html(reply_text)}</div><hr>" + reply.HTMLBody
-            reply.Save()
-
-            mark_read(mail)
-            add_processed_category(mail)
-
-            drafted += 1
-            print("Draft created for:", subject)
-
-            if SELF_NOTIFY:
-                send_self_notification(ns, TARGET_MAILBOX, SELF_NOTIFY_TO, subject, sender)
-
-            if CREATE_REMINDER_TASK:
-                create_outlook_task_reminder(ns, subject=subject, days=REMINDER_DAYS)
-
-        except Exception as e:
-            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", e)
-
-    print(f"Done. Checked={checked}, Drafted={drafted}")
-
-
-if __name__ == "__main__":
-    run_bot_once()
+•	ichtung bilanzielle CO₂-neutralität ist nur anhand eines glaubwürdigen Einsatzes des Grünstroms durch Einhaltung der Grundanforderungen in Kombination mit zusätzlichen Qualitätskriterien, die über Grundanforderungen hinausgehen und durch die eine Zusätzlichkeit | Grünstrombeschaffung eingehalten bzw.
+•	Eine öffentliche Akzeptanz der Unternehmensbemühungen in Richtung bilanzielle CO₂-neutralität ist nur anhand eines glaubwürdigen Einsatzes des Grünstroms durch Einhaltung der Grundanforderungen in Kombination mit zusätzlichen Qualitätskriterien, die über Grundanforderungen hinausgehen und durch die eine Zusätzlichkeit | In the following chapters, Mercedes-Benz AG shows the basic requirements and additional quality criteria that shall be complied with or observed when procuring green electricity, lists the priorities for green electricity procurement options and, if technically and economically possible, always recommends using the best option with the highest quality.
+•	Je nachdem werden manche Bauteile als Fokusbauteile eingestuft und erhalten gesonderte Anforderungen z.B.
+•	rohmaterialspezifische CO2 Anforderungen Es sind mehrere (third party) assessments angekündigt: CO2, Lieferkette, vegane Produkte etc..
+•	Internal Version V202302-01-FA Fokusprämissen Nachhaltigkeit für die Vergabe / Focus awarding premises sustainability Value 1 Internal Version V202302-01-FA 1Diese Anforderung findet sich auch in den übergreifenden Anforderungen zum Komponentenlastenheft (LHV 310 001, LHV 310 003, Version 7.0 & 7.1).
+Interne Quellen (Dokumente): m0016_Grünstromstandard_Green_Electricity_Standard_Einkauf_v202302.docx, 2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx, m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx
+Mit freundlichen Grüßen
+Shubham
+---
+Hello Sustainable-procurement,
+I hope you are doing well.
+Key points (to be verified by Copilot):
+- ichtung bilanzielle CO₂-neutralität ist nur anhand eines glaubwürdigen Einsatzes des Grünstroms durch Einhaltung der Grundanforderungen in Kombination mit zusätzlichen Qualitätskriterien, die über Grundanforderungen hinausgehen und durch die eine Zusätzlichkeit | Grünstrombeschaffung eingehalten bzw.
+- Eine öffentliche Akzeptanz der Unternehmensbemühungen in Richtung bilanzielle CO₂-neutralität ist nur anhand eines glaubwürdigen Einsatzes des Grünstroms durch Einhaltung der Grundanforderungen in Kombination mit zusätzlichen Qualitätskriterien, die über Grundanforderungen hinausgehen und durch die eine Zusätzlichkeit | In the following chapters, Mercedes-Benz AG shows the basic requirements and additional quality criteria that shall be complied with or observed when procuring green electricity, lists the priorities for green electricity procurement options and, if technically and economically possible, always recommends using the best option with the highest quality.
+- Je nachdem werden manche Bauteile als Fokusbauteile eingestuft und erhalten gesonderte Anforderungen z.B.
+- rohmaterialspezifische CO2 Anforderungen Es sind mehrere (third party) assessments angekündigt: CO2, Lieferkette, vegane Produkte etc..
+- Internal Version V202302-01-FA Fokusprämissen Nachhaltigkeit für die Vergabe / Focus awarding premises sustainability Value 1 Internal Version V202302-01-FA 1Diese Anforderung findet sich auch in den übergreifenden Anforderungen zum Komponentenlastenheft (LHV 310 001, LHV 310 003, Version 7.0 & 7.1).
+Best regards,
+Shubham
+=== VERIFICATION PACK (for M365 Copilot) ===
+Copilot prompt (paste into Copilot):
+Use only the information in this Verification Pack and the listed documents.
+1) Verify each bullet/claim: Supported / Not supported / Needs clarification.
+2) Rewrite the email professionally.
+3) Output German + English.
+4) Do NOT include personal names, supplier names, emails, phones, IDs, or addresses.
+5) Add 'Sources used' (document titles only, no emails).
+Question (cleaned):
+Was sind die Anforderungen an eine verantwortungsvolle Beschaffung &nbsp;
+Draft bullets (deterministic):
+- ichtung bilanzielle CO₂-neutralität ist nur anhand eines glaubwürdigen Einsatzes des Grünstroms durch Einhaltung der Grundanforderungen in Kombination mit zusätzlichen Qualitätskriterien, die über Grundanforderungen hinausgehen und durch die eine Zusätzlichkeit | Grünstrombeschaffung eingehalten bzw.
+- Eine öffentliche Akzeptanz der Unternehmensbemühungen in Richtung bilanzielle CO₂-neutralität ist nur anhand eines glaubwürdigen Einsatzes des Grünstroms durch Einhaltung der Grundanforderungen in Kombination mit zusätzlichen Qualitätskriterien, die über Grundanforderungen hinausgehen und durch die eine Zusätzlichkeit | In the following chapters, Mercedes-Benz AG shows the basic requirements and additional quality criteria that shall be complied with or observed when procuring green electricity, lists the priorities for green electricity procurement options and, if technically and economically possible, always recommends using the best option with the highest quality.
+- Je nachdem werden manche Bauteile als Fokusbauteile eingestuft und erhalten gesonderte Anforderungen z.B.
+- rohmaterialspezifische CO2 Anforderungen Es sind mehrere (third party) assessments angekündigt: CO2, Lieferkette, vegane Produkte etc..
+- Internal Version V202302-01-FA Fokusprämissen Nachhaltigkeit für die Vergabe / Focus awarding premises sustainability Value 1 Internal Version V202302-01-FA 1Diese Anforderung findet sich auch in den übergreifenden Anforderungen zum Komponentenlastenheft (LHV 310 001, LHV 310 003, Version 7.0 & 7.1).
+Top snippets (evidence):
+[1] Source: m0016_Grünstromstandard_Green_Electricity_Standard_Einkauf_v202302.docx
+ichtung bilanzielle CO₂-neutralität ist nur anhand eines glaubwürdigen Einsatzes des Grünstroms durch Einhaltung der Grundanforderungen in Kombination mit zusätzlichen Qualitätskriterien, die über Grundanforderungen hinausgehen und durch die eine Zusätzlichkeit | Grünstrombeschaffung eingehalten bzw. beachtet werden müssen, listet die Prioritäten bei den Grünstrombeschaffungsoptionen auf und empfiehlt, wenn technisch und wirtschaftlich möglich, immer auf die beste Option mit der höchsten Qualität zurückzugreifen. Eine öffentliche Akzeptanz der Unternehmensbemühungen in Richtung bilanzielle CO₂-neutralität ist nur anhand eines glaubwürdigen Einsatzes des Grünstroms durch Einhaltung der Grunda…
+[2] Source: 2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx
+Allgemeine Fragen
+Standardprämissen Nachhaltigkeit für die Vergabe* V202510-01-S
+*Fragen zu Sekundärmaterialien werden hier ausgeklammert. , da die Werkstoffverantwortlichen von *** dieses separat vorbereiten und dann mit Frau Kapp besprechen.
+Interieur” Allgemein
+Lieferantennachhaltigkeitsstrategie*
+Lieferantennachhaltigkeitsstrategie – krit. Rohstoffe/Leder
+Supply Chain Tracker_Template.htmlKLH, Kapitel
+Lieferantennachhaltigkeitsstrategie – krit. Rohstoffe/Stahl & Eisen
+Frage | Hinweis | Antwort / Erklärung
+liefert heute für die BR167 Säulen oben, Säulen unten (für MB.EA-L bereits angefragt), IP-Teile, Heckklappenverkl. (für MB.EA-L bereits angefragt) und strebt an, auch den Nachfolger mit…
+[3] Source: m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx
+Internal Version V202302-01-FA
+Fokusprämissen Nachhaltigkeit für die Vergabe / Focus awarding premises sustainability
+Value
+1
+Internal Version V202302-01-FA
+1Diese Anforderung findet sich auch in den übergreifenden Anforderungen zum Komponentenlastenheft (LHV 310 001, LHV 310 003, Version 7.0 & 7.1). / This requirement can also be found in the common requirements pertaining to the Component Requirement Specifications (LHV 310 001, LHV 310 003, Version 7.0 & 7.1).
+2
+Internal Version V202302-01-FA
+3
+Internal Version V202302-01-FA
+SIGN
+4
+Internal Version V202302-01-FA
+Anhang/Annex
+5
+Internal Version V202302-01-FA
+6
+Internal Version V202302-01-FA
+Internal Version V202302-01-FA
+CO2-targets for pr…
+[4] Source: m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx
+und einzelne Bauteile. Mercedes-Benz stellt hierfür nach Vergabe eine entsprechende Vorlage zur | 1. Responsible Sourcing Anforderungen 1.1 Lieferkettentransparenz Sofern der Partner Produkte liefert, in denen menschenrechtlich kritische Rohstoffe enthalten sind, verpflichtet sich der Partner im Falle einer Vergabe auf Anfrage von Mercedes-Benz zur Offenlegung seiner tier-n Lieferketten – bis zur Herkunft einzelner Rohstoffe. Die Anfrage erfolgt risikobasiert nur für bestimmte Rohstoffe und einzelne Bauteile. Mercedes-Benz stellt hierfür nach Vergabe eine entsprechende Vorlage zur | 1. Responsible Sourcing Anforderungen 1.1 Lieferkettentransparenz Sofern der Partner Produkte liefert, in dene…
+[5] Source: m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx
+tion Strom aus erneuerbaren Energien einsetzen (Scope 1+2). Dabei sind die im Dokument „Grünstromstandard Mercedes-Benz Group AG Mercedes-Benz Group aufgeführten Anforderungen zu beachten. O2-neutrale Produkte1 Alle Produkte, die ab dem 01.01.2039 von dem Partner an Mercedes-Benz geliefert werden, müssen in allen Wertschöpfungsstufen CO2-neutral produziert werden. Dies schließt sowohl die Produktion an allen Ihren Standorten als auch die vorgelagerte Lieferkette mit ein. Davon sind | Komponentenlastenheft (LHV 310 001, LHV 310 003, Version 7.0 & 7.1) ersichtlich. 2.2 Strom aus erneuerbaren Energien bei tier11 Der Partner muss für die Herstellung der Mercedes-Benz Produkte in seiner eigenen P…
+[6] Source: m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx
+nen Produktion Strom aus erneuerbaren Energien einsetzen (Scope 1+2). Dabei sind die im Dokument „Grünstromstandard Mercedes-Benz Group AG Mercedes-Benz Group aufgeführten Anforderungen zu beachten. O2-neutrale Produkte1 Alle Produkte, die ab dem 01.01.2039 von dem Partner an Mercedes-Benz geliefert werden, müssen in allen Wertschöpfungsstufen CO2-neutral produziert werden. Dies schließt sowohl die Produktion an allen Ihren Standorten als auch die vorgelagerte Lieferkette mit ein. Davon sind | Komponentenlastenheft (LHV 310 001, LHV 310 003, Version 7.0 & 7.1) ersichtlich. 2.2 Strom aus erneuerbaren Energien bei tier11 Der Partner muss für die Herstellung der Mercedes-Benz Produkte in seiner…
+[7] Source: m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx
+einer eigenen Produktion Strom aus erneuerbaren Energien einsetzen (Scope 1+2). Dabei sind die im Dokument „Grünstromstandard Mercedes-Benz Group AG Mercedes-Benz Group aufgeführten Anforderungen zu beachten. O2-neutrale Produkte1 Alle Produkte, die ab dem 01.01.2039 von dem Partner an Mercedes-Benz geliefert werden, müssen in allen Wertschöpfungsstufen CO2-neutral produziert werden. Dies schließt sowohl die Produktion an allen Ihren Standorten als auch die vorgelagerte Lieferkette mit ein. Davon sind | Komponentenlastenheft (LHV 310 001, LHV 310 003, Version 7.0 & 7.1) ersichtlich. 2.2 Strom aus erneuerbaren Energien bei tier11 Der Partner muss für die Herstellung der Mercedes-Benz Produkte…
+[8] Source: m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx
+dukte in seiner eigenen Produktion Strom aus erneuerbaren Energien einsetzen (Scope 1+2). Dabei sind die im Dokument „Grünstromstandard Mercedes-Benz Group AG Mercedes-Benz Group aufgeführten Anforderungen zu beachten. O2-neutrale Produkte1 Alle Produkte, die ab dem 01.01.2039 von dem Partner an Mercedes-Benz geliefert werden, müssen in allen Wertschöpfungsstufen CO2-neutral produziert werden. Dies schließt sowohl die Produktion an allen Ihren Standorten als auch die vorgelagerte Lieferkette mit ein. Davon sind | Komponentenlastenheft (LHV 310 001, LHV 310 003, Version 7.0 & 7.1) ersichtlich. 2.2 Strom aus erneuerbaren Energien bei tier11 Der Partner muss für die Herstellung der Mercedes-Ben…
+Candidate sources (documents):
+m0016_Grünstromstandard_Green_Electricity_Standard_Einkauf_v202302.docx, 2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx, m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx
+=== END VERIFICATION PACK ===
