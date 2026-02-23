@@ -1,374 +1,637 @@
+# -*- coding: utf-8 -*-
+"""
+OUTLOOK DRAFT BOT (NO LLM) — VSCode-friendly (Python 3.14)
+Purpose:
+- Creates a draft reply for emails whose subject is exactly "bot" (case-insensitive).
+- Uses ONLY KB documents (no email-chain docs) to extract relevant snippets.
+- Inserts a "Verification Pack" at the bottom of the draft so you can run Microsoft 365 Copilot
+  to verify + rewrite + translate (DE/EN) inside Outlook.
+
+How you use it:
+1) Run this script from VSCode (NOT a notebook).
+2) Send an email to yourself with subject "bot" and a question in body.
+3) Script creates a Draft reply + marks the original email as Read + categories it.
+4) Open the draft in Outlook → use Copilot with the included prompt.
+
+Dependencies:
+- pywin32
+- python-docx (only if you keep .docx in KB)
+- pdfplumber or pypdf (optional for PDF KB)
+- openpyxl (optional for Excel KB)
+"""
+
 from __future__ import annotations
-from pathlib import Path
-from datetime import datetime
-import csv
-import hashlib
+
+import os
 import re
-import traceback
+import time
+from pathlib import Path
+from datetime import datetime, timedelta
+from html import escape
+from typing import List, Tuple
 
-# ========= CONFIG =========
-ROOT = Path(r"C:\Users\SHTANDO\Desktop\chatbot")
-INPUT_DIR = ROOT / "input"          # put .msg files here
-EXPORTS_DIR = ROOT / "_exports"
+import win32com.client as win32
 
-PDF_EXTS = {".pdf"}
-IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
+# =========================
+# CONFIG — EDIT THESE
+# =========================
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"  # Outlook store DisplayName substring match
+WATCH_FOLDER_NAME = "Inbox"                          # "Inbox" or subfolder under Inbox
 
-# ========= HELPERS =========
-def now_tag() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
 
-def safe_text(x) -> str:
+# Processing controls
+STRICT_SUBJECT = "bot"          # subject must equal this (case-insensitive)
+REQUIRE_UNREAD = True
+PROCESS_PER_RUN = 3
+SCAN_LIMIT = 250
+STARTUP_DELAY_SEC = 1
+
+# Avoid duplicate processing
+PROCESSED_CATEGORY = "Drafted-CopilotPack"
+
+# Self notification + reminder
+SELF_NOTIFY = True
+SELF_NOTIFY_TO = TARGET_MAILBOX
+CREATE_REMINDER_TASK = True
+REMINDER_DAYS = 2
+
+# KB reading
+SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
+MAX_DOCS = 2000
+MAX_CHARS_PER_DOC = 180_000
+MAX_CHARS_PER_CHUNK = 1400
+MAX_CHUNKS_PER_DOC = 120
+
+# De-prioritize mail-chain-like documents
+MAILY_PREFIXES = ("aw_", "re_", "fw_", "wg_")
+MAILY_HINTS = ("subject", "mail", "email", "outlook", ".msg", "conversation")
+
+# Sources list in output should NOT include these docs
+EXCLUDE_AS_SOURCES_PREFIXES = ("aw_", "re_", "fw_", "wg_")
+
+# =========================
+# BASIC TEXT UTILS
+# =========================
+STOPWORDS = set("""
+the a an and or to of in on for with without from by at is are was were be been being
+der die das und oder zu von im in am an auf für mit ohne aus bei ist sind war waren
+""".split())
+
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def strict_subject_ok(subject: str) -> bool:
+    return (subject or "").strip().casefold() == STRICT_SUBJECT.casefold()
+
+def clean_html_to_text(html: str) -> str:
+    # Simple HTML tag stripper
+    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
+    return clean_ws(txt)
+
+def safe_firstname_from_email(email: str) -> str:
+    email = (email or "").strip()
+    local = email.split("@", 1)[0] if "@" in email else email
+    first = local.split(".", 1)[0].strip()
+    if not first:
+        return "Colleague"
+    return first[:1].upper() + first[1:]
+
+def format_outlook_html(text: str) -> str:
     """
-    Make any value safe for printing/CSV:
-    - convert to str
-    - replace problematic unicode with safe placeholders
+    Plain -> Outlook HTML:
+    - Blank-line blocks -> <p>
+    - Lines starting with '- ' -> <ul>
     """
-    if x is None:
-        return ""
-    s = str(x)
-    # Replace surrogate / non-printable chars safely
-    s = s.encode("utf-8", errors="backslashreplace").decode("utf-8", errors="ignore")
-    return s
+    text = (text or "").replace("\r\n", "\n").strip()
+    if not text:
+        return "<p></p>"
 
-def safe_name(name: str, max_len: int = 80) -> str:
-    name = safe_text(name).strip()
-    name = re.sub(r"[<>:\"/\\|?*\x00-\x1F]+", "_", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    if not name:
-        name = "file"
-    if len(name) > max_len:
-        h = hashlib.sha1(name.encode("utf-8", errors="ignore")).hexdigest()[:8]
-        base, dot, ext = name.rpartition(".")
-        if dot:
-            base = base[: max_len - (len(ext) + 1 + 9)]
-            name = f"{base}__{h}.{ext}"
-        else:
-            name = f"{name[: max_len - 9]}__{h}"
-    return name
-
-def write_error(log_path: Path, msg: str):
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8", errors="replace") as f:
-        f.write(safe_text(msg).rstrip() + "\n")
-
-def import_extract_msg():
-    try:
-        import extract_msg  # type: ignore
-        return extract_msg
-    except Exception as e:
-        raise RuntimeError(
-            "Missing dependency: extract-msg. Install with:\n"
-            "!python -m pip install --user -U extract-msg"
-        ) from e
-
-def open_msg(extract_msg, msg_path: Path):
-    """
-    Try a few encodings because some .msg streams are inconsistent.
-    """
-    # Many corp .msg decode better with utf-8 override, others need utf-16.
-    for enc in ("utf-8", "utf-16", None):
-        try:
-            if enc:
-                return extract_msg.Message(str(msg_path), overrideEncoding=enc)
-            return extract_msg.Message(str(msg_path))
-        except Exception:
+    blocks = re.split(r"\n\s*\n", text)
+    out = []
+    for block in blocks:
+        lines = [ln.rstrip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
             continue
-    # last attempt: raise the original behavior
-    return extract_msg.Message(str(msg_path))
+        if all(ln.lstrip().startswith("- ") for ln in lines):
+            out.append("<ul>")
+            for ln in lines:
+                ln2 = ln.lstrip()[2:].strip()
+                out.append(f"<li>{escape(ln2)}</li>")
+            out.append("</ul>")
+        else:
+            out.append("<p>" + "<br>".join(escape(ln.strip()) for ln in lines) + "</p>")
+    return "\n".join(out)
 
-# ========= MAIN =========
-def collect_attachments_from_msgs():
-    extract_msg = import_extract_msg()
+def tokenize(s: str) -> List[str]:
+    toks = re.split(r"[^a-zA-Z0-9ÄÖÜäöüß]+", (s or "").lower())
+    return [t for t in toks if t and t not in STOPWORDS and len(t) >= 3]
 
-    if not INPUT_DIR.exists():
-        raise FileNotFoundError(f"INPUT_DIR not found: {INPUT_DIR}")
+# =========================
+# KB READERS (skip missing libs)
+# =========================
+def read_txt(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="ignore")
 
-    msg_files = sorted([p for p in INPUT_DIR.rglob("*.msg") if p.is_file()])
-    print("ROOT:", ROOT)
-    print("INPUT_DIR:", INPUT_DIR)
-    print("Found .msg files:", len(msg_files))
-
-    run_dir = EXPORTS_DIR / f"collect_att_{now_tag()}"
-    pdf_dir = run_dir / "pdfs"
-    img_dir = run_dir / "images"
-    pdf_dir.mkdir(parents=True, exist_ok=True)
-    img_dir.mkdir(parents=True, exist_ok=True)
-
-    manifest_path = run_dir / "manifest.csv"
-    errors_path = run_dir / "errors.log"
-
-    with manifest_path.open("w", newline="", encoding="utf-8-sig", errors="replace") as f:
-        w = csv.writer(f)
-        w.writerow(["msg_file", "attachment_name", "saved_as", "type", "bytes"])
-
-    ok_msgs = 0
-    fail_msgs = 0
-    saved = 0
-
-    for msg_path in msg_files:
-        try:
-            m = open_msg(extract_msg, msg_path)
-
-            # Trigger parsing in some versions (subject access can force decode)
-            try:
-                _ = getattr(m, "subject", None)
-            except Exception:
-                pass
-
-            atts = getattr(m, "attachments", []) or []
-
-            for att in atts:
-                fname = "attachment"
-                try:
-                    fname = getattr(att, "longFilename", None) or getattr(att, "shortFilename", None) or "attachment"
-                    fname = safe_text(fname)
-                    ext = Path(fname).suffix.lower()
-
-                    if ext in PDF_EXTS:
-                        out_dir = pdf_dir
-                        typ = "pdf"
-                    elif ext in IMG_EXTS:
-                        out_dir = img_dir
-                        typ = "image"
-                    else:
-                        continue
-
-                    data = getattr(att, "data", None)
-                    if not data:
-                        continue
-
-                    out_name = safe_name(fname)
-                    out_path = out_dir / out_name
-
-                    if out_path.exists():
-                        h = hashlib.sha1(data).hexdigest()[:8]
-                        out_name = safe_name(f"{Path(out_name).stem}__{h}{Path(out_name).suffix}")
-                        out_path = out_dir / out_name
-
-                    out_path.write_bytes(data)
-                    saved += 1
-
-                    with manifest_path.open("a", newline="", encoding="utf-8-sig", errors="replace") as f:
-                        w = csv.writer(f)
-                        w.writerow([safe_text(msg_path.name), fname, safe_text(out_name), typ, len(data)])
-
-                except Exception as e_att:
-                    write_error(errors_path, f"ATT_SAVE_ERROR | {msg_path.name} | {fname} -> {repr(e_att)}")
-
-            ok_msgs += 1
-
-        except Exception as e_msg:
-            fail_msgs += 1
-            write_error(errors_path, f"MSG_ERROR | {msg_path} -> {repr(e_msg)}")
-            write_error(errors_path, traceback.format_exc())
-
-    print("RUN_DIR:", run_dir)
-    print(f"Done. MSG ok={ok_msgs} fail={fail_msgs} | attachments collected={saved}")
-    print("Manifest:", manifest_path)
-    print("Errors:", errors_path)
-    print("PDFs folder:", pdf_dir)
-    print("Images folder:", img_dir)
-
-# Run it:
-collect_attachments_from_msgs()
-
-  
-
-# --- CODE 2: Convert collected PDFs + images into DOCX (Notebook-safe) ---
-
-from __future__ import annotations
-from pathlib import Path
-from datetime import datetime
-import re
-import traceback
-
-# ========= CONFIG =========
-RUN_DIR = Path(r"C:\Users\SHTANDO\Desktop\chatbot\_exports\collect_att_YYYYMMDD_HHMMSS")  # <-- set this
-PDF_DIR = RUN_DIR / "pdfs"
-IMG_DIR = RUN_DIR / "images"
-
-OUT_DIR = RUN_DIR / f"docx_extracted_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-OUT_PDF = OUT_DIR / "from_pdfs"
-OUT_IMG = OUT_DIR / "from_images"
-OUT_PDF.mkdir(parents=True, exist_ok=True)
-OUT_IMG.mkdir(parents=True, exist_ok=True)
-
-ERRORS = OUT_DIR / "errors.log"
-
-# ========= HELPERS =========
-def write_error(msg: str):
-    ERRORS.parent.mkdir(parents=True, exist_ok=True)
-    with ERRORS.open("a", encoding="utf-8") as f:
-        f.write(msg.rstrip() + "\n")
-
-def safe_filename(name: str, max_len: int = 120) -> str:
-    name = (name or "").strip()
-    name = re.sub(r"[<>:\"/\\|?*\x00-\x1F]", "_", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    if not name:
-        name = "file"
-    return name[:max_len]
-
-def import_docx():
+def read_docx(p: Path) -> str:
     try:
-        from docx import Document  # type: ignore
-        return Document
-    except Exception as e:
-        raise RuntimeError("Missing dependency: python-docx. Install: !python -m pip install --user python-docx") from e
+        from docx import Document as DocxDocument  # type: ignore
+    except Exception:
+        return ""
+    doc = DocxDocument(str(p))
+    paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
+    table_lines = []
+    for t in doc.tables:
+        for row in t.rows:
+            cells = [clean_ws(c.text) for c in row.cells]
+            if any(cells):
+                table_lines.append(" | ".join(cells))
+    return (paras + "\n" + "\n".join(table_lines)).strip()
 
-def import_pdfplumber():
+def read_pdf(p: Path) -> str:
+    # prefer pdfplumber
     try:
         import pdfplumber  # type: ignore
-        return pdfplumber
+        out = []
+        with pdfplumber.open(str(p)) as pdf:
+            for page in pdf.pages:
+                out.append(page.extract_text() or "")
+        return "\n".join(out).strip()
     except Exception:
-        return None
-
-def import_pytesseract_and_pil():
+        pass
+    # fallback pypdf
     try:
-        import pytesseract  # type: ignore
-        from PIL import Image  # type: ignore
-        return pytesseract, Image
+        from pypdf import PdfReader  # type: ignore
+        r = PdfReader(str(p))
+        out = []
+        for pg in r.pages:
+            try:
+                out.append(pg.extract_text() or "")
+            except Exception:
+                pass
+        return "\n".join(out).strip()
     except Exception:
-        return None, None
-
-def normalize_cell(x) -> str:
-    if x is None:
         return ""
-    s = str(x).replace("\u00a0", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
 
-def add_table(doc, table_data):
-    # table_data: list[list[str]]
-    if not table_data:
-        return
-    rows = [r for r in table_data if isinstance(r, list)]
-    if len(rows) < 2:
-        return
-    cols = max(len(r) for r in rows)
-    if cols < 2:
-        return
-
-    t = doc.add_table(rows=len(rows), cols=cols)
-    t.style = "Table Grid"
-    for i, r in enumerate(rows):
-        r = list(r) + [""] * (cols - len(r))
-        for j, c in enumerate(r):
-            t.cell(i, j).text = normalize_cell(c)
-    doc.add_paragraph("")
-
-# ========= PDF -> DOCX =========
-def pdf_to_docx(pdf_path: Path, out_docx: Path):
-    Document = import_docx()
-    pdfplumber = import_pdfplumber()
-    if pdfplumber is None:
-        raise RuntimeError("pdfplumber is missing. Install: !python -m pip install --user pdfplumber")
-
-    doc = Document()
-    doc.add_heading(f"{pdf_path.name}", level=1)
-    doc.add_paragraph(f"Source: {pdf_path}")
-
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            doc.add_heading(f"Page {i}", level=2)
-
-            # 1) Try tables first (best effort)
-            try:
-                tables = page.extract_tables() or []
-            except Exception:
-                tables = []
-
-            if tables:
-                doc.add_paragraph("Tables:")
-                for tbl in tables:
-                    add_table(doc, tbl)
-
-            # 2) Then plain text
-            try:
-                txt = page.extract_text() or ""
-            except Exception:
-                txt = ""
-
-            txt = txt.strip()
-            if txt:
-                doc.add_paragraph("Text:")
-                for line in txt.splitlines():
-                    line = line.strip()
-                    if line:
-                        doc.add_paragraph(line)
-            else:
-                doc.add_paragraph("(No readable text on this page.)")
-
-            doc.add_page_break()
-
-    doc.save(str(out_docx))
-
-# ========= IMAGE -> DOCX (OCR) =========
-def image_to_docx(img_path: Path, out_docx: Path):
-    Document = import_docx()
-    pytesseract, Image = import_pytesseract_and_pil()
-    if pytesseract is None or Image is None:
-        raise RuntimeError(
-            "OCR not available (missing pytesseract/Pillow). "
-            "Install: !python -m pip install --user pytesseract pillow"
-        )
-
-    doc = Document()
-    doc.add_heading(f"{img_path.name}", level=1)
-    doc.add_paragraph(f"Source: {img_path}")
-
+def read_xlsx(p: Path) -> str:
     try:
-        img = Image.open(img_path)
-        text = pytesseract.image_to_string(img)
-    except Exception as e:
-        raise RuntimeError(f"OCR failed: {repr(e)}")
+        import openpyxl  # type: ignore
+    except Exception:
+        return ""
+    wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+    out = []
+    for ws in wb.worksheets:
+        out.append(f"Sheet: {ws.title}")
+        max_rows = min(ws.max_row or 0, 200)
+        max_cols = min(ws.max_column or 0, 40)
+        for r in range(1, max_rows + 1):
+            row_vals = []
+            for c in range(1, max_cols + 1):
+                v = ws.cell(row=r, column=c).value
+                row_vals.append("" if v is None else str(v))
+            if any(x.strip() for x in row_vals):
+                out.append(" | ".join(clean_ws(x) for x in row_vals))
+    return "\n".join(out).strip()
 
-    text = (text or "").strip()
-    if text:
-        for line in text.splitlines():
-            line = line.strip()
-            if line:
-                doc.add_paragraph(line)
+def extract_text_from_file(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext == ".txt":
+        return read_txt(p)
+    if ext == ".docx":
+        return read_docx(p)
+    if ext == ".pdf":
+        return read_pdf(p)
+    if ext == ".xlsx":
+        return read_xlsx(p)
+    return ""
+
+def is_maily_filename(p: Path) -> bool:
+    name = (p.name or "").lower()
+    stem = (p.stem or "").lower()
+    if stem.startswith("~$"):
+        return True
+    if stem.startswith(MAILY_PREFIXES):
+        return True
+    if any(h in name for h in MAILY_HINTS):
+        return True
+    return False
+
+# =========================
+# BUILD KB INDEX (docs -> chunks)
+# =========================
+def split_into_chunks(text: str) -> List[str]:
+    text = text or ""
+    paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    chunks: List[str] = []
+    for p in paras:
+        if len(p) <= MAX_CHARS_PER_CHUNK:
+            chunks.append(p)
+        else:
+            for i in range(0, len(p), MAX_CHARS_PER_CHUNK):
+                chunks.append(p[i:i + MAX_CHARS_PER_CHUNK])
+        if len(chunks) >= MAX_CHUNKS_PER_DOC:
+            break
+    return chunks
+
+def doc_priority_adjustment(filename: str) -> float:
+    """
+    Higher is better.
+    Penalize AW_/RE_/FW_/WG_ heavily.
+    """
+    fn = (filename or "").lower()
+    score = 0.0
+    if fn.startswith(MAILY_PREFIXES):
+        score -= 0.35
+    if any(h in fn for h in MAILY_HINTS):
+        score -= 0.15
+    # small boost to "standards"/"mbn"/"policy"/"guideline"
+    if re.search(r"(?i)\b(mbn|standard|policy|guideline|kapitel|chapter|requirements)\b", fn):
+        score += 0.12
+    return score
+
+def build_kb_index(kb_dir: str) -> List[Tuple[str, str, str]]:
+    """
+    Returns list of chunks:
+      (source_file_fullpath, source_filename, chunk_text)
+    """
+    base = Path(kb_dir)
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"KB_DIR not found: {kb_dir}")
+
+    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    files = files[:MAX_DOCS]
+
+    chunks: List[Tuple[str, str, str]] = []
+    for p in sorted(files):
+        try:
+            txt = extract_text_from_file(p)
+            txt = (txt or "").strip()
+            if not txt:
+                continue
+            txt = txt[:MAX_CHARS_PER_DOC]
+            for ch in split_into_chunks(txt):
+                if ch.strip():
+                    chunks.append((str(p), p.name, ch))
+        except Exception:
+            continue
+
+    return chunks
+
+# =========================
+# RETRIEVAL + ANSWER (deterministic)
+# =========================
+def score_chunk(query: str, chunk_text: str, filename: str) -> float:
+    q_toks = tokenize(query)
+    if not q_toks:
+        return 0.0
+
+    t = chunk_text.lower()
+    overlap = 0
+    for tk in set(q_toks):
+        if tk in t:
+            overlap += 1
+
+    # requirement bonus
+    req_bonus = 0
+    if re.search(r"(?i)\b(must|shall|required|requirement|muss|soll|erforder|anforder|nachweis|beleg)\b", chunk_text):
+        req_bonus = 2
+
+    base = overlap + req_bonus
+    # doc priority adjustment
+    base += doc_priority_adjustment(filename) * 10.0
+    return float(base)
+
+def pick_best_chunks(kb_chunks: List[Tuple[str, str, str]], query: str, top_k: int = 8):
+    scored = []
+    for fullpath, fname, ch in kb_chunks:
+        s = score_chunk(query, ch, fname)
+        if s > 0:
+            scored.append((s, fullpath, fname, ch))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:top_k]
+
+def sentence_split(text: str) -> List[str]:
+    txt = re.sub(r"\s+", " ", text or "").strip()
+    if not txt:
+        return []
+    parts = re.split(r"(?<=[\.\!\?])\s+", txt)
+    out = [p.strip(" -•\t\r\n") for p in parts if len(p.strip()) >= 15]
+    return out
+
+def build_bullets_from_chunks(best_chunks, question: str, max_points: int = 5) -> List[str]:
+    q_tokens = set(tokenize(question))
+    bullets = []
+    used = set()
+
+    for score, fullpath, fname, ch in best_chunks:
+        for sent in sentence_split(ch):
+            stoks = set(tokenize(sent))
+            # require some overlap to avoid random quoting
+            if len(q_tokens & stoks) < max(1, min(2, len(q_tokens)//6)):
+                continue
+            key = sent.lower()
+            if key in used:
+                continue
+            used.add(key)
+            bullets.append(sent)
+            if len(bullets) >= max_points:
+                break
+        if len(bullets) >= max_points:
+            break
+
+    # fallback: first sentence of best chunk
+    if not bullets and best_chunks:
+        bullets = sentence_split(best_chunks[0][3])[:2]
+
+    # de-dup and trim
+    out = []
+    seen = set()
+    for b in bullets:
+        b = clean_ws(b)
+        if not b:
+            continue
+        k = b.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(b)
+    return out[:max_points]
+
+def sources_from_chunks(best_chunks) -> List[str]:
+    # Only include valid docs (not AW_/RE_/WG_/FW_)
+    srcs = []
+    for _, fullpath, fname, _ in best_chunks:
+        if fname.lower().startswith(EXCLUDE_AS_SOURCES_PREFIXES):
+            continue
+        if fname not in srcs:
+            srcs.append(fname)
+    return srcs[:8]
+
+def build_verification_pack(question: str, best_chunks, bullets: List[str], sources: List[str]) -> str:
+    """
+    This is what you feed to Copilot in Outlook.
+    """
+    lines = []
+    lines.append("=== VERIFICATION PACK (for M365 Copilot) ===")
+    lines.append("")
+    lines.append("Copilot prompt (paste into Copilot):")
+    lines.append(
+        "Use only the information in this Verification Pack and the listed documents.\n"
+        "1) Verify each bullet/claim: Supported / Not supported / Needs clarification.\n"
+        "2) Rewrite the email professionally.\n"
+        "3) Output German + English.\n"
+        "4) Do NOT include personal names, supplier names, emails, phones, IDs, or addresses.\n"
+        "5) Add 'Sources used' (document titles only, no emails).\n"
+    )
+    lines.append("")
+    lines.append("Question (cleaned):")
+    lines.append(question.strip())
+    lines.append("")
+    lines.append("Draft bullets (deterministic):")
+    for b in bullets:
+        lines.append(f"- {b}")
+    lines.append("")
+    lines.append("Top snippets (evidence):")
+    for i, (score, fullpath, fname, ch) in enumerate(best_chunks, start=1):
+        lines.append(f"[{i}] Source: {fname}")
+        # keep short
+        snip = ch.strip()
+        if len(snip) > 700:
+            snip = snip[:700] + "…"
+        lines.append(snip)
+        lines.append("")
+    lines.append("Candidate sources (documents):")
+    lines.append(", ".join(sources) if sources else "(none)")
+    lines.append("")
+    lines.append("=== END VERIFICATION PACK ===")
+    return "\n".join(lines)
+
+def build_email_body(greeting_name: str, signature_name: str, bullets: List[str], sources: List[str], verification_pack: str) -> str:
+    """
+    This is what goes into the draft.
+    We keep it readable, then add the pack at bottom.
+    """
+    greeting_name = greeting_name or "Sustainable-procurement"
+    signature_name = signature_name or "Shubham"
+
+    de = []
+    de.append(f"Hallo {greeting_name},")
+    de.append("ich hoffe, es geht Ihnen gut.")
+    de.append("")
+    if bullets:
+        for b in bullets:
+            de.append(f"- {b}")
     else:
-        doc.add_paragraph("(No readable text found by OCR.)")
+        de.append("- Ich konnte in den verfügbaren Dokumenten keine eindeutige, explizite Antwort finden. Können Sie bitte den Dokumentennamen oder Abschnitt nennen?")
+    de.append("")
+    de.append("Mit freundlichen Grüßen")
+    de.append(signature_name)
 
-    doc.save(str(out_docx))
+    # lightweight EN (Copilot will rewrite anyway)
+    en = []
+    en.append(f"Hello {greeting_name},")
+    en.append("I hope you are doing well.")
+    en.append("")
+    en.append("Key points (to be verified by Copilot):")
+    for b in bullets[:6]:
+        en.append(f"- {b}")
+    en.append("")
+    en.append("Best regards,")
+    en.append(signature_name)
 
-# ========= RUN =========
-def run_convert():
-    pdfs = sorted([p for p in PDF_DIR.glob("*.pdf") if p.is_file()])
-    imgs = sorted([p for p in IMG_DIR.glob("*") if p.is_file() and p.suffix.lower() in {".png",".jpg",".jpeg",".tif",".tiff",".bmp",".gif",".webp"}])
+    src_line = ""
+    if sources:
+        src_line = "Interne Quellen (Dokumente): " + ", ".join(sources)
 
-    print("RUN_DIR:", RUN_DIR)
-    print("PDFs found:", len(pdfs))
-    print("Images found:", len(imgs))
-    print("OUT_DIR:", OUT_DIR)
+    body = "\n".join(de)
+    if src_line:
+        body = body.replace("Mit freundlichen Grüßen", src_line + "\n\nMit freundlichen Grüßen")
 
-    ok = fail = 0
+    return body + "\n\n---\n\n" + "\n".join(en) + "\n\n\n" + verification_pack
 
-    for p in pdfs:
-        out = OUT_PDF / safe_filename(p.stem + ".docx")
+# =========================
+# OUTLOOK HELPERS
+# =========================
+def get_sender_smtp(mail) -> str:
+    try:
+        addr = (mail.SenderEmailAddress or "").lower()
+        if addr.startswith("/o="):
+            ex = mail.Sender.GetExchangeUser()
+            if ex:
+                return (ex.PrimarySmtpAddress or "").lower()
+        return addr
+    except Exception:
+        return (mail.SenderEmailAddress or "").lower()
+
+def get_target_folder():
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+    target_store = None
+    for st in ns.Stores:
+        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
+            target_store = st
+            break
+
+    if not target_store:
+        print("Available stores (use one of these in TARGET_MAILBOX):")
+        for st in ns.Stores:
+            print(" -", st.DisplayName)
+        raise SystemExit("Target mailbox not found.")
+
+    inbox = target_store.GetDefaultFolder(6)  # Inbox
+    if WATCH_FOLDER_NAME.lower() == "inbox":
+        return ns, inbox, target_store.DisplayName, "Inbox"
+
+    for f in inbox.Folders:
+        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
+            return ns, f, target_store.DisplayName, f.Name
+
+    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
+
+def add_processed_category(mail):
+    try:
+        cats = mail.Categories or ""
+        if PROCESSED_CATEGORY.lower() not in cats.lower():
+            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
+        mail.Save()
+    except Exception:
+        pass
+
+def mark_read(mail):
+    try:
+        mail.UnRead = False
+        mail.Save()
+    except Exception:
+        pass
+
+def get_account_for_mailbox(ns, mailbox_substring: str):
+    try:
+        for acc in ns.Session.Accounts:
+            smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
+            if mailbox_substring.lower() in smtp or smtp in mailbox_substring.lower():
+                return acc
+    except Exception:
+        pass
+    return None
+
+def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
+    msg = ns.Application.CreateItem(0)
+    msg.To = to_addr
+    msg.Subject = f"Draft created (review needed): {orig_subject}"
+    msg.Body = (
+        "A draft reply has been created in Outlook.\n\n"
+        f"Original subject: {orig_subject}\n"
+        f"Requester: {requester_email}\n\n"
+        "Open the Draft and run Copilot using the Verification Pack.\n"
+    )
+    acc = get_account_for_mailbox(ns, from_mailbox)
+    if acc:
         try:
-            pdf_to_docx(p, out)
-            ok += 1
-        except Exception as e:
-            fail += 1
-            write_error(f"PDF_FAIL | {p.name} -> {repr(e)}")
-            write_error(traceback.format_exc())
+            msg.SendUsingAccount = acc
+        except Exception:
+            pass
+    msg.Send()
 
-    for p in imgs:
-        out = OUT_IMG / safe_filename(p.stem + ".docx")
+def create_outlook_task_reminder(ns, subject: str, days: int = 2):
+    try:
+        task = ns.Application.CreateItem(3)  # olTaskItem
+        task.Subject = f"Reminder: review/send draft for '{subject}'"
+        task.DueDate = (datetime.now() + timedelta(days=days)).date()
+        task.ReminderSet = True
+        task.ReminderTime = datetime.now() + timedelta(days=days)
+        task.Body = "A draft reply was created. Please review and send it."
+        task.Save()
+    except Exception:
+        pass
+
+# =========================
+# MAIN
+# =========================
+def run_bot_once():
+    time.sleep(STARTUP_DELAY_SEC)
+
+    print("Loading KB from:", KB_DIR)
+    kb_chunks = build_kb_index(KB_DIR)
+    print("KB loaded (chunks):", len(kb_chunks))
+
+    ns, folder, store_name, folder_name = get_target_folder()
+    print(f"Mailbox={store_name} | Folder={folder_name}")
+
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True)
+
+    drafted = 0
+    checked = 0
+
+    your_firstname = safe_firstname_from_email(TARGET_MAILBOX)
+
+    for mail in items:
+        checked += 1
+        if checked > SCAN_LIMIT:
+            break
+        if drafted >= PROCESS_PER_RUN:
+            break
+
         try:
-            image_to_docx(p, out)
-            ok += 1
+            if getattr(mail, "Class", None) != 43:
+                continue
+
+            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
+                continue
+
+            if REQUIRE_UNREAD and not mail.UnRead:
+                continue
+
+            subject = mail.Subject or ""
+            if not strict_subject_ok(subject):
+                continue
+
+            sender = get_sender_smtp(mail)
+            greeting_name = safe_firstname_from_email(sender)
+
+            body_text = clean_html_to_text(mail.HTMLBody or "")
+
+            # remove quoted chain from the question (top block only)
+            question = re.split(r"(?i)\b(von:|from:|gesendet:|sent:|-----original message-----)\b", body_text)[0].strip()
+            if not question:
+                question = body_text.strip()
+
+            # retrieval
+            best = pick_best_chunks(kb_chunks, query=question, top_k=8)
+            bullets = build_bullets_from_chunks(best, question, max_points=5)
+            sources = sources_from_chunks(best)
+            pack = build_verification_pack(question, best, bullets, sources)
+
+            reply_text = build_email_body(
+                greeting_name=greeting_name,
+                signature_name=your_firstname,
+                bullets=bullets,
+                sources=sources,
+                verification_pack=pack,
+            )
+
+            # draft
+            reply = mail.Reply()
+            reply.HTMLBody = f"<div>{format_outlook_html(reply_text)}</div><hr>" + reply.HTMLBody
+            reply.Save()
+
+            mark_read(mail)
+            add_processed_category(mail)
+
+            drafted += 1
+            print("Draft created for:", subject)
+
+            if SELF_NOTIFY:
+                send_self_notification(ns, TARGET_MAILBOX, SELF_NOTIFY_TO, subject, sender)
+
+            if CREATE_REMINDER_TASK:
+                create_outlook_task_reminder(ns, subject=subject, days=REMINDER_DAYS)
+
         except Exception as e:
-            fail += 1
-            write_error(f"IMG_FAIL | {p.name} -> {repr(e)}")
-            write_error(traceback.format_exc())
+            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", e)
 
-    print(f"Done. ok={ok} fail={fail}")
-    print("Errors:", ERRORS)
+    print(f"Done. Checked={checked}, Drafted={drafted}")
 
-# Run it:
-run_convert()
+
+if __name__ == "__main__":
+    run_bot_once()
