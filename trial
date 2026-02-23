@@ -1,5 +1,3 @@
-# --- CODE 1: Collect PDF + image attachments from .msg files (Notebook-safe) ---
-
 from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
@@ -9,11 +7,10 @@ import re
 import traceback
 
 # ========= CONFIG =========
-ROOT = Path(r"C:\Users\SHTANDO\Desktop\chatbot")  # change if needed
-INPUT_DIR = ROOT / "input"                        # folder that contains .msg files
+ROOT = Path(r"C:\Users\SHTANDO\Desktop\chatbot")
+INPUT_DIR = ROOT / "input"          # put .msg files here
 EXPORTS_DIR = ROOT / "_exports"
 
-# what we collect
 PDF_EXTS = {".pdf"}
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
 
@@ -21,8 +18,21 @@ IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
 def now_tag() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
+def safe_text(x) -> str:
+    """
+    Make any value safe for printing/CSV:
+    - convert to str
+    - replace problematic unicode with safe placeholders
+    """
+    if x is None:
+        return ""
+    s = str(x)
+    # Replace surrogate / non-printable chars safely
+    s = s.encode("utf-8", errors="backslashreplace").decode("utf-8", errors="ignore")
+    return s
+
 def safe_name(name: str, max_len: int = 80) -> str:
-    name = (name or "").strip()
+    name = safe_text(name).strip()
     name = re.sub(r"[<>:\"/\\|?*\x00-\x1F]+", "_", name)
     name = re.sub(r"\s+", " ", name).strip()
     if not name:
@@ -39,8 +49,8 @@ def safe_name(name: str, max_len: int = 80) -> str:
 
 def write_error(log_path: Path, msg: str):
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(msg.rstrip() + "\n")
+    with log_path.open("a", encoding="utf-8", errors="replace") as f:
+        f.write(safe_text(msg).rstrip() + "\n")
 
 def import_extract_msg():
     try:
@@ -48,22 +58,35 @@ def import_extract_msg():
         return extract_msg
     except Exception as e:
         raise RuntimeError(
-            "Missing dependency: extract_msg. Install with:\n"
+            "Missing dependency: extract-msg. Install with:\n"
             "!python -m pip install --user -U extract-msg"
         ) from e
+
+def open_msg(extract_msg, msg_path: Path):
+    """
+    Try a few encodings because some .msg streams are inconsistent.
+    """
+    # Many corp .msg decode better with utf-8 override, others need utf-16.
+    for enc in ("utf-8", "utf-16", None):
+        try:
+            if enc:
+                return extract_msg.Message(str(msg_path), overrideEncoding=enc)
+            return extract_msg.Message(str(msg_path))
+        except Exception:
+            continue
+    # last attempt: raise the original behavior
+    return extract_msg.Message(str(msg_path))
 
 # ========= MAIN =========
 def collect_attachments_from_msgs():
     extract_msg = import_extract_msg()
 
-    input_dir = INPUT_DIR
-    if not input_dir.exists():
-        raise FileNotFoundError(f"INPUT_DIR not found: {input_dir}")
+    if not INPUT_DIR.exists():
+        raise FileNotFoundError(f"INPUT_DIR not found: {INPUT_DIR}")
 
-    # find .msg (recursive)
-    msg_files = sorted([p for p in input_dir.rglob("*.msg") if p.is_file()])
+    msg_files = sorted([p for p in INPUT_DIR.rglob("*.msg") if p.is_file()])
     print("ROOT:", ROOT)
-    print("INPUT_DIR:", input_dir)
+    print("INPUT_DIR:", INPUT_DIR)
     print("Found .msg files:", len(msg_files))
 
     run_dir = EXPORTS_DIR / f"collect_att_{now_tag()}"
@@ -75,7 +98,7 @@ def collect_attachments_from_msgs():
     manifest_path = run_dir / "manifest.csv"
     errors_path = run_dir / "errors.log"
 
-    with manifest_path.open("w", newline="", encoding="utf-8") as f:
+    with manifest_path.open("w", newline="", encoding="utf-8-sig", errors="replace") as f:
         w = csv.writer(f)
         w.writerow(["msg_file", "attachment_name", "saved_as", "type", "bytes"])
 
@@ -85,19 +108,21 @@ def collect_attachments_from_msgs():
 
     for msg_path in msg_files:
         try:
-            m = extract_msg.Message(str(msg_path))
-            # IMPORTANT: different extract_msg versions behave differently.
-            # We avoid calling .process() and rely on lazy access.
+            m = open_msg(extract_msg, msg_path)
+
+            # Trigger parsing in some versions (subject access can force decode)
+            try:
+                _ = getattr(m, "subject", None)
+            except Exception:
+                pass
+
             atts = getattr(m, "attachments", []) or []
 
-            # Some versions require parsing by accessing subject/body first
-            _ = getattr(m, "subject", None)
-
-            # attachments list objects typically have:
-            # .longFilename / .shortFilename, .data
             for att in atts:
+                fname = "attachment"
                 try:
                     fname = getattr(att, "longFilename", None) or getattr(att, "shortFilename", None) or "attachment"
+                    fname = safe_text(fname)
                     ext = Path(fname).suffix.lower()
 
                     if ext in PDF_EXTS:
@@ -116,7 +141,6 @@ def collect_attachments_from_msgs():
                     out_name = safe_name(fname)
                     out_path = out_dir / out_name
 
-                    # avoid overwrite collisions
                     if out_path.exists():
                         h = hashlib.sha1(data).hexdigest()[:8]
                         out_name = safe_name(f"{Path(out_name).stem}__{h}{Path(out_name).suffix}")
@@ -125,9 +149,9 @@ def collect_attachments_from_msgs():
                     out_path.write_bytes(data)
                     saved += 1
 
-                    with manifest_path.open("a", newline="", encoding="utf-8") as f:
+                    with manifest_path.open("a", newline="", encoding="utf-8-sig", errors="replace") as f:
                         w = csv.writer(f)
-                        w.writerow([msg_path.name, fname, out_name, typ, len(data)])
+                        w.writerow([safe_text(msg_path.name), fname, safe_text(out_name), typ, len(data)])
 
                 except Exception as e_att:
                     write_error(errors_path, f"ATT_SAVE_ERROR | {msg_path.name} | {fname} -> {repr(e_att)}")
@@ -148,6 +172,8 @@ def collect_attachments_from_msgs():
 
 # Run it:
 collect_attachments_from_msgs()
+
+  
 
 # --- CODE 2: Convert collected PDFs + images into DOCX (Notebook-safe) ---
 
