@@ -1,1 +1,18 @@
-docker run --rm -p 5000:5000 libretranslate/libretranslate
+import requests
+
+LIBRE_URL = "http://localhost:5000"
+
+payload = {
+    "q": "Das ist ein Test. Bitte übersetzen.",
+    "source": "de",
+    "target": "en",
+    "format": "text",
+}
+
+r = requests.post(f"{LIBRE_URL}/translate", data=payload, timeout=60)
+print("status:", r.status_code)
+print("text:", r.text[:500])
+
+# If status == 200, parse JSON:
+if r.status_code == 200:
+    print("translated:", r.json().get("translatedText"))
