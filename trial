@@ -1,7 +1,547 @@
-An exception has occurred, use %tb to see the full traceback.
+# -*- coding: utf-8 -*-
+"""
+OUTLOOK DRAFT BOT (WITH LLM) — VSCode-friendly (Python 3.14)
 
-SystemExit: Could not authenticate to Nexus with tried base_url candidates. Last error: NotFoundError("Error code: 404 - {'message': 'no Route matched with those values', 'request_id': '5327e141e85e331e1ba82c08b9454c2c'}")
+FIXED VERSION:
+- Uses GenAI-Nexus endpoint WITH "/apikey/" because that is what you said works for your org.
+- Uses AzureOpenAI chat.completions (deployment name in model=AZURE_DEPLOYMENT_NAME).
+- Everything else kept the same structure/behavior.
+"""
 
-An exception has occurred, use %tb to see the full traceback.
+from __future__ import annotations
 
-SystemExit: Could not authenticate to Nexus with tried base_url candidates. Last error: NotFoundError("Error code: 404 - {'message': 'no Route matched with those values', 'request_id': '5327e141e85e331e1ba82c08b9454c2c'}")
+import os
+import re
+import time
+from pathlib import Path
+from datetime import datetime, timedelta
+from html import escape
+from typing import List, Tuple
+
+import win32com.client as win32
+from openai import AzureOpenAI
+
+# =========================
+# CONFIG — EDIT THESE
+# =========================
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"
+WATCH_FOLDER_NAME = "Inbox"
+
+KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
+
+STRICT_SUBJECT = "bot"
+
+REQUIRE_UNREAD = True
+PROCESS_PER_RUN = 3
+SCAN_LIMIT = 250
+STARTUP_DELAY_SEC = 1
+
+PROCESSED_CATEGORY = "Drafted-LLM"
+
+SELF_NOTIFY = True
+SELF_NOTIFY_TO = TARGET_MAILBOX
+CREATE_REMINDER_TASK = True
+REMINDER_DAYS = 2
+
+# KB reading
+SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
+MAX_DOCS = 5000
+MAX_CHARS_PER_DOC = 180_000
+MAX_CHARS_PER_CHUNK = 1400
+MAX_CHUNKS_PER_DOC = 120
+
+# De-prioritize mail-chain-like documents in KB
+MAILY_PREFIXES = ("aw_", "re_", "fw_", "wg_")
+MAILY_HINTS = ("subject", "mail", "email", "outlook", ".msg", "conversation")
+
+# Exclude maily docs from “Sources used”
+EXCLUDE_AS_SOURCES_PREFIXES = ("aw_", "re_", "fw_", "wg_")
+
+# =========================
+# LLM settings (GenAI-Nexus / Azure-style)
+# =========================
+# IMPORTANT: This is the FIX you asked for (WITH /apikey/)
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net/apikey/"
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-5.1"  # your deployment name
+
+LLM_TEMPERATURE = 0.2
+LLM_MAX_TOKENS = 450
+
+# =========================
+# BASIC TEXT UTILS
+# =========================
+STOPWORDS = set("""
+the a an and or to of in on for with without from by at is are was were be been being
+der die das und oder zu von im in am an auf für mit ohne aus bei ist sind war waren
+""".split())
+
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def strict_subject_ok(subject: str) -> bool:
+    return (subject or "").strip().casefold() == STRICT_SUBJECT.casefold()
+
+def clean_html_to_text(html: str) -> str:
+    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
+    return clean_ws(txt)
+
+def safe_firstname_from_email(email: str) -> str:
+    email = (email or "").strip()
+    local = email.split("@", 1)[0] if "@" in email else email
+    first = local.split(".", 1)[0].strip()
+    if not first:
+        return "Colleague"
+    return first[:1].upper() + first[1:]
+
+def format_outlook_html(text: str) -> str:
+    text = (text or "").replace("\r\n", "\n").strip()
+    if not text:
+        return "<p></p>"
+
+    blocks = re.split(r"\n\s*\n", text)
+    out = []
+    for block in blocks:
+        lines = [ln.rstrip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        if all(ln.lstrip().startswith("- ") for ln in lines):
+            out.append("<ul>")
+            for ln in lines:
+                ln2 = ln.lstrip()[2:].strip()
+                out.append(f"<li>{escape(ln2)}</li>")
+            out.append("</ul>")
+        else:
+            out.append("<p>" + "<br>".join(escape(ln.strip()) for ln in lines) + "</p>")
+    return "\n".join(out)
+
+def tokenize(s: str) -> List[str]:
+    toks = re.split(r"[^a-zA-Z0-9ÄÖÜäöüß]+", (s or "").lower())
+    return [t for t in toks if t and t not in STOPWORDS and len(t) >= 3]
+
+# =========================
+# KB READERS (skip missing libs)
+# =========================
+def read_txt(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="ignore")
+
+def read_docx(p: Path) -> str:
+    try:
+        from docx import Document as DocxDocument  # type: ignore
+    except Exception:
+        return ""
+    doc = DocxDocument(str(p))
+    paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
+    table_lines = []
+    for t in doc.tables:
+        for row in t.rows:
+            cells = [clean_ws(c.text) for c in row.cells]
+            if any(cells):
+                table_lines.append(" | ".join(cells))
+    return (paras + "\n" + "\n".join(table_lines)).strip()
+
+def read_pdf(p: Path) -> str:
+    try:
+        import pdfplumber  # type: ignore
+        out = []
+        with pdfplumber.open(str(p)) as pdf:
+            for page in pdf.pages:
+                out.append(page.extract_text() or "")
+        return "\n".join(out).strip()
+    except Exception:
+        pass
+    try:
+        from pypdf import PdfReader  # type: ignore
+        r = PdfReader(str(p))
+        out = []
+        for pg in r.pages:
+            try:
+                out.append(pg.extract_text() or "")
+            except Exception:
+                pass
+        return "\n".join(out).strip()
+    except Exception:
+        return ""
+
+def read_xlsx(p: Path) -> str:
+    try:
+        import openpyxl  # type: ignore
+    except Exception:
+        return ""
+    wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+    out = []
+    for ws in wb.worksheets:
+        out.append(f"Sheet: {ws.title}")
+        max_rows = min(ws.max_row or 0, 200)
+        max_cols = min(ws.max_column or 0, 40)
+        for r in range(1, max_rows + 1):
+            row_vals = []
+            for c in range(1, max_cols + 1):
+                v = ws.cell(row=r, column=c).value
+                row_vals.append("" if v is None else str(v))
+            if any(x.strip() for x in row_vals):
+                out.append(" | ".join(clean_ws(x) for x in row_vals))
+    return "\n".join(out).strip()
+
+def extract_text_from_file(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext == ".txt":
+        return read_txt(p)
+    if ext == ".docx":
+        return read_docx(p)
+    if ext == ".pdf":
+        return read_pdf(p)
+    if ext == ".xlsx":
+        return read_xlsx(p)
+    return ""
+
+# =========================
+# BUILD KB INDEX (docs -> chunks)
+# =========================
+def split_into_chunks(text: str) -> List[str]:
+    text = text or ""
+    paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    chunks: List[str] = []
+    for p in paras:
+        if len(p) <= MAX_CHARS_PER_CHUNK:
+            chunks.append(p)
+        else:
+            for i in range(0, len(p), MAX_CHARS_PER_CHUNK):
+                chunks.append(p[i:i + MAX_CHARS_PER_CHUNK])
+        if len(chunks) >= MAX_CHUNKS_PER_DOC:
+            break
+    return chunks
+
+def doc_priority_adjustment(filename: str) -> float:
+    fn = (filename or "").lower()
+    score = 0.0
+    if fn.startswith(MAILY_PREFIXES):
+        score -= 0.60
+    if any(h in fn for h in MAILY_HINTS):
+        score -= 0.25
+    if re.search(r"(?i)\b(mbn|standard|policy|guideline|kapitel|chapter|requirements|norm)\b", fn):
+        score += 0.20
+    return score
+
+def build_kb_index(kb_dir: str) -> List[Tuple[str, str, str]]:
+    base = Path(kb_dir)
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"KB_DIR not found: {kb_dir}")
+
+    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    files = files[:MAX_DOCS]
+
+    chunks: List[Tuple[str, str, str]] = []
+    for p in sorted(files):
+        try:
+            txt = extract_text_from_file(p)
+            txt = (txt or "").strip()
+            if not txt:
+                continue
+            txt = txt[:MAX_CHARS_PER_DOC]
+            for ch in split_into_chunks(txt):
+                if ch.strip():
+                    chunks.append((str(p), p.name, ch))
+        except Exception:
+            continue
+    return chunks
+
+# =========================
+# RETRIEVAL
+# =========================
+def score_chunk(query: str, chunk_text: str, filename: str) -> float:
+    q_toks = tokenize(query)
+    if not q_toks:
+        return 0.0
+
+    t = chunk_text.lower()
+    overlap = 0
+    for tk in set(q_toks):
+        if tk in t:
+            overlap += 1
+
+    req_bonus = 0
+    if re.search(r"(?i)\b(must|shall|required|requirement|muss|soll|erforder|anforder|nachweis|beleg|standard|norm)\b", chunk_text):
+        req_bonus = 2
+
+    base = overlap + req_bonus
+    base += doc_priority_adjustment(filename) * 10.0
+    return float(base)
+
+def pick_best_chunks(kb_chunks: List[Tuple[str, str, str]], query: str, top_k: int = 10):
+    scored = []
+    for fullpath, fname, ch in kb_chunks:
+        s = score_chunk(query, ch, fname)
+        if s > 0:
+            scored.append((s, fullpath, fname, ch))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:top_k]
+
+def sources_from_chunks(best_chunks) -> List[str]:
+    srcs = []
+    for _, fullpath, fname, _ in best_chunks:
+        if fname.lower().startswith(EXCLUDE_AS_SOURCES_PREFIXES):
+            continue
+        if fname not in srcs:
+            srcs.append(fname)
+    return srcs[:8]
+
+def build_evidence_block(best_chunks, max_chars_each: int = 850) -> str:
+    lines = []
+    for i, (score, fullpath, fname, ch) in enumerate(best_chunks, start=1):
+        snip = re.sub(r"\s+", " ", (ch or "").strip())
+        if len(snip) > max_chars_each:
+            snip = snip[:max_chars_each] + "…"
+        lines.append(f"[{i}] {fname}\n{snip}")
+    return "\n\n".join(lines)
+
+# =========================
+# LLM CALL (AzureOpenAI)
+# =========================
+def build_llm_prompt(question: str, greeting_name: str, signature_name: str, sources: List[str], evidence: str) -> str:
+    src_line = ", ".join(sources) if sources else "(none)"
+    return f"""
+You are drafting a professional email reply for corporate procurement/sustainability context.
+
+Hard rules:
+- Use ONLY the evidence snippets provided below. Do not invent facts.
+- If evidence is insufficient, ask 1-2 short clarifying questions instead of guessing.
+- Output MUST be bilingual: first German, then a separator line '---', then English.
+- Keep it human, concise, and presentable (aim 120–200 words total).
+- Use paragraphs. Use bullet points only if there are multiple items/steps.
+- DO NOT include personal names, supplier names, email addresses, phone numbers, postal addresses, IDs, internal org codes, or money amounts.
+- At the end of EACH language section, include a short "Sources used:" line with document TITLES only (from the list below). No emails.
+
+Greeting/closing:
+- German starts with: "Hallo {greeting_name},"
+- German ends with: "Mit freundlichen Grüßen" + "{signature_name}"
+- English starts with: "Hello {greeting_name},"
+- English ends with: "Best regards," + "{signature_name}"
+
+Question:
+{question}
+
+Allowed sources list (use for "Sources used"):
+{src_line}
+
+Evidence snippets:
+{evidence}
+""".strip()
+
+def build_azure_client() -> AzureOpenAI:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise SystemExit("OPENAI_API_KEY env var missing (GenAI-Nexus key).")
+    return AzureOpenAI(
+        api_key=key,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_version=AZURE_API_VERSION,
+    )
+
+def call_llm(client: AzureOpenAI, prompt: str) -> str:
+    resp = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+        temperature=LLM_TEMPERATURE,
+        max_tokens=LLM_MAX_TOKENS,
+        messages=[
+            {"role": "system", "content": "Follow the user's hard rules exactly. Use only provided evidence."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+# =========================
+# OUTLOOK HELPERS
+# =========================
+def get_sender_smtp(mail) -> str:
+    try:
+        addr = (mail.SenderEmailAddress or "").lower()
+        if addr.startswith("/o="):
+            ex = mail.Sender.GetExchangeUser()
+            if ex:
+                return (ex.PrimarySmtpAddress or "").lower()
+        return addr
+    except Exception:
+        return (mail.SenderEmailAddress or "").lower()
+
+def get_target_folder():
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+    target_store = None
+    for st in ns.Stores:
+        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
+            target_store = st
+            break
+
+    if not target_store:
+        print("Available stores (use one of these in TARGET_MAILBOX):")
+        for st in ns.Stores:
+            print(" -", st.DisplayName)
+        raise SystemExit("Target mailbox not found.")
+
+    inbox = target_store.GetDefaultFolder(6)  # Inbox
+    if WATCH_FOLDER_NAME.lower() == "inbox":
+        return ns, inbox, target_store.DisplayName, "Inbox"
+
+    for f in inbox.Folders:
+        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
+            return ns, f, target_store.DisplayName, f.Name
+
+    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
+
+def add_processed_category(mail):
+    try:
+        cats = mail.Categories or ""
+        if PROCESSED_CATEGORY.lower() not in cats.lower():
+            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
+        mail.Save()
+    except Exception:
+        pass
+
+def mark_read(mail):
+    try:
+        mail.UnRead = False
+        mail.Save()
+    except Exception:
+        pass
+
+def get_account_for_mailbox(ns, mailbox_substring: str):
+    try:
+        for acc in ns.Session.Accounts:
+            smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
+            if mailbox_substring.lower() in smtp or smtp in mailbox_substring.lower():
+                return acc
+    except Exception:
+        pass
+    return None
+
+def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
+    msg = ns.Application.CreateItem(0)
+    msg.To = to_addr
+    msg.Subject = f"Draft created (review needed): {orig_subject}"
+    msg.Body = (
+        "A draft reply has been created in Outlook.\n\n"
+        f"Original subject: {orig_subject}\n"
+        f"Requester: {requester_email}\n\n"
+        "Please review the draft carefully before sending.\n"
+    )
+    acc = get_account_for_mailbox(ns, from_mailbox)
+    if acc:
+        try:
+            msg.SendUsingAccount = acc
+        except Exception:
+            pass
+    msg.Send()
+
+def create_outlook_task_reminder(ns, subject: str, days: int = 2):
+    try:
+        task = ns.Application.CreateItem(3)  # olTaskItem
+        task.Subject = f"Reminder: review/send draft for '{subject}'"
+        task.DueDate = (datetime.now() + timedelta(days=days)).date()
+        task.ReminderSet = True
+        task.ReminderTime = datetime.now() + timedelta(days=days)
+        task.Body = "A draft reply was created by the bot. Please review and send it."
+        task.Save()
+    except Exception:
+        pass
+
+# =========================
+# MAIN
+# =========================
+def run_bot_once():
+    time.sleep(STARTUP_DELAY_SEC)
+
+    print("Building KB index from:", KB_DIR)
+    kb_chunks = build_kb_index(KB_DIR)
+    print("KB chunks:", len(kb_chunks))
+
+    client = build_azure_client()
+
+    ns, folder, store_name, folder_name = get_target_folder()
+    print(f"Mailbox={store_name} | Folder={folder_name}")
+
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True)
+
+    drafted = 0
+    checked = 0
+    your_firstname = safe_firstname_from_email(TARGET_MAILBOX)
+
+    for mail in items:
+        checked += 1
+        if checked > SCAN_LIMIT:
+            break
+        if drafted >= PROCESS_PER_RUN:
+            break
+
+        try:
+            if getattr(mail, "Class", None) != 43:
+                continue
+
+            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
+                continue
+
+            if REQUIRE_UNREAD and not mail.UnRead:
+                continue
+
+            subject = mail.Subject or ""
+            if not strict_subject_ok(subject):
+                continue
+
+            sender = get_sender_smtp(mail)
+            greeting_name = safe_firstname_from_email(sender)
+
+            body_text = clean_html_to_text(mail.HTMLBody or "")
+
+            question = re.split(r"(?i)\b(von:|from:|gesendet:|sent:|-----original message-----)\b", body_text)[0].strip()
+            if not question:
+                question = body_text.strip()
+
+            best = pick_best_chunks(kb_chunks, query=question, top_k=10)
+            sources = sources_from_chunks(best)
+            evidence = build_evidence_block(best, max_chars_each=850)
+
+            prompt = build_llm_prompt(
+                question=question,
+                greeting_name=greeting_name,
+                signature_name=your_firstname,
+                sources=sources,
+                evidence=evidence,
+            )
+
+            reply_text = call_llm(client, prompt)
+
+            reply = mail.Reply()
+            reply.HTMLBody = f"<div>{format_outlook_html(reply_text)}</div><hr>" + reply.HTMLBody
+            reply.Save()
+
+            mark_read(mail)
+            add_processed_category(mail)
+
+            drafted += 1
+            print("Draft created for:", subject)
+
+            if SELF_NOTIFY:
+                send_self_notification(ns, TARGET_MAILBOX, SELF_NOTIFY_TO, subject, sender)
+
+            if CREATE_REMINDER_TASK:
+                create_outlook_task_reminder(ns, subject=subject, days=REMINDER_DAYS)
+
+        except Exception as e:
+            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", repr(e))
+
+    print(f"Done. Checked={checked}, Drafted={drafted}")
+
+
+if __name__ == "__main__":
+    run_bot_once()
+
+So give me corrected code.
+
+It should use the key which i set in env in notebook.
+
+Also if i run the code in notebook in vscode (ipynb) it should still work
+
+Also main important is it should use gpt 5.1 key and deployment
+
+PLEASE HELP
