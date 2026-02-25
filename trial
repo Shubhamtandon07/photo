@@ -2,32 +2,17 @@
 """
 OUTLOOK DRAFT BOT (WITH LLM) — Notebook-safe + VSCode-friendly (Python 3.14)
 
-What it does
-- Watches an Outlook folder for emails whose subject is exactly "bot" (case-insensitive).
-- Retrieves relevant snippets from KB documents (prefers real docs; de-prioritizes AW_/RE_/FW_/WG_ mail-chain docs).
-- Calls GenAI-Nexus (AzureOpenAI) deployment to generate a human-like reply:
-  - German + English
-  - Greeting + closing
-  - Paragraphs + bullets when helpful
-  - “Sources used” (document titles only) at the end
-- Marks the original email as Read + categories it to avoid duplicates.
-- Sends self-notification + creates Outlook Task reminder (optional).
+CHANGES vs your last working version (only what you asked):
+1) Coverage: instruct the LLM to extract *all* relevant points from evidence (not just 1–2).
+2) Focus: answer ONLY what the user asked (no extra adjacent topics).
+3) Summary: add a short bullet summary at the end ONLY if the answer is not already short.
+4) Use AW_/RE_ mail-chain docs:
+   - Still de-prioritized for factual answering,
+   - But allowed as secondary evidence for “how MB typically answers” and
+     for identical/near-identical past questions.
 
-Critical fix for GPT-5.1 on Nexus
-- Uses max_completion_tokens (NOT max_tokens), otherwise you get:
-  "Unsupported parameter: 'max_tokens' ... Use 'max_completion_tokens' instead."
-
-Requirements
-- pip install -U openai pywin32
-Optional (KB parsing)
-- pip install -U python-docx pdfplumber pypdf openpyxl
-
-How to set key (works in notebook OR terminal)
-- Notebook:
-    import os
-    os.environ["OPENAI_API_KEY"] = "PASTE_YOUR_NEXUS_KEY"
-- Terminal (PowerShell):
-    setx OPENAI_API_KEY "PASTE_YOUR_NEXUS_KEY"
+Critical fix remains:
+- Uses max_completion_tokens for GPT-5.1 (not max_tokens).
 """
 
 from __future__ import annotations
@@ -48,12 +33,11 @@ from openai import AzureOpenAI
 # =========================
 # CONFIG — EDIT THESE
 # =========================
-TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"  # Outlook store DisplayName substring match
-WATCH_FOLDER_NAME = "Inbox"                          # "Inbox" or subfolder under Inbox
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"
+WATCH_FOLDER_NAME = "Inbox"
 
 KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
 
-# Subject must equal this (case-insensitive)
 STRICT_SUBJECT = "bot"
 
 REQUIRE_UNREAD = True
@@ -75,21 +59,20 @@ MAX_CHARS_PER_DOC = 180_000
 MAX_CHARS_PER_CHUNK = 1400
 MAX_CHUNKS_PER_DOC = 120
 
-# De-prioritize mail-chain-like documents in KB (still usable, but lower priority)
+# De-prioritize mail-chain-like documents
 MAILY_PREFIXES = ("aw_", "re_", "fw_", "wg_")
 MAILY_HINTS = ("subject", "mail", "email", "outlook", ".msg", "conversation")
 
-# Exclude maily docs from “Sources used” list
+# Exclude maily docs from “Sources used” list (keep this)
 EXCLUDE_AS_SOURCES_PREFIXES = ("aw_", "re_", "fw_", "wg_")
 
-# ========== LLM settings (GenAI-Nexus / Azure-style) ==========
-# IMPORTANT: for AzureOpenAI, endpoint should be base URL WITHOUT /apikey/
+# LLM settings (GenAI-Nexus / Azure-style)
 AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"  # NO /apikey/
 AZURE_API_VERSION = "2024-06-01"
-AZURE_DEPLOYMENT_NAME = "gpt-5.1"  # your working deployment name
+AZURE_DEPLOYMENT_NAME = "gpt-5.1"
 
-LLM_TEMPERATURE = 0.2
-LLM_MAX_TOKENS = 650  # mapped to max_completion_tokens for gpt-5.1
+LLM_TEMPERATURE = 0.15
+LLM_MAX_TOKENS = 900  # max_completion_tokens
 
 
 # =========================
@@ -124,11 +107,6 @@ def safe_firstname_from_email(email: str) -> str:
 
 
 def format_outlook_html(text: str) -> str:
-    """
-    Plain -> Outlook HTML:
-    - Blank-line blocks -> <p>
-    - Lines starting with '- ' -> <ul>
-    """
     text = (text or "").replace("\r\n", "\n").strip()
     if not text:
         return "<p></p>"
@@ -268,24 +246,25 @@ def split_into_chunks(text: str) -> List[str]:
 
 def doc_priority_adjustment(filename: str) -> float:
     """
-    Higher is better. Strongly penalize AW_/RE_/FW_/WG_.
+    Higher is better.
+    Real docs boosted, AW_/RE_/FW_/WG_ strongly penalized, but not excluded.
     """
     fn = (filename or "").lower()
     score = 0.0
     if fn.startswith(MAILY_PREFIXES):
-        score -= 0.60
+        score -= 0.70
     if any(h in fn for h in MAILY_HINTS):
         score -= 0.25
     # boost authoritative keywords
-    if re.search(r"(?i)\b(mbn|standard|policy|guideline|kapitel|chapter|requirements|norm)\b", fn):
-        score += 0.20
+    if re.search(r"(?i)\b(mbn|din|iso|vda|standard|policy|guideline|kapitel|chapter|requirements|norm)\b", fn):
+        score += 0.25
     return score
 
 
-def build_kb_index(kb_dir: str) -> List[Tuple[str, str, str]]:
+def build_kb_index(kb_dir: str) -> List[Tuple[str, str, str, bool]]:
     """
     Returns list of chunks:
-      (source_file_fullpath, source_filename, chunk_text)
+      (source_file_fullpath, source_filename, chunk_text, is_maily)
     """
     base = Path(kb_dir)
     if not base.exists() or not base.is_dir():
@@ -294,7 +273,7 @@ def build_kb_index(kb_dir: str) -> List[Tuple[str, str, str]]:
     files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
     files = files[:MAX_DOCS]
 
-    chunks: List[Tuple[str, str, str]] = []
+    chunks: List[Tuple[str, str, str, bool]] = []
     for p in sorted(files):
         try:
             txt = extract_text_from_file(p)
@@ -302,18 +281,19 @@ def build_kb_index(kb_dir: str) -> List[Tuple[str, str, str]]:
             if not txt:
                 continue
             txt = txt[:MAX_CHARS_PER_DOC]
+            maily = is_maily_filename(p)
             for ch in split_into_chunks(txt):
                 if ch.strip():
-                    chunks.append((str(p), p.name, ch))
+                    chunks.append((str(p), p.name, ch, maily))
         except Exception:
             continue
     return chunks
 
 
 # =========================
-# RETRIEVAL
+# RETRIEVAL (two-pass merge)
 # =========================
-def score_chunk(query: str, chunk_text: str, filename: str) -> float:
+def score_chunk(query: str, chunk_text: str, filename: str, is_maily: bool) -> float:
     q_toks = tokenize(query)
     if not q_toks:
         return 0.0
@@ -324,43 +304,71 @@ def score_chunk(query: str, chunk_text: str, filename: str) -> float:
         if tk in t:
             overlap += 1
 
-    # bonus for “shall/must/requirement” style (helps standards questions)
+    # bonus for requirements/standards language
     req_bonus = 0
-    if re.search(r"(?i)\b(must|shall|required|requirement|muss|soll|erforder|anforder|nachweis|beleg|standard|norm)\b", chunk_text):
+    if re.search(r"(?i)\b(must|shall|required|requirement|muss|soll|erforder|anforder|nachweis|beleg|standard|norm|gemäß|in accordance)\b", chunk_text):
         req_bonus = 2
 
     base = overlap + req_bonus
     base += doc_priority_adjustment(filename) * 10.0
+
+    # Keep mail-chain chunks eligible, but give small extra demotion at chunk level too
+    if is_maily:
+        base -= 1.0
+
     return float(base)
 
 
-def pick_best_chunks(kb_chunks: List[Tuple[str, str, str]], query: str, top_k: int = 10):
-    scored = []
-    for fullpath, fname, ch in kb_chunks:
-        s = score_chunk(query, ch, fname)
-        if s > 0:
-            scored.append((s, fullpath, fname, ch))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[:top_k]
+def pick_best_chunks_two_pass(kb_chunks: List[Tuple[str, str, str, bool]], query: str, top_k: int = 18):
+    """
+    Pass A: prefer non-maily docs
+    Pass B: include maily docs (AW/RE) to catch identical past Q&A and MB phrasing
+    Merge and rerank.
+    """
+    scored_A = []
+    scored_B = []
+
+    for fullpath, fname, ch, is_maily in kb_chunks:
+        s = score_chunk(query, ch, fname, is_maily)
+        if s <= 0:
+            continue
+        if is_maily:
+            scored_B.append((s, fullpath, fname, ch, is_maily))
+        else:
+            scored_A.append((s, fullpath, fname, ch, is_maily))
+
+    scored_A.sort(key=lambda x: x[0], reverse=True)
+    scored_B.sort(key=lambda x: x[0], reverse=True)
+
+    # take more from A, fewer from B
+    take_A = min(len(scored_A), max(10, top_k))
+    take_B = min(len(scored_B), max(6, top_k // 2))
+
+    merged = scored_A[:take_A] + scored_B[:take_B]
+    merged.sort(key=lambda x: x[0], reverse=True)
+
+    # final top_k
+    return merged[:top_k]
 
 
 def sources_from_chunks(best_chunks) -> List[str]:
     srcs = []
-    for _, _fullpath, fname, _ in best_chunks:
+    for _, _fullpath, fname, _ch, _is_maily in best_chunks:
         if fname.lower().startswith(EXCLUDE_AS_SOURCES_PREFIXES):
             continue
         if fname not in srcs:
             srcs.append(fname)
-    return srcs[:8]
+    return srcs[:10]
 
 
-def build_evidence_block(best_chunks, max_chars_each: int = 850) -> str:
+def build_evidence_block(best_chunks, max_chars_each: int = 900) -> str:
     lines = []
-    for i, (_score, _fullpath, fname, ch) in enumerate(best_chunks, start=1):
+    for i, (_score, _fullpath, fname, ch, is_maily) in enumerate(best_chunks, start=1):
         snip = re.sub(r"\s+", " ", ch.strip())
         if len(snip) > max_chars_each:
             snip = snip[:max_chars_each] + "…"
-        lines.append(f"[{i}] {fname}\n{snip}")
+        tag = "MAIL-CHAIN" if is_maily else "DOC"
+        lines.append(f"[{i}] ({tag}) {fname}\n{snip}")
     return "\n\n".join(lines)
 
 
@@ -372,20 +380,33 @@ def build_llm_prompt(question: str, greeting_name: str, signature_name: str, sou
     return f"""
 You are drafting a professional email reply for corporate procurement/sustainability context.
 
-Hard rules:
+HARD RULES (follow strictly):
 - Use ONLY the evidence snippets provided below. Do not invent facts.
-- If evidence is insufficient, ask 1-2 short clarifying questions instead of guessing.
-- Output MUST be bilingual: first German, then a separator line '---', then English.
-- Keep it human, concise, and presentable (aim 120–220 words total).
-- Use paragraphs. Use bullet points only if there are multiple items/steps.
-- DO NOT include personal names, supplier names, email addresses, phone numbers, postal addresses, IDs, internal org codes, or money amounts.
-- At the end of EACH language section, include a short "Sources used:" line with document TITLES only (from the list below). No emails.
+- Answer ONLY what the user asked. Do NOT add adjacent topics unless strictly required to answer the question.
+- Extract ALL relevant requirements/steps/definitions from the evidence that directly answer the question (do not stop at 1–2 points if there are more).
+- If evidence is insufficient, ask 1–2 short clarifying questions instead of guessing.
+- Output MUST be bilingual: German first, then a separator line '---', then English.
+- Keep it human and presentable; be concise but complete.
+- Use paragraphs. Use bullet points only when there are multiple items/steps.
+- Do NOT include personal names, supplier names, email addresses, phone numbers, postal addresses, IDs, internal org codes, or money amounts.
+- Mail-chain evidence (marked MAIL-CHAIN) is allowed ONLY as secondary support:
+  - to mirror typical Mercedes reply style, or
+  - if it contains an identical/near-identical past Q&A that directly answers the question.
+  Prefer DOC evidence for the factual answer.
+
+SUMMARY RULE:
+- If the answer section is longer than ~120 words OR has more than 3 bullets, add at the end of EACH language section:
+  "Kurzfassung:" (DE) / "Short summary:" (EN) with 2–4 bullets.
+- If the answer is already short, DO NOT add a summary.
 
 Greeting/closing:
 - German starts with: "Hallo {greeting_name},"
 - German ends with: "Mit freundlichen Grüßen" + "{signature_name}"
 - English starts with: "Hello {greeting_name},"
 - English ends with: "Best regards," + "{signature_name}"
+
+At the end of EACH language section include:
+"Sources used: <doc titles only from allowed list>" (no emails).
 
 Question:
 {question}
@@ -399,7 +420,6 @@ Evidence snippets:
 
 
 def build_azure_client() -> AzureOpenAI:
-    # Uses whatever you set in the notebook/session env:
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
         raise SystemExit("OPENAI_API_KEY env var missing (GenAI-Nexus key).")
@@ -411,28 +431,16 @@ def build_azure_client() -> AzureOpenAI:
 
 
 def call_llm(client: AzureOpenAI, prompt: str) -> str:
-    # IMPORTANT: gpt-5.1 on your gateway requires max_completion_tokens
     resp = client.chat.completions.create(
         model=AZURE_DEPLOYMENT_NAME,
         temperature=LLM_TEMPERATURE,
         max_completion_tokens=LLM_MAX_TOKENS,
         messages=[
-            {"role": "system", "content": "Follow the user's hard rules exactly. Use only provided evidence."},
+            {"role": "system", "content": "You must follow the hard rules. Use only provided evidence."},
             {"role": "user", "content": prompt},
         ],
     )
     return (resp.choices[0].message.content or "").strip()
-
-
-def llm_smoke_test():
-    client = build_azure_client()
-    resp = client.chat.completions.create(
-        model=AZURE_DEPLOYMENT_NAME,
-        messages=[{"role": "user", "content": "Reply with exactly: OK"}],
-        temperature=0,
-        max_completion_tokens=5,
-    )
-    print("LLM smoke test:", resp.choices[0].message.content.strip())
 
 
 # =========================
@@ -591,9 +599,9 @@ def run_bot_once():
             if not question:
                 question = body_text.strip()
 
-            best = pick_best_chunks(kb_chunks, query=question, top_k=10)
+            best = pick_best_chunks_two_pass(kb_chunks, query=question, top_k=18)
             sources = sources_from_chunks(best)
-            evidence = build_evidence_block(best, max_chars_each=850)
+            evidence = build_evidence_block(best, max_chars_each=900)
 
             prompt = build_llm_prompt(
                 question=question,
@@ -642,8 +650,7 @@ def run_bot_once():
     print(f"Done. Checked={checked}, Drafted={drafted}")
 
 
-# For notebooks, call:
-# llm_smoke_test()
+# In notebook:
 # run_bot_once()
 
 if __name__ == "__main__":
