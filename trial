@@ -1,657 +1,361 @@
 # -*- coding: utf-8 -*-
-"""
-OUTLOOK DRAFT BOT (WITH LLM) — Notebook-safe + VSCode-friendly (Python 3.14)
+# ============================================================
+# KI Risiko – HIGH PRECISION material-aware HR/ENV scraper
+# Outputs: gescrapte_links_<rohst>.csv
+# ============================================================
 
-CHANGES vs your last working version (only what you asked):
-1) Coverage: instruct the LLM to extract *all* relevant points from evidence (not just 1–2).
-2) Focus: answer ONLY what the user asked (no extra adjacent topics).
-3) Summary: add a short bullet summary at the end ONLY if the answer is not already short.
-4) Use AW_/RE_ mail-chain docs:
-   - Still de-prioritized for factual answering,
-   - But allowed as secondary evidence for “how MB typically answers” and
-     for identical/near-identical past questions.
-
-Critical fix remains:
-- Uses max_completion_tokens for GPT-5.1 (not max_tokens).
-"""
-
-from __future__ import annotations
-
-import os
-import re
+import csv
 import time
+import re
+import random
 from pathlib import Path
-from datetime import datetime, timedelta
-from html import escape
-from typing import List, Tuple
+from urllib.parse import quote_plus, urlparse
 
-import win32com.client as win32
+import dateparser
 
-from openai import AzureOpenAI
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+# =========================
+# 1) PATHS / CONFIG
+# =========================
+PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
+SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
+SCRAPED_DIR = PROJECT_ROOT / "gescrapte_Artikel-Links"
+SCRAPED_DIR.mkdir(parents=True, exist_ok=True)
+
+EINSTELLUNGEN_CSV = SETTINGS_DIR / "Einstellungen_Analyse.csv"
+BEKANNTE_SEITEN_CSV = SETTINGS_DIR / "Bekannte_Seiten.csv"
+SCHLAGWORT_CSV = SETTINGS_DIR / "Schlagwörter.csv"
+
+HEADLESS = False
+
+# Depth
+MAX_DDG_PAGES = 5
+QUERIES_PER_SITE = 10
+
+# fallback
+MIN_AFTER_SITES = 5
+FALLBACK_TARGET_TOTAL = 20
+
+PAUSE_BETWEEN_QUERIES_SEC = (1.5, 3.0)
+PAUSE_BETWEEN_SITES_SEC = (2.0, 4.0)
 
 
 # =========================
-# CONFIG — EDIT THESE
+# 2) READ SETTINGS
 # =========================
-TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"
-WATCH_FOLDER_NAME = "Inbox"
+rohst = rawm = max_datum_str = None
 
-KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
-
-STRICT_SUBJECT = "bot"
-
-REQUIRE_UNREAD = True
-PROCESS_PER_RUN = 3
-SCAN_LIMIT = 250
-STARTUP_DELAY_SEC = 1
-
-PROCESSED_CATEGORY = "Drafted-LLM"
-
-SELF_NOTIFY = True
-SELF_NOTIFY_TO = TARGET_MAILBOX
-CREATE_REMINDER_TASK = True
-REMINDER_DAYS = 2
-
-# KB reading
-SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
-MAX_DOCS = 5000
-MAX_CHARS_PER_DOC = 180_000
-MAX_CHARS_PER_CHUNK = 1400
-MAX_CHUNKS_PER_DOC = 120
-
-# De-prioritize mail-chain-like documents
-MAILY_PREFIXES = ("aw_", "re_", "fw_", "wg_")
-MAILY_HINTS = ("subject", "mail", "email", "outlook", ".msg", "conversation")
-
-# Exclude maily docs from “Sources used” list (keep this)
-EXCLUDE_AS_SOURCES_PREFIXES = ("aw_", "re_", "fw_", "wg_")
-
-# LLM settings (GenAI-Nexus / Azure-style)
-AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"  # NO /apikey/
-AZURE_API_VERSION = "2024-06-01"
-AZURE_DEPLOYMENT_NAME = "gpt-5.1"
-
-LLM_TEMPERATURE = 0.15
-LLM_MAX_TOKENS = 900  # max_completion_tokens
+def lese_einstellungen():
+    global rohst, rawm, max_datum_str
+    if not EINSTELLUNGEN_CSV.exists():
+        raise FileNotFoundError(f"Settings file not found: {EINSTELLUNGEN_CSV}")
+    with EINSTELLUNGEN_CSV.open("r", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f, delimiter=","))
+    def get_row(idx, default=""):
+        return (rows[idx][0].strip() if len(rows) > idx and rows[idx] else default)
+    rohst = get_row(5, "Stahl")
+    rawm = get_row(8, "Steel")
+    max_datum_str = get_row(11, "20.11.2020")
+    return rawm
 
 
 # =========================
-# BASIC TEXT UTILS
+# 3) SITE LIST MANAGEMENT
 # =========================
-STOPWORDS = set("""
-the a an and or to of in on for with without from by at is are was were be been being
-der die das und oder zu von im in am an auf für mit ohne aus bei ist sind war waren
-""".split())
-
-
-def clean_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
-
-
-def strict_subject_ok(subject: str) -> bool:
-    return (subject or "").strip().casefold() == STRICT_SUBJECT.casefold()
-
-
-def clean_html_to_text(html: str) -> str:
-    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
-    return clean_ws(txt)
-
-
-def safe_firstname_from_email(email: str) -> str:
-    email = (email or "").strip()
-    local = email.split("@", 1)[0] if "@" in email else email
-    first = local.split(".", 1)[0].strip()
-    if not first:
-        return "Colleague"
-    return first[:1].upper() + first[1:]
-
-
-def format_outlook_html(text: str) -> str:
-    text = (text or "").replace("\r\n", "\n").strip()
-    if not text:
-        return "<p></p>"
-
-    blocks = re.split(r"\n\s*\n", text)
+def lese_liste(pfad):
+    if not pfad.exists():
+        return []
     out = []
-    for block in blocks:
-        lines = [ln.rstrip() for ln in block.split("\n") if ln.strip()]
-        if not lines:
-            continue
-        if all(ln.lstrip().startswith("- ") for ln in lines):
-            out.append("<ul>")
-            for ln in lines:
-                ln2 = ln.lstrip()[2:].strip()
-                out.append(f"<li>{escape(ln2)}</li>")
-            out.append("</ul>")
-        else:
-            out.append("<p>" + "<br>".join(escape(ln.strip()) for ln in lines) + "</p>")
-    return "\n".join(out)
-
-
-def tokenize(s: str) -> List[str]:
-    toks = re.split(r"[^a-zA-Z0-9ÄÖÜäöüß]+", (s or "").lower())
-    return [t for t in toks if t and t not in STOPWORDS and len(t) >= 3]
+    with pfad.open("r", encoding="utf-8-sig") as f:
+        r = csv.reader(f)
+        for row in r:
+            for cell in row:
+                v = cell.strip().lower()
+                if v:
+                    out.append(v)
+    return list(dict.fromkeys(out))
 
 
 # =========================
-# KB READERS (skip missing libs)
+# 4) SELENIUM DRIVER
 # =========================
-def read_txt(p: Path) -> str:
-    return p.read_text(encoding="utf-8", errors="ignore")
+def make_driver():
+    opts = Options()
+    if HEADLESS:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    return webdriver.Chrome(options=opts)
 
 
-def read_docx(p: Path) -> str:
+# =========================
+# 5) SEARCH HELPERS
+# =========================
+def ddg_search_url(query: str) -> str:
+    return "https://duckduckgo.com/?q=" + quote_plus(query) + "&kp=1&ia=web"
+
+def scrape_ddg_results(driver: webdriver.Chrome, search_url: str) -> list[dict]:
+    items = []
     try:
-        from docx import Document as DocxDocument  # type: ignore
+        driver.get(search_url)
     except Exception:
-        return ""
-    doc = DocxDocument(str(p))
-    paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
-    table_lines = []
-    for t in doc.tables:
-        for row in t.rows:
-            cells = [clean_ws(c.text) for c in row.cells]
-            if any(cells):
-                table_lines.append(" | ".join(cells))
-    return (paras + "\n" + "\n".join(table_lines)).strip()
+        return items
 
+    pages_seen = 0
+    while pages_seen < MAX_DDG_PAGES:
+        time.sleep(2.5)
+        try:
+            WebDriverWait(driver, 6).until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'article[data-testid="result"]'))
+            )
+        except Exception:
+            break
 
-def read_pdf(p: Path) -> str:
-    try:
-        import pdfplumber  # type: ignore
-        out = []
-        with pdfplumber.open(str(p)) as pdf:
-            for page in pdf.pages:
-                out.append(page.extract_text() or "")
-        return "\n".join(out).strip()
-    except Exception:
-        pass
-    try:
-        from pypdf import PdfReader  # type: ignore
-        r = PdfReader(str(p))
-        out = []
-        for pg in r.pages:
+        articles = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="result"]')
+        for art in articles:
             try:
-                out.append(pg.extract_text() or "")
+                a = art.find_element(By.CSS_SELECTOR, "a[data-testid='result-title-a']")
+                url = a.get_attribute("href") or ""
+                title = a.text.strip()
+                if not url:
+                    continue
+            except Exception:
+                continue
+
+            snippet = ""
+            try:
+                snippet = art.find_element(By.CSS_SELECTOR, "div[data-testid='result-snippet']").text.strip()
             except Exception:
                 pass
-        return "\n".join(out).strip()
-    except Exception:
-        return ""
+
+            items.append({"url": url, "title": title, "snippet": snippet})
+
+        # try “more results”
+        try:
+            more_btn = driver.find_element(By.ID, "more-results")
+            driver.execute_script("arguments[0].click()", more_btn)
+            pages_seen += 1
+            time.sleep(1.5)
+        except Exception:
+            break
+
+    return items
 
 
-def read_xlsx(p: Path) -> str:
-    try:
-        import openpyxl  # type: ignore
-    except Exception:
-        return ""
-    wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
-    out = []
-    for ws in wb.worksheets:
-        out.append(f"Sheet: {ws.title}")
-        max_rows = min(ws.max_row or 0, 200)
-        max_cols = min(ws.max_column or 0, 40)
-        for r in range(1, max_rows + 1):
-            row_vals = []
-            for c in range(1, max_cols + 1):
-                v = ws.cell(row=r, column=c).value
-                row_vals.append("" if v is None else str(v))
-            if any(x.strip() for x in row_vals):
-                out.append(" | ".join(clean_ws(x) for x in row_vals))
-    return "\n".join(out).strip()
+# =========================
+# 6) CONTEXT FILTERS
+# =========================
+def material_word_match(text: str, material: str) -> bool:
+    if not text or not material:
+        return False
+    return bool(re.search(rf"\b{re.escape(material.lower())}\b", text.lower()))
 
-
-def extract_text_from_file(p: Path) -> str:
-    ext = p.suffix.lower()
-    if ext == ".txt":
-        return read_txt(p)
-    if ext == ".docx":
-        return read_docx(p)
-    if ext == ".pdf":
-        return read_pdf(p)
-    if ext == ".xlsx":
-        return read_xlsx(p)
-    return ""
-
-
-def is_maily_filename(p: Path) -> bool:
-    name = (p.name or "").lower()
-    stem = (p.stem or "").lower()
-    if stem.startswith("~$"):
-        return True
-    if stem.startswith(MAILY_PREFIXES):
-        return True
-    if any(h in name for h in MAILY_HINTS):
-        return True
+def material_context_match(text: str, material: str) -> bool:
+    t = text.lower()
+    m = material.lower()
+    if not re.search(rf"\b{re.escape(m)}\b", t):
+        return False
+    related = [
+        "mine", "mining", "extraction", "refin", "smelt", "ore",
+        "pollut", "contamin", "risk", "environment", "labour", "labor",
+        "human rights", "lawsuit", "violation", "abuse"
+    ]
+    for kw in related:
+        if re.search(rf"\b{kw}\b.*\b{re.escape(m)}\b", t) or re.search(rf"\b{re.escape(m)}\b.*\b{kw}\b", t):
+            return True
     return False
 
-
-# =========================
-# BUILD KB INDEX (docs -> chunks)
-# =========================
-def split_into_chunks(text: str) -> List[str]:
-    text = text or ""
-    paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
-    chunks: List[str] = []
-    for p in paras:
-        if len(p) <= MAX_CHARS_PER_CHUNK:
-            chunks.append(p)
-        else:
-            for i in range(0, len(p), MAX_CHARS_PER_CHUNK):
-                chunks.append(p[i:i + MAX_CHARS_PER_CHUNK])
-        if len(chunks) >= MAX_CHUNKS_PER_DOC:
-            break
-    return chunks
-
-
-def doc_priority_adjustment(filename: str) -> float:
-    """
-    Higher is better.
-    Real docs boosted, AW_/RE_/FW_/WG_ strongly penalized, but not excluded.
-    """
-    fn = (filename or "").lower()
-    score = 0.0
-    if fn.startswith(MAILY_PREFIXES):
-        score -= 0.70
-    if any(h in fn for h in MAILY_HINTS):
-        score -= 0.25
-    # boost authoritative keywords
-    if re.search(r"(?i)\b(mbn|din|iso|vda|standard|policy|guideline|kapitel|chapter|requirements|norm)\b", fn):
-        score += 0.25
-    return score
-
-
-def build_kb_index(kb_dir: str) -> List[Tuple[str, str, str, bool]]:
-    """
-    Returns list of chunks:
-      (source_file_fullpath, source_filename, chunk_text, is_maily)
-    """
-    base = Path(kb_dir)
-    if not base.exists() or not base.is_dir():
-        raise SystemExit(f"KB_DIR not found: {kb_dir}")
-
-    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
-    files = files[:MAX_DOCS]
-
-    chunks: List[Tuple[str, str, str, bool]] = []
-    for p in sorted(files):
-        try:
-            txt = extract_text_from_file(p)
-            txt = (txt or "").strip()
-            if not txt:
-                continue
-            txt = txt[:MAX_CHARS_PER_DOC]
-            maily = is_maily_filename(p)
-            for ch in split_into_chunks(txt):
-                if ch.strip():
-                    chunks.append((str(p), p.name, ch, maily))
-        except Exception:
-            continue
-    return chunks
+def risk_snippet(title: str, snippet: str) -> bool:
+    text = f"{title} {snippet}".lower()
+    return bool(RISK_RE.search(text))
 
 
 # =========================
-# RETRIEVAL (two-pass merge)
+# 7) QUERY BUILDERS
 # =========================
-def score_chunk(query: str, chunk_text: str, filename: str, is_maily: bool) -> float:
-    q_toks = tokenize(query)
-    if not q_toks:
-        return 0.0
+def build_site_queries(domain: str, material: str, keywords: list[str]) -> list[str]:
+    base = [
+        "human rights violation",
+        "forced labor",
+        "child labor",
+        "environmental damage",
+        "pollution contamination",
+        "lawsuit investigation",
+        "supply chain",
+        "mining extraction",
+    ]
+    kws = keywords[:6] if keywords else []
+    queries = []
+    queries.append(f"site:{domain} {material} mining")
+    queries.append(f"site:{domain} {material} human rights")
+    queries.append(f"site:{domain} {material} environmental")
+    queries.append(f"site:{domain} {material} supply chain")
+    for k in kws[:4]:
+        queries.append(f"site:{domain} {material} {k}")
+    queries.append(f"site:{domain} {material}")
+    uniq = []
+    for q in queries:
+        if q not in uniq:
+            uniq.append(q)
+    return uniq[:QUERIES_PER_SITE]
 
-    t = chunk_text.lower()
-    overlap = 0
-    for tk in set(q_toks):
-        if tk in t:
-            overlap += 1
-
-    # bonus for requirements/standards language
-    req_bonus = 0
-    if re.search(r"(?i)\b(must|shall|required|requirement|muss|soll|erforder|anforder|nachweis|beleg|standard|norm|gemäß|in accordance)\b", chunk_text):
-        req_bonus = 2
-
-    base = overlap + req_bonus
-    base += doc_priority_adjustment(filename) * 10.0
-
-    # Keep mail-chain chunks eligible, but give small extra demotion at chunk level too
-    if is_maily:
-        base -= 1.0
-
-    return float(base)
-
-
-def pick_best_chunks_two_pass(kb_chunks: List[Tuple[str, str, str, bool]], query: str, top_k: int = 18):
-    """
-    Pass A: prefer non-maily docs
-    Pass B: include maily docs (AW/RE) to catch identical past Q&A and MB phrasing
-    Merge and rerank.
-    """
-    scored_A = []
-    scored_B = []
-
-    for fullpath, fname, ch, is_maily in kb_chunks:
-        s = score_chunk(query, ch, fname, is_maily)
-        if s <= 0:
-            continue
-        if is_maily:
-            scored_B.append((s, fullpath, fname, ch, is_maily))
-        else:
-            scored_A.append((s, fullpath, fname, ch, is_maily))
-
-    scored_A.sort(key=lambda x: x[0], reverse=True)
-    scored_B.sort(key=lambda x: x[0], reverse=True)
-
-    # take more from A, fewer from B
-    take_A = min(len(scored_A), max(10, top_k))
-    take_B = min(len(scored_B), max(6, top_k // 2))
-
-    merged = scored_A[:take_A] + scored_B[:take_B]
-    merged.sort(key=lambda x: x[0], reverse=True)
-
-    # final top_k
-    return merged[:top_k]
-
-
-def sources_from_chunks(best_chunks) -> List[str]:
-    srcs = []
-    for _, _fullpath, fname, _ch, _is_maily in best_chunks:
-        if fname.lower().startswith(EXCLUDE_AS_SOURCES_PREFIXES):
-            continue
-        if fname not in srcs:
-            srcs.append(fname)
-    return srcs[:10]
-
-
-def build_evidence_block(best_chunks, max_chars_each: int = 900) -> str:
-    lines = []
-    for i, (_score, _fullpath, fname, ch, is_maily) in enumerate(best_chunks, start=1):
-        snip = re.sub(r"\s+", " ", ch.strip())
-        if len(snip) > max_chars_each:
-            snip = snip[:max_chars_each] + "…"
-        tag = "MAIL-CHAIN" if is_maily else "DOC"
-        lines.append(f"[{i}] ({tag}) {fname}\n{snip}")
-    return "\n\n".join(lines)
+def build_fallback_queries(material: str, keywords: list[str]) -> list[str]:
+    base = [
+        f"{material} human rights violation",
+        f"{material} forced labor allegations",
+        f"{material} pollution contamination spill",
+        f"{material} mining supply chain issues",
+        f"{material} environmental lawsuit",
+        f"{material} community displacement"
+    ]
+    for k in keywords[:6]:
+        base.append(f"{material} {k}")
+    uniq = []
+    for q in base:
+        if q not in uniq:
+            uniq.append(q)
+    return uniq
 
 
 # =========================
-# LLM CALL
+# 8) MAIN
 # =========================
-def build_llm_prompt(question: str, greeting_name: str, signature_name: str, sources: List[str], evidence: str) -> str:
-    src_line = ", ".join(sources) if sources else "(none)"
-    return f"""
-You are drafting a professional email reply for corporate procurement/sustainability context.
-
-HARD RULES (follow strictly):
-- Use ONLY the evidence snippets provided below. Do not invent facts.
-- Answer ONLY what the user asked. Do NOT add adjacent topics unless strictly required to answer the question.
-- Extract ALL relevant requirements/steps/definitions from the evidence that directly answer the question (do not stop at 1–2 points if there are more).
-- If evidence is insufficient, ask 1–2 short clarifying questions instead of guessing.
-- Output MUST be bilingual: German first, then a separator line '---', then English.
-- Keep it human and presentable; be concise but complete.
-- Use paragraphs. Use bullet points only when there are multiple items/steps.
-- Do NOT include personal names, supplier names, email addresses, phone numbers, postal addresses, IDs, internal org codes, or money amounts.
-- Mail-chain evidence (marked MAIL-CHAIN) is allowed ONLY as secondary support:
-  - to mirror typical Mercedes reply style, or
-  - if it contains an identical/near-identical past Q&A that directly answers the question.
-  Prefer DOC evidence for the factual answer.
-
-SUMMARY RULE:
-- If the answer section is longer than ~120 words OR has more than 3 bullets, add at the end of EACH language section:
-  "Kurzfassung:" (DE) / "Short summary:" (EN) with 2–4 bullets.
-- If the answer is already short, DO NOT add a summary.
-
-Greeting/closing:
-- German starts with: "Hallo {greeting_name},"
-- German ends with: "Mit freundlichen Grüßen" + "{signature_name}"
-- English starts with: "Hello {greeting_name},"
-- English ends with: "Best regards," + "{signature_name}"
-
-At the end of EACH language section include:
-"Sources used: <doc titles only from allowed list>" (no emails).
-
-Question:
-{question}
-
-Allowed sources list (use for "Sources used"):
-{src_line}
-
-Evidence snippets:
-{evidence}
-""".strip()
-
-
-def build_azure_client() -> AzureOpenAI:
-    key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not key:
-        raise SystemExit("OPENAI_API_KEY env var missing (GenAI-Nexus key).")
-    return AzureOpenAI(
-        api_key=key,
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        api_version=AZURE_API_VERSION,
-    )
-
-
-def call_llm(client: AzureOpenAI, prompt: str) -> str:
-    resp = client.chat.completions.create(
-        model=AZURE_DEPLOYMENT_NAME,
-        temperature=LLM_TEMPERATURE,
-        max_completion_tokens=LLM_MAX_TOKENS,
-        messages=[
-            {"role": "system", "content": "You must follow the hard rules. Use only provided evidence."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    return (resp.choices[0].message.content or "").strip()
-
-
-# =========================
-# OUTLOOK HELPERS
-# =========================
-def get_sender_smtp(mail) -> str:
-    try:
-        addr = (mail.SenderEmailAddress or "").lower()
-        if addr.startswith("/o="):
-            ex = mail.Sender.GetExchangeUser()
-            if ex:
-                return (ex.PrimarySmtpAddress or "").lower()
-        return addr
-    except Exception:
-        return (mail.SenderEmailAddress or "").lower()
-
-
-def get_target_folder():
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-
-    target_store = None
-    for st in ns.Stores:
-        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
-            target_store = st
-            break
-
-    if not target_store:
-        print("Available stores (use one of these in TARGET_MAILBOX):")
-        for st in ns.Stores:
-            print(" -", st.DisplayName)
-        raise SystemExit("Target mailbox not found.")
-
-    inbox = target_store.GetDefaultFolder(6)  # Inbox
-    if WATCH_FOLDER_NAME.lower() == "inbox":
-        return ns, inbox, target_store.DisplayName, "Inbox"
-
-    for f in inbox.Folders:
-        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
-            return ns, f, target_store.DisplayName, f.Name
-
-    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
-
-
-def add_processed_category(mail):
-    try:
-        cats = mail.Categories or ""
-        if PROCESSED_CATEGORY.lower() not in cats.lower():
-            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
-        mail.Save()
-    except Exception:
-        pass
-
-
-def mark_read(mail):
-    try:
-        mail.UnRead = False
-        mail.Save()
-    except Exception:
-        pass
-
-
-def get_account_for_mailbox(ns, mailbox_substring: str):
-    try:
-        for acc in ns.Session.Accounts:
-            smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
-            if mailbox_substring.lower() in smtp or smtp in mailbox_substring.lower():
-                return acc
-    except Exception:
-        pass
-    return None
-
-
-def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
-    msg = ns.Application.CreateItem(0)
-    msg.To = to_addr
-    msg.Subject = f"Draft created (review needed): {orig_subject}"
-    msg.Body = (
-        "A draft reply has been created in Outlook.\n\n"
-        f"Original subject: {orig_subject}\n"
-        f"Requester: {requester_email}\n\n"
-        "Please review the draft carefully before sending.\n"
-    )
-    acc = get_account_for_mailbox(ns, from_mailbox)
-    if acc:
-        try:
-            msg.SendUsingAccount = acc
-        except Exception:
-            pass
-    msg.Send()
-
-
-def create_outlook_task_reminder(ns, subject: str, days: int = 2):
-    try:
-        task = ns.Application.CreateItem(3)  # olTaskItem
-        task.Subject = f"Reminder: review/send draft for '{subject}'"
-        task.DueDate = (datetime.now() + timedelta(days=days)).date()
-        task.ReminderSet = True
-        task.ReminderTime = datetime.now() + timedelta(days=days)
-        task.Body = "A draft reply was created by the bot. Please review and send it."
-        task.Save()
-    except Exception:
-        pass
-
-
-# =========================
-# MAIN
-# =========================
-def run_bot_once():
-    time.sleep(STARTUP_DELAY_SEC)
-
-    print("Building KB index from:", KB_DIR)
-    kb_chunks = build_kb_index(KB_DIR)
-    print("KB chunks:", len(kb_chunks))
-
-    client = build_azure_client()
-
-    ns, folder, store_name, folder_name = get_target_folder()
-    print(f"Mailbox={store_name} | Folder={folder_name}")
-
-    items = folder.Items
-    items.Sort("[ReceivedTime]", True)
-
-    drafted = 0
-    checked = 0
-
-    your_firstname = safe_firstname_from_email(TARGET_MAILBOX)
-
-    for mail in items:
-        checked += 1
-        if checked > SCAN_LIMIT:
-            break
-        if drafted >= PROCESS_PER_RUN:
-            break
-
-        try:
-            if getattr(mail, "Class", None) != 43:
-                continue
-
-            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
-                continue
-
-            if REQUIRE_UNREAD and not mail.UnRead:
-                continue
-
-            subject = mail.Subject or ""
-            if not strict_subject_ok(subject):
-                continue
-
-            sender = get_sender_smtp(mail)
-            greeting_name = safe_firstname_from_email(sender)
-
-            body_text = clean_html_to_text(mail.HTMLBody or "")
-
-            # Keep only the top part of the message as the question
-            question = re.split(r"(?i)\b(von:|from:|gesendet:|sent:|-----original message-----)\b", body_text)[0].strip()
-            if not question:
-                question = body_text.strip()
-
-            best = pick_best_chunks_two_pass(kb_chunks, query=question, top_k=18)
-            sources = sources_from_chunks(best)
-            evidence = build_evidence_block(best, max_chars_each=900)
-
-            prompt = build_llm_prompt(
-                question=question,
-                greeting_name=greeting_name,
-                signature_name=your_firstname,
-                sources=sources,
-                evidence=evidence,
-            )
-
-            try:
-                reply_text = call_llm(client, prompt)
-            except Exception as e_llm:
-                reply_text = (
-                    f"Hallo {greeting_name},\n"
-                    f"ich hoffe, es geht Ihnen gut.\n\n"
-                    f"- Ich konnte keine belastbare Antwort aus den verfügbaren Dokumenten ableiten.\n"
-                    f"- Bitte nennen Sie das konkrete Dokument oder den relevanten Abschnitt.\n\n"
-                    f"Mit freundlichen Grüßen\n{your_firstname}\n\n---\n\n"
-                    f"Hello {greeting_name},\n"
-                    f"I hope you are doing well.\n\n"
-                    f"- I could not derive a well-supported answer from the available documents.\n"
-                    f"- Please share the specific document or relevant section.\n\n"
-                    f"Best regards,\n{your_firstname}"
-                )
-                print("LLM error fallback used:", repr(e_llm))
-
-            reply = mail.Reply()
-            reply.HTMLBody = f"<div>{format_outlook_html(reply_text)}</div><hr>" + reply.HTMLBody
-            reply.Save()
-
-            mark_read(mail)
-            add_processed_category(mail)
-
-            drafted += 1
-            print("Draft created for:", subject)
-
-            if SELF_NOTIFY:
-                send_self_notification(ns, TARGET_MAILBOX, SELF_NOTIFY_TO, subject, sender)
-
-            if CREATE_REMINDER_TASK:
-                create_outlook_task_reminder(ns, subject=subject, days=REMINDER_DAYS)
-
-        except Exception as e:
-            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", repr(e))
-
-    print(f"Done. Checked={checked}, Drafted={drafted}")
-
-
-# In notebook:
-# run_bot_once()
-
 if __name__ == "__main__":
-    run_bot_once()
+    rawm = lese_einstellungen()
+    seiten_user = lese_liste(BEKANNTE_SEITEN_CSV)
+    schlagwoerter = lese_liste(SCHLAGWORT_CSV)
+
+    if not seiten_user:
+        seiten_user = [
+            "mongabay.com","theguardian.com","miningweekly.com",
+            "fian.de","brot-fuer-die-welt.de","business-humanrights.org",
+            "misereor.de","deutsche-rohstoffagentur.de","hrw.org",
+            "inclusivedevelopment.net","diversedaily.com"
+        ]
+
+    EXTRA = [
+        "reuters.com","apnews.com","bbc.com","dw.com","aljazeera.com",
+        "nytimes.com","washingtonpost.com","zeit.de","ft.com",
+        "rfa.org","spiegel.de","cnn.com"
+    ]
+
+    merged_sites = list(dict.fromkeys(seiten_user + EXTRA))
+
+    out_path = SCRAPED_DIR / f"gescrapte_links_{rohst}.csv"
+
+    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
+        csv.writer(f, delimiter=";").writerow(["url","site","query","title","snippet"])
+
+    driver = make_driver()
+    global_seen = set()
+    total = 0
+
+    try:
+        for idx, domain in enumerate(merged_sites, start=1):
+            print(f"\n🌐 Site {idx}/{len(merged_sites)}: {domain}")
+
+            queries = build_site_queries(domain, rawm, schlagwoerter)
+            print("   Queries:", len(queries))
+
+            accepted_for_site = 0
+
+            for qi, q in enumerate(queries, start=1):
+                print(f"   🔎 {qi}/{len(queries)} | searched so far = {total}")
+
+                results = scrape_ddg_results(driver, ddg_search_url(q))
+                print(f"      → raw hits: {len(results)}")
+
+                scored = []
+                for r in results:
+                    u = r.get("url","")
+                    if not u or u in global_seen:
+                        continue
+
+                    dom = urlparse(u).netloc.lower()
+                    if "duckduckgo.com" in dom:
+                        continue
+                    if any(s in dom for s in ["facebook.com","instagram.com","tiktok.com","youtube.com","twitter.com","x.com","reddit.com"]):
+                        continue
+
+                    title = r.get("title","")
+                    snippet = r.get("snippet","")
+
+                    if not (material_context_match(title+" "+snippet, rawm) or risk_snippet(title, snippet)):
+                        continue
+
+                    scored.append((0, r))
+
+                for _, r in scored:
+                    u = r["url"]
+                    if u in global_seen:
+                        continue
+
+                    global_seen.add(u)
+                    total += 1
+                    accepted_for_site += 1
+
+                    with out_path.open("a", newline="", encoding="utf-8-sig") as f:
+                        csv.writer(f, delimiter=";").writerow([
+                            u, domain, q, r["title"], r["snippet"]
+                        ])
+
+                    print(f"      ✅ accepted | total={total} | site={domain} | {r['title'][:80]}")
+
+                time.sleep(random.uniform(*PAUSE_BETWEEN_QUERIES_SEC))
+
+            print(f"   → accepted from site: {accepted_for_site}")
+            time.sleep(random.uniform(*PAUSE_BETWEEN_SITES_SEC))
+
+        if total < MIN_AFTER_SITES:
+            print(f"\n⚠️ Only {total} collected after sites. Starting fallback…")
+            fallback_queries = build_fallback_queries(rawm, schlagwoerter)
+
+            for qi, q in enumerate(fallback_queries, start=1):
+                if total >= FALLBACK_TARGET_TOTAL:
+                    break
+
+                print(f"🌍 Fallback {qi}/{len(fallback_queries)} | total so far = {total}")
+
+                results = scrape_ddg_results(driver, ddg_search_url(q))
+                print(f"   → raw hits: {len(results)}")
+
+                for r in results:
+                    if total >= FALLBACK_TARGET_TOTAL:
+                        break
+
+                    u = r.get("url","")
+                    if not u or u in global_seen:
+                        continue
+
+                    dom = urlparse(u).netloc.lower()
+                    if any(s in dom for s in ["facebook.com","instagram.com","tiktok.com","youtube.com","twitter.com","x.com","reddit.com"]):
+                        continue
+
+                    text = (r.get("title","")+" "+r.get("snippet","")).lower()
+                    if not (material_context_match(text, rawm) or risk_snippet(r.get("title",""), r.get("snippet",""))):
+                        continue
+
+                    global_seen.add(u)
+                    total += 1
+
+                    with out_path.open("a", newline="", encoding="utf-8-sig") as f:
+                        csv.writer(f, delimiter=";").writerow([
+                            u, "WEB_WIDE", q, r["title"], r["snippet"]
+                        ])
+
+                    print(f"   ✅ fallback accepted | total={total} | {r['title'][:80]}")
+
+                time.sleep(random.uniform(*PAUSE_BETWEEN_QUERIES_SEC))
+
+    finally:
+        try:
+            driver.quit()
+        except:
+            pass
+
+    print(f"\n✅ Done. Collected total: {total}\nOutput:\n{out_path}")
