@@ -1,15 +1,67 @@
----------------------------------------------------------------------------
-PermissionError                           Traceback (most recent call last)
-Cell In[17], line 251
-    247 merged_sites = list(dict.fromkeys(seiten_user + EXTRA))
-    249 out_path = SCRAPED_DIR / f"gescrapte_links_{rohst}.csv"
---> 251 with out_path.open("w", newline="", encoding="utf-8-sig") as f:
-    252     csv.writer(f, delimiter=";").writerow(["url","site","query","title","snippet"])
-    254 driver = make_driver()
+copilot answer
 
-File c:\Users\SHTANDO\AppData\Local\Programs\Python\Python314\Lib\pathlib\__init__.py:776, in Path.open(self, mode, buffering, encoding, errors, newline)
-    774 if "b" not in mode:
-    775     encoding = io.text_encoding(encoding)
---> 776 return io.open(self, mode, buffering, encoding, errors, newline)
+Subject: Anforderungen an eine verantwortungsvolle Beschaffung / Responsible Sourcing Requirements
+Dear Mr. Tandon,
+Sehr geehrter Herr Tandon,
+I hope you are doing well. Below you will find a bilingual summary of the responsible sourcing requirements based on the current Mercedes‑Benz sustainability premises.
+Ich hoffe, es geht Ihnen gut. Nachfolgend finden Sie eine zweisprachige Zusammenfassung der Anforderungen an eine verantwortungsvolle Beschaffung gemäß den aktuellen Nachhaltigkeitsprämissen von Mercedes‑Benz.
 
-PermissionError: [Errno 13] Permission denied: 'C:\\Users\\SHTANDO\\Desktop\\KI Risko\\gescrapte_Artikel-Links\\gescrapte_links_Kupfer.csv'
+1. Supply Chain Transparency / Lieferkettentransparenz
+Suppliers must disclose their tier‑n supply chain up to the raw‑material origin for human‑rights‑critical materials. A Mercedes‑Benz template must be completed and returned within 4 weeks. Any changes after Design Freeze must be communicated proactively.
+Lieferanten müssen ihre tier‑n‑Lieferkette bis zur Herkunft menschenrechtlich kritischer Rohstoffe offenlegen. Die bereitgestellte Vorlage von Mercedes‑Benz ist innerhalb von 4 Wochen auszufüllen und zurückzusenden. Änderungen nach dem Design‑Freeze müssen unaufgefordert gemeldet werden.
+ [MB-EA_only...02304-1-FA | PDF]
+
+2. Sustainability Assessment Questionnaire (SAQ)
+Suppliers must complete the latest SAQ on the SupplierAssurance platform for the relevant production site. If the site changes or no valid result exists, Mercedes‑Benz must be informed.
+Lieferanten müssen den aktuellen SAQ für den betreffenden Produktionsstandort auf der SupplierAssurance‑Plattform ausfüllen. Bei Änderungen des Produktionsstandorts oder fehlenden Ergebnissen ist Mercedes‑Benz zu informieren.
+ [MB-EA_only...02304-1-FA | PDF]
+
+3. Due Diligence / Sorgfaltsmaßnahmen
+Upon request, suppliers must submit information on their human‑rights due‑diligence measures through the Mercedes‑Benz DDQ within 4 weeks.
+Auf Anfrage müssen Lieferanten ihre Maßnahmen zur menschenrechtlichen Sorgfaltspflicht über den Mercedes‑Benz‑DDQ innerhalb von 4 Wochen einreichen.
+ [BR17xM-H24...000_signed | PDF]
+
+4. 3TG Materials (Tin, Tantalum, Tungsten, Gold) / 3TG‑Materialien
+All 3TG materials must come exclusively from RMAP‑conformant smelters. Suppliers must submit a CMRT annually by March 1st. Mercedes‑Benz may require removal of non‑compliant smelters.
+Alle 3TG‑Materialien müssen ausschließlich von RMAP‑konformen Raffinerien/Schmelzen stammen. Ein CMRT ist jährlich bis 01. März einzureichen. Mercedes‑Benz kann die Entfernung nicht konformer Schmelzen verlangen.
+ [BR17xM-H24...000_signed | PDF]
+
+If you require further details or a version prepared for external communication, feel free to let me know.
+Wenn Sie weitere Details oder eine Version für die externe Kommunikation benötigen, lassen Sie es mich gerne wissen.
+Best regards / Mit freundlichen Grüßen,
+Shubham Tandon
+
+
+Hallo Sustainable-procurement,
+die „Fokusprämissen Nachhaltigkeit für die Vergabe – Umweltbezogene Anforderungen“ umfassen laut den vorliegenden Unterlagen insbesondere:
+- Sekundärmaterial-Ziele (Sekundärmaterialanteil):
+Der Partner bestätigt, dass mit dem zuständigen Komponentenverantwortlichen Zielwerte für den Einsatz von Sekundärmaterial vereinbart wurden.
+Diese Zielvereinbarung bzw. etwaige Abweichungen sind im Rahmen der Vergabe in den weiteren gültigen Dokumenten (z. B. Komponentenlastenheft oder Abweichungsliste) zu dokumentieren.
+Die entsprechenden Zielwerte sind in den jeweils referenzierten Unterlagen hinterlegt.
+- CO₂-Ziele für Rohmaterialien (Metalle, Polymere, Glas):
+Es bestehen CO₂-Zielvorgaben für die Produktion der Rohmaterialien Metalle, Polymere und Glas mit Zeithorizont SOP–2039.
+Diese Punkte bilden den Kern der umweltbezogenen Anforderungen innerhalb der Fokusprämissen Nachhaltigkeit für die Vergabe.
+Kurzfassung:
+- Vereinbarung und Dokumentation von Sekundärmaterial-Zielwerten mit Mercedes-Benz.
+- Einhaltung definierter CO₂-Ziele für Metalle, Polymere und Glas bis SOP–2039.
+Sources used: m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx, m0010_Sustainability_premises_V202302-1-FA.docx, m0020_8.6_Sustainability_premises_V202302-1-FA-IND_Brose_signed.docx
+---
+Hello Sustainable-procurement,
+according to the available documents, the “Focus awarding premises sustainability – Environmental requirements” include in particular:
+- Secondary material target values:
+The partner confirms that target values for the use of secondary material have been agreed with the responsible component manager at Mercedes-Benz.
+This agreement or any deviations must be documented as part of the awarding in the applicable documents (e.g. component specification book or deviation list).
+The corresponding targets are defined in the referenced documents.
+- CO₂ targets for raw materials (metals, polymers, glass):
+There are CO₂ target specifications for the production of the raw materials metals, polymers and glass with a time horizon up to SOP–2039.
+These points form the core environmental requirements within the focus sustainability premises for awarding.
+Short summary:
+- Agree and document secondary material target values with Mercedes-Benz.
+- Comply with defined CO₂ targets for metals, polymers and glass up to SOP–2039.
+Sources used: m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx, m0010_Sustainability_premises_V202302-1-FA.docx, m0020_8.6_Sustainability_premises_V202302-1-FA-IND_Brose_signed.docx
+Mit freundlichen Grüßen
+Shubham
+Best regards,
+Shubham
+
+gpt 5.1 answer, i like better copilot answer, can we train llm to generate such good answers?
