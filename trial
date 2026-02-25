@@ -1,16 +1,13 @@
 import os
-from openai import AzureOpenAI
 
-client = AzureOpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),  # your Nexus key stored here
-    azure_endpoint="https://genai-nexus.api.corpinter.net",
-    api_version="2024-06-01",
-)
+# Set the key for THIS notebook/session only
+os.environ["OPENAI_API_KEY"] = "PASTE_YOUR_NEXUS_OPENAI_KEY_HERE"
 
-resp = client.chat.completions.create(
-    model="gpt-5.1",  # your Nexus deployment name (confirmed working)
-    messages=[{"role": "user", "content": "Reply with exactly: OK"}],
-    temperature=0,
-)
+# (Optional) GenAI-Nexus base URL + deployment you said you use
+os.environ["NEXUS_ENDPOINT"] = "https://genai-nexus.api.corpinter.net"
+os.environ["NEXUS_DEPLOYMENT"] = "gpt-5.1"
 
-print(resp.choices[0].message.content)
+# Quick checks
+print("OPENAI_API_KEY present:", bool(os.getenv("OPENAI_API_KEY")), "len:", len(os.getenv("OPENAI_API_KEY","")))
+print("NEXUS_ENDPOINT:", os.getenv("NEXUS_ENDPOINT"))
+print("NEXUS_DEPLOYMENT:", os.getenv("NEXUS_DEPLOYMENT"))
