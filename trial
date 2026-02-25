@@ -1,23 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-OUTLOOK DRAFT BOT (NO LLM) — VSCode-friendly (Python 3.14)
-Purpose:
-- Creates a draft reply for emails whose subject is exactly "bot" (case-insensitive).
-- Uses ONLY KB documents (no email-chain docs) to extract relevant snippets.
-- Inserts a "Verification Pack" at the bottom of the draft so you can run Microsoft 365 Copilot
-  to verify + rewrite + translate (DE/EN) inside Outlook.
+OUTLOOK DRAFT BOT (WITH LLM) — VSCode-friendly (Python 3.14)
 
-How you use it:
-1) Run this script from VSCode (NOT a notebook).
-2) Send an email to yourself with subject "bot" and a question in body.
-3) Script creates a Draft reply + marks the original email as Read + categories it.
-4) Open the draft in Outlook → use Copilot with the included prompt.
+Purpose
+- Watches an Outlook folder for emails whose subject is exactly "bot" (case-insensitive).
+- Retrieves relevant snippets from KB documents (NOT mail-chain docs).
+- Calls GenAI-Nexus (Azure-style) GPT deployment to generate a human-like reply:
+  - German + English
+  - Greeting + closing
+  - Paragraphs + bullets when helpful
+  - “Sources used” (document titles only) at the end
+- Marks the original email as Read + categories it to avoid duplicates.
+- Sends self-notification + creates Outlook Task reminder (optional).
 
-Dependencies:
+IMPORTANT
+- Uses your GenAI-Nexus endpoint WITHOUT "/apikey/".
+- Requires env var OPENAI_API_KEY to be set to your Nexus key.
+
+Dependencies
 - pywin32
-- python-docx (only if you keep .docx in KB)
-- pdfplumber or pypdf (optional for PDF KB)
-- openpyxl (optional for Excel KB)
+- openai (latest)
+Optional (for KB parsing):
+- python-docx (docx)
+- pdfplumber or pypdf (pdf)
+- openpyxl (xlsx)
 """
 
 from __future__ import annotations
@@ -32,6 +38,10 @@ from typing import List, Tuple
 
 import win32com.client as win32
 
+# ========== LLM (GenAI-Nexus) ==========
+# pip install -U openai
+from openai import AzureOpenAI
+
 # =========================
 # CONFIG — EDIT THESE
 # =========================
@@ -40,17 +50,16 @@ WATCH_FOLDER_NAME = "Inbox"                          # "Inbox" or subfolder unde
 
 KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
 
-# Processing controls
-STRICT_SUBJECT = "bot"          # subject must equal this (case-insensitive)
+# Subject must equal this (case-insensitive)
+STRICT_SUBJECT = "bot"
+
 REQUIRE_UNREAD = True
 PROCESS_PER_RUN = 3
 SCAN_LIMIT = 250
 STARTUP_DELAY_SEC = 1
 
-# Avoid duplicate processing
-PROCESSED_CATEGORY = "Drafted-CopilotPack"
+PROCESSED_CATEGORY = "Drafted-LLM"
 
-# Self notification + reminder
 SELF_NOTIFY = True
 SELF_NOTIFY_TO = TARGET_MAILBOX
 CREATE_REMINDER_TASK = True
@@ -58,17 +67,25 @@ REMINDER_DAYS = 2
 
 # KB reading
 SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
-MAX_DOCS = 2000
+MAX_DOCS = 5000
 MAX_CHARS_PER_DOC = 180_000
 MAX_CHARS_PER_CHUNK = 1400
 MAX_CHUNKS_PER_DOC = 120
 
-# De-prioritize mail-chain-like documents
+# De-prioritize mail-chain-like documents in KB
 MAILY_PREFIXES = ("aw_", "re_", "fw_", "wg_")
 MAILY_HINTS = ("subject", "mail", "email", "outlook", ".msg", "conversation")
 
-# Sources list in output should NOT include these docs
+# Exclude maily docs from “Sources used”
 EXCLUDE_AS_SOURCES_PREFIXES = ("aw_", "re_", "fw_", "wg_")
+
+# LLM settings (GenAI-Nexus / Azure-style)
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"  # NO /apikey/
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-5.1"  # your working deployment name
+
+LLM_TEMPERATURE = 0.2
+LLM_MAX_TOKENS = 450
 
 # =========================
 # BASIC TEXT UTILS
@@ -85,7 +102,6 @@ def strict_subject_ok(subject: str) -> bool:
     return (subject or "").strip().casefold() == STRICT_SUBJECT.casefold()
 
 def clean_html_to_text(html: str) -> str:
-    # Simple HTML tag stripper
     txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
     return clean_ws(txt)
 
@@ -149,7 +165,6 @@ def read_docx(p: Path) -> str:
     return (paras + "\n" + "\n".join(table_lines)).strip()
 
 def read_pdf(p: Path) -> str:
-    # prefer pdfplumber
     try:
         import pdfplumber  # type: ignore
         out = []
@@ -159,7 +174,6 @@ def read_pdf(p: Path) -> str:
         return "\n".join(out).strip()
     except Exception:
         pass
-    # fallback pypdf
     try:
         from pypdf import PdfReader  # type: ignore
         r = PdfReader(str(p))
@@ -236,17 +250,17 @@ def split_into_chunks(text: str) -> List[str]:
 def doc_priority_adjustment(filename: str) -> float:
     """
     Higher is better.
-    Penalize AW_/RE_/FW_/WG_ heavily.
+    Strongly penalize AW_/RE_/FW_/WG_.
     """
     fn = (filename or "").lower()
     score = 0.0
     if fn.startswith(MAILY_PREFIXES):
-        score -= 0.35
+        score -= 0.60
     if any(h in fn for h in MAILY_HINTS):
-        score -= 0.15
-    # small boost to "standards"/"mbn"/"policy"/"guideline"
-    if re.search(r"(?i)\b(mbn|standard|policy|guideline|kapitel|chapter|requirements)\b", fn):
-        score += 0.12
+        score -= 0.25
+    # boost authoritative keywords
+    if re.search(r"(?i)\b(mbn|standard|policy|guideline|kapitel|chapter|requirements|norm)\b", fn):
+        score += 0.20
     return score
 
 def build_kb_index(kb_dir: str) -> List[Tuple[str, str, str]]:
@@ -274,11 +288,10 @@ def build_kb_index(kb_dir: str) -> List[Tuple[str, str, str]]:
                     chunks.append((str(p), p.name, ch))
         except Exception:
             continue
-
     return chunks
 
 # =========================
-# RETRIEVAL + ANSWER (deterministic)
+# RETRIEVAL
 # =========================
 def score_chunk(query: str, chunk_text: str, filename: str) -> float:
     q_toks = tokenize(query)
@@ -291,17 +304,16 @@ def score_chunk(query: str, chunk_text: str, filename: str) -> float:
         if tk in t:
             overlap += 1
 
-    # requirement bonus
+    # bonus for “shall/must/requirement” style (helps standards questions)
     req_bonus = 0
-    if re.search(r"(?i)\b(must|shall|required|requirement|muss|soll|erforder|anforder|nachweis|beleg)\b", chunk_text):
+    if re.search(r"(?i)\b(must|shall|required|requirement|muss|soll|erforder|anforder|nachweis|beleg|standard|norm)\b", chunk_text):
         req_bonus = 2
 
     base = overlap + req_bonus
-    # doc priority adjustment
     base += doc_priority_adjustment(filename) * 10.0
     return float(base)
 
-def pick_best_chunks(kb_chunks: List[Tuple[str, str, str]], query: str, top_k: int = 8):
+def pick_best_chunks(kb_chunks: List[Tuple[str, str, str]], query: str, top_k: int = 10):
     scored = []
     for fullpath, fname, ch in kb_chunks:
         s = score_chunk(query, ch, fname)
@@ -310,55 +322,7 @@ def pick_best_chunks(kb_chunks: List[Tuple[str, str, str]], query: str, top_k: i
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:top_k]
 
-def sentence_split(text: str) -> List[str]:
-    txt = re.sub(r"\s+", " ", text or "").strip()
-    if not txt:
-        return []
-    parts = re.split(r"(?<=[\.\!\?])\s+", txt)
-    out = [p.strip(" -•\t\r\n") for p in parts if len(p.strip()) >= 15]
-    return out
-
-def build_bullets_from_chunks(best_chunks, question: str, max_points: int = 5) -> List[str]:
-    q_tokens = set(tokenize(question))
-    bullets = []
-    used = set()
-
-    for score, fullpath, fname, ch in best_chunks:
-        for sent in sentence_split(ch):
-            stoks = set(tokenize(sent))
-            # require some overlap to avoid random quoting
-            if len(q_tokens & stoks) < max(1, min(2, len(q_tokens)//6)):
-                continue
-            key = sent.lower()
-            if key in used:
-                continue
-            used.add(key)
-            bullets.append(sent)
-            if len(bullets) >= max_points:
-                break
-        if len(bullets) >= max_points:
-            break
-
-    # fallback: first sentence of best chunk
-    if not bullets and best_chunks:
-        bullets = sentence_split(best_chunks[0][3])[:2]
-
-    # de-dup and trim
-    out = []
-    seen = set()
-    for b in bullets:
-        b = clean_ws(b)
-        if not b:
-            continue
-        k = b.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(b)
-    return out[:max_points]
-
 def sources_from_chunks(best_chunks) -> List[str]:
-    # Only include valid docs (not AW_/RE_/WG_/FW_)
     srcs = []
     for _, fullpath, fname, _ in best_chunks:
         if fname.lower().startswith(EXCLUDE_AS_SOURCES_PREFIXES):
@@ -367,87 +331,75 @@ def sources_from_chunks(best_chunks) -> List[str]:
             srcs.append(fname)
     return srcs[:8]
 
-def build_verification_pack(question: str, best_chunks, bullets: List[str], sources: List[str]) -> str:
+def build_evidence_block(best_chunks, max_chars_each: int = 850) -> str:
     """
-    This is what you feed to Copilot in Outlook.
+    Evidence fed into LLM. Keep short.
     """
     lines = []
-    lines.append("=== VERIFICATION PACK (for M365 Copilot) ===")
-    lines.append("")
-    lines.append("Copilot prompt (paste into Copilot):")
-    lines.append(
-        "Use only the information in this Verification Pack and the listed documents.\n"
-        "1) Verify each bullet/claim: Supported / Not supported / Needs clarification.\n"
-        "2) Rewrite the email professionally.\n"
-        "3) Output German + English.\n"
-        "4) Do NOT include personal names, supplier names, emails, phones, IDs, or addresses.\n"
-        "5) Add 'Sources used' (document titles only, no emails).\n"
-    )
-    lines.append("")
-    lines.append("Question (cleaned):")
-    lines.append(question.strip())
-    lines.append("")
-    lines.append("Draft bullets (deterministic):")
-    for b in bullets:
-        lines.append(f"- {b}")
-    lines.append("")
-    lines.append("Top snippets (evidence):")
     for i, (score, fullpath, fname, ch) in enumerate(best_chunks, start=1):
-        lines.append(f"[{i}] Source: {fname}")
-        # keep short
         snip = ch.strip()
-        if len(snip) > 700:
-            snip = snip[:700] + "…"
-        lines.append(snip)
-        lines.append("")
-    lines.append("Candidate sources (documents):")
-    lines.append(", ".join(sources) if sources else "(none)")
-    lines.append("")
-    lines.append("=== END VERIFICATION PACK ===")
-    return "\n".join(lines)
+        snip = re.sub(r"\s+", " ", snip)
+        if len(snip) > max_chars_each:
+            snip = snip[:max_chars_each] + "…"
+        lines.append(f"[{i}] {fname}\n{snip}")
+    return "\n\n".join(lines)
 
-def build_email_body(greeting_name: str, signature_name: str, bullets: List[str], sources: List[str], verification_pack: str) -> str:
-    """
-    This is what goes into the draft.
-    We keep it readable, then add the pack at bottom.
-    """
-    greeting_name = greeting_name or "Sustainable-procurement"
-    signature_name = signature_name or "Shubham"
+# =========================
+# LLM CALL
+# =========================
+def build_llm_prompt(question: str, greeting_name: str, signature_name: str, sources: List[str], evidence: str) -> str:
+    # NOTE: we do NOT want to leak sensitive info. We tell the model to avoid it.
+    # We also force bilingual output and a clean structure.
+    src_line = ", ".join(sources) if sources else "(none)"
+    return f"""
+You are drafting a professional email reply for corporate procurement/sustainability context.
 
-    de = []
-    de.append(f"Hallo {greeting_name},")
-    de.append("ich hoffe, es geht Ihnen gut.")
-    de.append("")
-    if bullets:
-        for b in bullets:
-            de.append(f"- {b}")
-    else:
-        de.append("- Ich konnte in den verfügbaren Dokumenten keine eindeutige, explizite Antwort finden. Können Sie bitte den Dokumentennamen oder Abschnitt nennen?")
-    de.append("")
-    de.append("Mit freundlichen Grüßen")
-    de.append(signature_name)
+Hard rules:
+- Use ONLY the evidence snippets provided below. Do not invent facts.
+- If evidence is insufficient, ask 1-2 short clarifying questions instead of guessing.
+- Output MUST be bilingual: first German, then a separator line '---', then English.
+- Keep it human, concise, and presentable (aim 120–200 words total).
+- Use paragraphs. Use bullet points only if there are multiple items/steps.
+- DO NOT include personal names, supplier names, email addresses, phone numbers, postal addresses, IDs, internal org codes, or money amounts.
+- At the end of EACH language section, include a short "Sources used:" line with document TITLES only (from the list below). No emails.
 
-    # lightweight EN (Copilot will rewrite anyway)
-    en = []
-    en.append(f"Hello {greeting_name},")
-    en.append("I hope you are doing well.")
-    en.append("")
-    en.append("Key points (to be verified by Copilot):")
-    for b in bullets[:6]:
-        en.append(f"- {b}")
-    en.append("")
-    en.append("Best regards,")
-    en.append(signature_name)
+Greeting/closing:
+- German starts with: "Hallo {greeting_name},"
+- German ends with: "Mit freundlichen Grüßen" + "{signature_name}"
+- English starts with: "Hello {greeting_name},"
+- English ends with: "Best regards," + "{signature_name}"
 
-    src_line = ""
-    if sources:
-        src_line = "Interne Quellen (Dokumente): " + ", ".join(sources)
+Question:
+{question}
 
-    body = "\n".join(de)
-    if src_line:
-        body = body.replace("Mit freundlichen Grüßen", src_line + "\n\nMit freundlichen Grüßen")
+Allowed sources list (use for "Sources used"):
+{src_line}
 
-    return body + "\n\n---\n\n" + "\n".join(en) + "\n\n\n" + verification_pack
+Evidence snippets:
+{evidence}
+""".strip()
+
+def build_azure_client() -> AzureOpenAI:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise SystemExit("OPENAI_API_KEY env var missing (GenAI-Nexus key).")
+    return AzureOpenAI(
+        api_key=key,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_version=AZURE_API_VERSION,
+    )
+
+def call_llm(client: AzureOpenAI, prompt: str) -> str:
+    resp = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+        temperature=LLM_TEMPERATURE,
+        max_tokens=LLM_MAX_TOKENS,
+        messages=[
+            {"role": "system", "content": "Follow the user's hard rules exactly. Use only provided evidence."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 # =========================
 # OUTLOOK HELPERS
@@ -522,7 +474,7 @@ def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: st
         "A draft reply has been created in Outlook.\n\n"
         f"Original subject: {orig_subject}\n"
         f"Requester: {requester_email}\n\n"
-        "Open the Draft and run Copilot using the Verification Pack.\n"
+        "Please review the draft carefully before sending.\n"
     )
     acc = get_account_for_mailbox(ns, from_mailbox)
     if acc:
@@ -539,7 +491,7 @@ def create_outlook_task_reminder(ns, subject: str, days: int = 2):
         task.DueDate = (datetime.now() + timedelta(days=days)).date()
         task.ReminderSet = True
         task.ReminderTime = datetime.now() + timedelta(days=days)
-        task.Body = "A draft reply was created. Please review and send it."
+        task.Body = "A draft reply was created by the bot. Please review and send it."
         task.Save()
     except Exception:
         pass
@@ -550,9 +502,11 @@ def create_outlook_task_reminder(ns, subject: str, days: int = 2):
 def run_bot_once():
     time.sleep(STARTUP_DELAY_SEC)
 
-    print("Loading KB from:", KB_DIR)
+    print("Building KB index from:", KB_DIR)
     kb_chunks = build_kb_index(KB_DIR)
-    print("KB loaded (chunks):", len(kb_chunks))
+    print("KB chunks:", len(kb_chunks))
+
+    client = build_azure_client()
 
     ns, folder, store_name, folder_name = get_target_folder()
     print(f"Mailbox={store_name} | Folder={folder_name}")
@@ -591,26 +545,40 @@ def run_bot_once():
 
             body_text = clean_html_to_text(mail.HTMLBody or "")
 
-            # remove quoted chain from the question (top block only)
+            # Keep only the top part of the message as the question
             question = re.split(r"(?i)\b(von:|from:|gesendet:|sent:|-----original message-----)\b", body_text)[0].strip()
             if not question:
                 question = body_text.strip()
 
-            # retrieval
-            best = pick_best_chunks(kb_chunks, query=question, top_k=8)
-            bullets = build_bullets_from_chunks(best, question, max_points=5)
+            best = pick_best_chunks(kb_chunks, query=question, top_k=10)
             sources = sources_from_chunks(best)
-            pack = build_verification_pack(question, best, bullets, sources)
+            evidence = build_evidence_block(best, max_chars_each=850)
 
-            reply_text = build_email_body(
+            prompt = build_llm_prompt(
+                question=question,
                 greeting_name=greeting_name,
                 signature_name=your_firstname,
-                bullets=bullets,
                 sources=sources,
-                verification_pack=pack,
+                evidence=evidence,
             )
 
-            # draft
+            try:
+                reply_text = call_llm(client, prompt)
+            except Exception as e_llm:
+                # fallback (still create something)
+                reply_text = (
+                    f"Hallo {greeting_name},\n"
+                    f"ich hoffe, es geht Ihnen gut.\n\n"
+                    f"- Ich konnte keine belastbare Antwort aus den verfügbaren Dokumenten ableiten.\n"
+                    f"- Bitte nennen Sie das konkrete Dokument oder den relevanten Abschnitt.\n\n"
+                    f"Mit freundlichen Grüßen\n{your_firstname}\n\n---\n\n"
+                    f"Hello {greeting_name},\n"
+                    f"I hope you are doing well.\n\n"
+                    f"- I could not derive a well-supported answer from the available documents.\n"
+                    f"- Please share the specific document or relevant section.\n\n"
+                    f"Best regards,\n{your_firstname}"
+                )
+
             reply = mail.Reply()
             reply.HTMLBody = f"<div>{format_outlook_html(reply_text)}</div><hr>" + reply.HTMLBody
             reply.Save()
