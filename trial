@@ -1,20 +1,11 @@
----------------------------------------------------------------------------
-KeyError                                  Traceback (most recent call last)
-Cell In[15], line 5
-      2 os.environ["OPENAI_API_KEY"] = "e485facd-19fe-4c41-ae78-e"
-      4 from openai import OpenAI
-----> 5 client = OpenAI(api_key=os.environ["e485facd-19fe-4c41-ae78-e"])
-      7 resp = client.responses.create(
-      8     model="gpt-5.1-codex-max",
-      9     input="Reply with exactly: OK",
-     10 )
-     11 print(resp.output_text)
+import os
+from openai import OpenAI
 
-File <frozen os>:709, in _Environ.__getitem__(self, key)
-    706     value = self._data[self.encodekey(key)]
-    707 except KeyError:
-    708     # raise KeyError with the original key value
---> 709     raise KeyError(key) from None
-    710 return self.decodevalue(value)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-KeyError: 'e485facd-19fe-4c41-ae78-e'
+resp = client.responses.create(
+    model="gpt-5.1-codex-max",
+    input="Reply with exactly: OK",
+)
+
+print(resp.output_text)
