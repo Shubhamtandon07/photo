@@ -1,11 +1,2 @@
-import os
-os.environ["OPENAI_API_KEY"] = "PASTE_NEW_KEY_HERE"
-
-from openai import OpenAI
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-resp = client.responses.create(
-    model="gpt-5.1-codex-max",
-    input="Reply with exactly: OK",
-)
-print(resp.output_text)
+k = "PASTE_KEY_HERE"
+print(len(k), k[:4], k[-4:])
