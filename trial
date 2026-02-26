@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# KI Risiko – HIGH RECALL material-aware HR/ENV scraper
-# Reads:
-#   C:\Users\SHTANDO\Desktop\KI Risko\Textdoks_für_Einstellungen_der_Suche\
-#       Einstellungen_Analyse.csv
-#       Bekannte_Seiten.csv
-#       Schlagwörter.csv
-# Writes:
-#   C:\Users\SHTANDO\Desktop\KI Risko\gescrapte_Artikel-Links\gescrapte_links_<rohst>.csv
+# KI Risiko – HIGH ACCURACY material-aware HR/ENV scraper
+# Outputs: gescrapte_links_<rohst>.csv
 #
-# Behavior:
-#   Phase 1: search your sites (from Bekannte_Seiten.csv) + 10 extra trusted sites (added below)
-#   Phase 2: if <5 total, search web-wide until 10 total
-#   Shows progress counters while running
-#   Skips: PDFs, obvious social media (LinkedIn allowed), jobs/careers/IR pages, duplicates
+# Reads:
+#   Einstellungen_Analyse.csv   (rohst/rawm/date)
+#   Bekannte_Seiten.csv        (your sites)
+#   Schlagwörter.csv           (optional extra keywords)
+#
+# Writes:
+#   gescrapte_links_<rohst>.csv with columns:
+#   url;datum_raw;datum_iso;site;query;title;snippet
+#
+# Key behavior:
+# - Deep discovery: MAX_DDG_PAGES=5, QUERIES_PER_SITE=10
+# - High accuracy: filters out non-material context (e.g., "Copperfield")
+# - PDFs are allowed (do PDF parsing in analysis step)
+# - Prints timestamp + keeps DDG date if present
 # ============================================================
 
 import csv
@@ -22,6 +25,7 @@ import re
 import random
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
+from datetime import datetime
 
 import dateparser
 
@@ -45,22 +49,21 @@ BEKANNTE_SEITEN_CSV = SETTINGS_DIR / "Bekannte_Seiten.csv"
 SCHLAGWORT_CSV = SETTINGS_DIR / "Schlagwörter.csv"
 
 HEADLESS = False
-MAX_DDG_PAGES = 2
 
-# runtime controls
-QUERIES_PER_SITE = 6
+# Deep discovery
+MAX_DDG_PAGES = 5
+QUERIES_PER_SITE = 10
 
-# fallback behavior
+# Fallback (keep small; high accuracy prefers fewer but better)
 MIN_AFTER_SITES = 5
-FALLBACK_TARGET_TOTAL = 10
+FALLBACK_TARGET_TOTAL = 20
 
-# pauses
-PAUSE_BETWEEN_QUERIES_SEC = (1.5, 3.5)
-PAUSE_BETWEEN_SITES_SEC = (2.0, 5.0)
+PAUSE_BETWEEN_QUERIES_SEC = (1.2, 2.5)
+PAUSE_BETWEEN_SITES_SEC = (1.5, 3.0)
 
 
 # =========================
-# 2) RISK TERMS (broad / stem-like)
+# 2) RISK TERMS (tight)
 # =========================
 RISK_PATTERNS = [
     r"\bhuman rights?\b",
@@ -70,60 +73,48 @@ RISK_PATTERNS = [
     r"\bchild\s+labou?r\b",
     r"\bmodern\s+slavery\b",
     r"\btraffick(ing|ed)?\b",
-    r"\bexploitation\b",
-    r"\bunsafe\b",
-    r"\bhazard(ous)?\b",
     r"\bdiscriminat(ion|e|ed)\b",
-    r"\bunion\b",
-    r"\bcollective\s+bargaining\b",
-    r"\bunion[-\s]?bust(ing|er|ed)?\b",
     r"\bpollut(ion|ed|ing)\b",
     r"\bcontaminat(e|ed|ion)\b",
     r"\btoxic\b",
     r"\bspill(s|ed)?\b",
-    r"\btailing(s)?\b",
-    r"\bwaste\b",
+    r"\btailing(s)?\b|\btailings dam\b",
     r"\bdeforest(ation|ed|ing)\b",
-    r"\bconflict\b",
-    r"\bprotest(s|ed|ing)?\b",
-    r"\blawsuit(s)?\b",
+    r"\blawsuit(s)?\b|\bsued\b",
     r"\balleg(ation|ed|edly)\b",
+    r"\binvestigat(e|ed|ion|ions)\b",
+    r"\bprotest(s|ed|ing)?\b",
 ]
 RISK_RE = re.compile("|".join(RISK_PATTERNS), flags=re.IGNORECASE)
 
-
-# =========================
-# 3) YOUR SITES (as you listed) + 10 EXTRA TRUSTED SITES
-#    NOTE: the script still reads Bekannte_Seiten.csv as primary input.
-#          If that file already contains these, fine; if not, we merge.
-# =========================
-YOUR_SITES_FALLBACK = [
-    "mongabay.com",
-    "theguardian.com",
-    "miningweekly.com",
-    "fian.de",
-    "brot-fuer-die-welt.de",
-    "business-humanrights.org",
-    "misereor.de",
-    "deutsche-rohstoffagentur.de",
-    "hrw.org",
-    "inclusivedevelopment.net",
-    "diversedaily.com",
+# context terms to ensure we are talking about materials/metals/mining chain
+CONTEXT_TERMS = [
+    "mine", "mining", "extraction", "extractive", "ore",
+    "refin", "refining", "smelt", "smelting", "concentrate",
+    "processing", "beneficiation", "tailings", "dam",
+    "supply chain", "upstream", "downstream",
+    "metals", "mineral", "minerals", "raw material",
+    "pollut", "contamin", "toxic", "spill",
+    "lawsuit", "investigation", "allegation", "violation", "abuse",
 ]
 
-TOP10_EXTRA_SITES = [
-    # High-quality news / investigations / enforcement & litigation coverage
+
+# =========================
+# 3) EXTRA SITES (your list)
+# =========================
+TOP_EXTRA_SITES = [
     "reuters.com",
     "apnews.com",
     "bbc.com",
     "dw.com",
     "aljazeera.com",
-    # Institutions / primary sources for labour & HR risks
-    "amnesty.org",
-    "ilo.org",
-    "un.org",
-    "oecd.org",
-    "state.gov",
+    "nytimes.com",
+    "washingtonpost.com",
+    "zeit.de",
+    "ft.com",
+    "rfa.org",
+    "spiegel.de",
+    "cnn.com",
 ]
 
 
@@ -134,7 +125,6 @@ rohst = rawm = max_datum_str = None
 
 def lese_einstellungen():
     global rohst, rawm, max_datum_str
-
     if not EINSTELLUNGEN_CSV.exists():
         raise FileNotFoundError(f"Settings file not found: {EINSTELLUNGEN_CSV}")
 
@@ -209,7 +199,7 @@ def scrape_ddg_results(driver: webdriver.Chrome, search_url: str, max_pages: int
 
     pages_seen = 0
     while pages_seen < max_pages:
-        time.sleep(2.5)
+        time.sleep(2.2)
 
         try:
             WebDriverWait(driver, 8).until(
@@ -243,7 +233,6 @@ def scrape_ddg_results(driver: webdriver.Chrome, search_url: str, max_pages: int
 
             items.append({"url": url, "title": title, "snippet": snippet, "date_txt": date_txt})
 
-        # more results
         try:
             more_btn = WebDriverWait(driver, 3).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, "#more-results"))
@@ -259,23 +248,19 @@ def scrape_ddg_results(driver: webdriver.Chrome, search_url: str, max_pages: int
 
 
 # =========================
-# 8) FILTERS (HIGH RECALL)
+# 8) FILTERS (HIGH ACCURACY)
 # =========================
 SOCIAL_BAD = [
     "facebook.com", "instagram.com", "tiktok.com", "youtube.com",
     "twitter.com", "x.com", "reddit.com",
 ]
-ALLOW_LIST = ["linkedin.com"]  # user allowed
+ALLOW_LIST = ["linkedin.com"]
 
 BAD_PATH_HINTS = [
     "/jobs", "/careers", "/career", "/job/", "/vacancies", "/vacancy",
     "/investor", "/investors", "/ir/", "/financial", "/finance", "/stock",
     "/press-release", "/pressreleases", "/media-kit",
 ]
-
-def is_pdf(url: str) -> bool:
-    u = url.lower().split("?")[0]
-    return u.endswith(".pdf")
 
 def is_bad_social_domain(domain: str) -> bool:
     d = domain.lower()
@@ -287,39 +272,39 @@ def is_bad_path(url: str) -> bool:
     u = url.lower()
     return any(h in u for h in BAD_PATH_HINTS)
 
-def material_present_soft(text: str, material: str) -> bool:
-    if not material:
-        return False
-    return material.lower() in (text or "").lower()
-
-def risk_present_soft(text: str) -> bool:
-    return bool(RISK_RE.search(text or ""))
-
-def score_hit(title: str, snippet: str, domain: str, material: str) -> int:
-    text = f"{title} {snippet}".lower()
-    s = 0
-    if material and material.lower() in text:
-        s += 3
-    if risk_present_soft(text):
-        s += 3
-    if domain.endswith(".gov") or domain.endswith(".int") or domain.endswith(".org"):
-        s += 1
-    if "business-humanrights" in domain:
-        s += 2
-    return s
-
 def date_ok(date_txt: str, min_date) -> bool:
-    if not min_date:
-        return True
-    if not date_txt:
+    if not min_date or not date_txt:
         return True
     dt = dateparser.parse(date_txt, languages=["de", "en"])
     if not dt:
         return True
     return dt.date() >= min_date
 
-def rand_sleep(a_b: tuple[float, float]) -> None:
-    time.sleep(random.uniform(a_b[0], a_b[1]))
+def parse_ddg_date_to_iso(date_txt: str) -> str:
+    if not date_txt:
+        return ""
+    dt = dateparser.parse(date_txt, languages=["de", "en"])
+    if not dt:
+        return ""
+    return dt.date().isoformat()
+
+def material_word_match(text: str, material: str) -> bool:
+    if not text or not material:
+        return False
+    return bool(re.search(rf"\b{re.escape(material.lower())}\b", text.lower()))
+
+def material_context_match(text: str, material: str) -> bool:
+    """Material as whole word + at least one mining/processing/risk context term nearby."""
+    if not material_word_match(text, material):
+        return False
+    t = text.lower()
+    for kw in CONTEXT_TERMS:
+        if kw in t:
+            return True
+    return False
+
+def risk_snippet(title: str, snippet: str) -> bool:
+    return bool(RISK_RE.search(f"{title} {snippet}"))
 
 
 # =========================
@@ -327,24 +312,37 @@ def rand_sleep(a_b: tuple[float, float]) -> None:
 # =========================
 def build_site_queries(domain: str, material: str, schlagwoerter: list[str]) -> list[str]:
     base = [
-        "human rights", "abuse", "violation", "forced labor", "child labor",
-        "pollution", "contamination", "spill", "toxic", "lawsuit", "allegations",
-        "discrimination", "trade union",
+        "mining", "extraction", "smelting", "refining",
+        "human rights", "forced labor", "child labor",
+        "pollution", "contamination", "toxic", "spill",
+        "lawsuit", "allegations", "investigation",
+        "supply chain",
     ]
+
     kws = schlagwoerter[:8] if schlagwoerter else []
-
     queries = []
-    queries.append(f"site:{domain} {material} " + " ".join(base[:6]))
-    queries.append(f"site:{domain} {material} " + " ".join(base[6:11]))
-    queries.append(f"site:{domain} {material} discrimination trade union union rights")
 
-    for k in kws[:3]:
-        k_clean = k.replace("+", " ")
-        queries.append(f"site:{domain} {material} {k_clean}")
+    # high-precision combos
+    combos = [
+        ("mining",),
+        ("extraction",),
+        ("refining",),
+        ("smelting",),
+        ("human rights",),
+        ("pollution",),
+        ("lawsuit",),
+        ("supply chain",),
+    ]
+    for c in combos:
+        queries.append(f"site:{domain} {material} " + " ".join(c))
 
-    # non-material variant to catch titles/snippets missing material
-    queries.append(f"site:{domain} " + " ".join(base[:8]))
+    for k in kws[:4]:
+        queries.append(f"site:{domain} {material} {k.replace('+',' ')}")
 
+    # last: broad material-only within site
+    queries.append(f"site:{domain} {material}")
+
+    # uniq keep order and cap
     seen = set()
     out = []
     for q in queries:
@@ -354,24 +352,15 @@ def build_site_queries(domain: str, material: str, schlagwoerter: list[str]) -> 
             out.append(q)
     return out[:QUERIES_PER_SITE]
 
-def build_fallback_queries(material: str, schlagwoerter: list[str]) -> list[str]:
-    base = [
-        f"{material} human rights violation",
-        f"{material} forced labor allegations",
-        f"{material} child labor supply chain",
-        f"{material} pollution contamination spill",
-        f"{material} discrimination trade union rights",
+def build_fallback_queries(material: str) -> list[str]:
+    return [
+        f"{material} mining human rights violation",
+        f"{material} mining pollution contamination",
+        f"{material} smelting toxic emissions",
+        f"{material} refining wastewater",
         f"{material} lawsuit environmental damage",
+        f"{material} forced labor supply chain",
     ]
-    for k in (schlagwoerter[:8] if schlagwoerter else []):
-        base.append(f"{material} {k.replace('+',' ')}")
-    seen, out = set(), []
-    for q in base:
-        q = re.sub(r'[\u201C\u201D\"\']', "", q).strip()
-        if q and q not in seen:
-            seen.add(q)
-            out.append(q)
-    return out
 
 
 # =========================
@@ -379,75 +368,56 @@ def build_fallback_queries(material: str, schlagwoerter: list[str]) -> list[str]
 # =========================
 if __name__ == "__main__":
     min_date = lese_einstellungen()
-    print(f"SETTINGS: rohst={rohst} | rawm={rawm} | max_datum={max_datum_str}")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] SETTINGS: rohst={rohst} | rawm={rawm} | min_date={max_datum_str}")
 
-    # Read YOUR sites from Bekannte_Seiten.csv (primary)
     seiten_user = lese_einfache_liste(BEKANNTE_SEITEN_CSV, delimiter=",")
-
-    # If Bekannte_Seiten.csv is empty, fall back to your pasted list
-    if not seiten_user:
-        seiten_user = [s.lower() for s in YOUR_SITES_FALLBACK]
-        print("⚠️ Bekannte_Seiten.csv empty/not found → using YOUR_SITES_FALLBACK list.")
-
-    # Read Schlagwörter.csv
     schlagwoerter = lese_einfache_liste(SCHLAGWORT_CSV, delimiter=",")
 
-    # Merge: your sites first, then 10 extra
+    if not seiten_user:
+        raise FileNotFoundError(f"Bekannte_Seiten.csv is empty or missing: {BEKANNTE_SEITEN_CSV}")
+
     merged_sites = []
-    seen = set()
-    for s in seiten_user + TOP10_EXTRA_SITES:
+    seen_sites = set()
+    for s in seiten_user + TOP_EXTRA_SITES:
         s = (s or "").strip().lower()
         if not s:
             continue
         s = s[4:] if s.startswith("www.") else s
-        if s not in seen:
-            seen.add(s)
+        if s not in seen_sites:
+            seen_sites.add(s)
             merged_sites.append(s)
-
-    print(f"Sites total: {len(merged_sites)} | user={len(seiten_user)} | extra={len(merged_sites)-len(seiten_user)}")
-    print("User sites (from CSV):", ", ".join(seiten_user))
-    print("Extra sites (top10):", ", ".join(TOP10_EXTRA_SITES))
 
     out_path = SCRAPED_DIR / f"gescrapte_links_{rohst}.csv"
 
-    global_seen_urls = set()
-
     with out_path.open("w", newline="", encoding="utf-8-sig") as f:
         csv.writer(f, delimiter=";").writerow(
-            ["url", "datum", "site", "query", "title", "snippet", "score"]
+            ["url", "datum_raw", "datum_iso", "site", "query", "title", "snippet"]
         )
 
     driver = make_driver()
+    global_seen_urls = set()
     collected_total = 0
 
     try:
-        # -----------------------------
-        # Phase 1: site-based
-        # -----------------------------
+        # ---- Phase 1: site-based
         for idx_site, domain in enumerate(merged_sites, start=1):
-            print(f"\n🌐 Site {idx_site}/{len(merged_sites)}: {domain}")
+            print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🌐 Site {idx_site}/{len(merged_sites)}: {domain}")
             queries = build_site_queries(domain, rawm, schlagwoerter)
             print(f"   → queries: {len(queries)}")
 
             accepted_for_site = 0
 
             for q_i, q in enumerate(queries, start=1):
-                print(f"   🔎 {q_i}/{len(queries)} | collected so far = {collected_total}")
-                url_search = ddg_search_url(q)
-
-                results = scrape_ddg_results(driver, url_search, max_pages=MAX_DDG_PAGES)
+                print(f"   [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🔎 {q_i}/{len(queries)} | total collected = {collected_total}")
+                results = scrape_ddg_results(driver, ddg_search_url(q), max_pages=MAX_DDG_PAGES)
                 print(f"      → raw hits: {len(results)}")
 
-                scored = []
                 for r in results:
-                    u = r.get("url", "")
+                    u = (r.get("url") or "").strip()
                     if not u or u in global_seen_urls:
                         continue
 
                     dom = urlparse(u).netloc.lower()
-
-                    if is_pdf(u):
-                        continue
                     if is_bad_social_domain(dom):
                         continue
                     if is_bad_path(u):
@@ -455,19 +425,13 @@ if __name__ == "__main__":
                     if not date_ok(r.get("date_txt", ""), min_date):
                         continue
 
-                    sc = score_hit(r.get("title", ""), r.get("snippet", ""), dom, rawm)
-                    scored.append((sc, r))
+                    title = r.get("title", "") or ""
+                    snippet = r.get("snippet", "") or ""
+                    text = f"{title} {snippet}"
 
-                scored.sort(key=lambda x: x[0], reverse=True)
-
-                for sc, r in scored:
-                    u = r["url"]
-                    if u in global_seen_urls:
-                        continue
-
-                    # High-recall acceptance:
-                    # keep some relevance by preferring scored items, but don't starve the output
-                    if sc == 0 and accepted_for_site >= 3:
+                    # HIGH ACCURACY GATE:
+                    # accept if (material is in real context) OR (risk terms appear AND material is a whole word)
+                    if not (material_context_match(text, rawm) or (risk_snippet(title, snippet) and material_word_match(text, rawm))):
                         continue
 
                     global_seen_urls.add(u)
@@ -478,77 +442,68 @@ if __name__ == "__main__":
                         csv.writer(f, delimiter=";").writerow([
                             u,
                             r.get("date_txt", ""),
+                            parse_ddg_date_to_iso(r.get("date_txt", "")),
                             domain,
                             q,
-                            r.get("title", ""),
-                            r.get("snippet", ""),
-                            sc
+                            title,
+                            snippet,
                         ])
 
-                    print(
-                        f"      ✅ accepted | total={collected_total} | site={accepted_for_site} | score={sc} | "
-                        f"{(r.get('title','') or '')[:80]}"
-                    )
+                    print(f"      ✅ accepted | total={collected_total} | site={accepted_for_site} | {title[:80]}")
 
-                rand_sleep(PAUSE_BETWEEN_QUERIES_SEC)
+                time.sleep(random.uniform(*PAUSE_BETWEEN_QUERIES_SEC))
 
             print(f"   → accepted from site: {accepted_for_site}")
-            rand_sleep(PAUSE_BETWEEN_SITES_SEC)
+            time.sleep(random.uniform(*PAUSE_BETWEEN_SITES_SEC))
 
-        # -----------------------------
-        # Phase 2: fallback web-wide
-        # -----------------------------
+        # ---- Phase 2: fallback web-wide (still high accuracy)
         if collected_total < MIN_AFTER_SITES:
-            print(f"\n⚠️ Only {collected_total} collected after sites. Starting web-wide fallback…")
-            fallback_queries = build_fallback_queries(rawm, schlagwoerter)
-
-            for q_i, q in enumerate(fallback_queries, start=1):
+            print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Only {collected_total} after sites. Web-wide fallback…")
+            for q_i, q in enumerate(build_fallback_queries(rawm), start=1):
                 if collected_total >= FALLBACK_TARGET_TOTAL:
                     break
 
-                print(f"🌍 Fallback {q_i}/{len(fallback_queries)} | collected so far = {collected_total}")
+                print(f"   [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🌍 Fallback {q_i} | total={collected_total} | {q}")
                 results = scrape_ddg_results(driver, ddg_search_url(q), max_pages=MAX_DDG_PAGES)
-                print(f"   → raw hits: {len(results)}")
 
                 for r in results:
                     if collected_total >= FALLBACK_TARGET_TOTAL:
                         break
 
-                    u = r.get("url", "")
+                    u = (r.get("url") or "").strip()
                     if not u or u in global_seen_urls:
                         continue
 
                     dom = urlparse(u).netloc.lower()
-                    if is_pdf(u):
-                        continue
                     if is_bad_social_domain(dom):
                         continue
                     if is_bad_path(u):
                         continue
 
-                    text = f"{r.get('title','')} {r.get('snippet','')}".lower()
-                    # fallback must have at least material OR risk in title/snippet
-                    if not (material_present_soft(text, rawm) or risk_present_soft(text)):
+                    title = r.get("title", "") or ""
+                    snippet = r.get("snippet", "") or ""
+                    text = f"{title} {snippet}"
+
+                    if not (material_context_match(text, rawm) or (risk_snippet(title, snippet) and material_word_match(text, rawm))):
                         continue
 
                     global_seen_urls.add(u)
                     collected_total += 1
-                    sc = score_hit(r.get("title", ""), r.get("snippet", ""), dom, rawm)
 
                     with out_path.open("a", newline="", encoding="utf-8-sig") as f:
                         csv.writer(f, delimiter=";").writerow([
                             u,
                             r.get("date_txt", ""),
+                            parse_ddg_date_to_iso(r.get("date_txt", "")),
                             "WEB_WIDE",
                             q,
-                            r.get("title", ""),
-                            r.get("snippet", ""),
-                            sc
+                            title,
+                            snippet,
                         ])
 
-                    print(f"   ✅ fallback accepted | total={collected_total} | score={sc} | {r.get('title','')[:80]}")
+                    print(f"      ✅ fallback accepted | total={collected_total} | {title[:80]}")
 
-                rand_sleep(PAUSE_BETWEEN_QUERIES_SEC)
+                time.sleep(random.uniform(*PAUSE_BETWEEN_QUERIES_SEC))
 
     finally:
         try:
@@ -556,4 +511,4 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    print(f"\n✅ Done. Collected total: {collected_total}\nOutput:\n{out_path}")
+    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ✅ Done. Collected total: {collected_total}\nOutput:\n{out_path}")
