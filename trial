@@ -1,1 +1,239 @@
-!pip install -U pdfplumber requests htmldate beautifulsoup4 python-dateutil
+# -*- coding: utf-8 -*-
+"""
+ANALYSE-SCRIPT with strict filtering (material context + harm)
+Reads:  gescrapte_links_<rohst>.csv
+Writes: analyse_tabelle_<rohst>.csv
+"""
+
+import os
+import csv
+import re
+import random
+import requests
+import pdfplumber
+from pathlib import Path
+from urllib.parse import urlparse
+from bs4 import BeautifulSoup
+from dateutil import parser as date_parser
+
+# Pub date extractor
+from htmldate import find_date
+
+
+# ==========================================================
+# 1) PATHS
+# ==========================================================
+PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
+SCRAPED_DIR = PROJECT_ROOT / "gescrapte_Artikel-Links"
+OUTPUT_DIR = PROJECT_ROOT / "Analyse_Tabelle"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
+EINSTELLUNGEN_CSV = SETTINGS_DIR / "Einstellungen_Analyse.csv"
+
+# ==========================================================
+# 2) READ SETTINGS
+# ==========================================================
+rohst = rawm = None
+
+def lese_einstellungen():
+    global rohst, rawm
+    if not EINSTELLUNGEN_CSV.exists():
+        raise FileNotFoundError(f"Settings file not found: {EINSTELLUNGEN_CSV}")
+    with EINSTELLUNGEN_CSV.open("r", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    def get_row(idx, default=""):
+        return (rows[idx][0].strip() if len(rows) > idx and rows[idx] else default)
+    rohst = get_row(5, "Stahl")
+    rawm = get_row(8, "").strip()
+    return rawm
+
+
+# ==========================================================
+# 3) TEXT EXTRACTION (HTML + PDF)
+# ==========================================================
+def extract_html_text(url: str) -> str:
+    try:
+        resp = requests.get(url, timeout=15)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # remove scripts/styles
+        for tag in soup(["script", "style", "nav", "footer"]):
+            tag.decompose()
+        return soup.get_text(separator="\n", strip=True)
+    except Exception:
+        return ""
+
+def extract_pdf_text(url: str) -> str:
+    try:
+        # download PDF temporarily
+        r = requests.get(url, timeout=20)
+        path = Path("temp.pdf")
+        with path.open("wb") as f:
+            f.write(r.content)
+        text = ""
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                text += page_text + "\n"
+        path.unlink()
+        return text
+    except Exception:
+        return ""
+
+
+# ==========================================================
+# 4) CONTEXT FILTERS
+# ==========================================================
+RISK_PATTERNS = [
+    r"\bhuman rights?\b", r"\bviolat(e|ed|ion|ions)\b",
+    r"\babuse(s|d)?\b", r"\bforced\s+labou?r\b",
+    r"\bchild\s+labou?r\b", r"\bpollut(ion|ed|ing)\b",
+    r"\bcontaminat(e|ed|ion)\b", r"\bspill(s|ed)?\b",
+    r"\benvironment(al)?\b", r"\blawsuit\b", r"\balleg(ation|ed)\b"
+]
+RISK_RE = re.compile("|".join(RISK_PATTERNS), flags=re.IGNORECASE)
+
+
+def material_context(text: str, material: str) -> bool:
+    """True if material is a whole word in context of domain terms."""
+    if not material:
+        return False
+    t = text.lower()
+    m = material.lower()
+    if not re.search(rf"\b{re.escape(m)}\b", t):
+        return False
+    related = [
+        "mine", "mining", "extraction", "processing", "smelt",
+        "pollut", "contamin", "risk", "environment", "labour", "labor",
+        "human rights", "lawsuit", "violation", "abuse"
+    ]
+    for kw in related:
+        if re.search(rf"\b{kw}\b.*\b{re.escape(m)}\b", t) or re.search(rf"\b{re.escape(m)}\b.*\b{kw}\b", t):
+            return True
+    return False
+
+
+# ==========================================================
+# 5) YEAR & RISK CHECKS
+# ==========================================================
+def extract_pub_date(html_text: str, url: str) -> int:
+    try:
+        # attempt using htmldate heuristics
+        date_str = find_date(url)
+        if date_str:
+            dt = date_parser.parse(date_str)
+            return dt.year
+    except Exception:
+        pass
+    # fallback: search for yyyy in text
+    years = re.findall(r"\b(20\d{2})\b", html_text)
+    if years:
+        return max(int(y) for y in years)
+    return None
+
+def contains_risk(text: str) -> bool:
+    return bool(RISK_RE.search(text))
+
+
+# ==========================================================
+# 6) CSV READ/WRITE
+# ==========================================================
+def read_scraped_links(rohstoff: str) -> list[str]:
+    fpath = SCRAPED_DIR / f"gescrapte_links_{rohstoff}.csv"
+    if not fpath.exists():
+        raise FileNotFoundError(f"Scrape CSV not found: {fpath}")
+    with fpath.open("r", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f, delimiter=";"))
+    return list({row[0].strip() for row in rows[1:] if row and row[0].strip()})
+
+def write_analysis_csv(rohstoff: str, data_rows: list):
+    out_path = OUTPUT_DIR / f"analyse_tabelle_{rohstoff}.csv"
+    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow([
+            "link","Risikokategorien (A–M)",
+            "Arten der Menschenrechts-/Umweltschädigungen","Begründung",
+            "Jahr(e)","Land/Länder","Ort(e)",
+            "Stufe der Rohstoffgewinnung","Involvierte Unternehmen",
+            "Betroffene Personengruppen/Ökosysteme",
+            "Mindestzahl der betroffenen Personen",
+            "Begründung Mindestzahl","Schwere","Begründung Schwere"
+        ])
+        for row in data_rows:
+            w.writerow(row)
+    print(f"✅ Analysis written to: {out_path}")
+
+
+# ==========================================================
+# 7) SIMPLE ANALYSIS (rule-based)
+# ==========================================================
+def analyse_text(text: str) -> list[str]:
+    # risk categories & harm description
+    risks = ", ".join(set(m.group(0) for m in RISK_RE.finditer(text)))
+    harms = risks or "Not in Text"
+
+    # simple justification
+    justific = "Article mentions relevant harm context." if risks else "No harm context found."
+
+    year = extract_pub_date(text, "")
+
+    countries = ", ".join(
+        sorted(set(c for c in re.findall(r"\b([A-Z][a-z]+)\b", text) if len(c) > 2))
+    ) or "Not in Text"
+
+    return [
+        risks or "Not in Text",
+        harms,
+        justific,
+        str(year) if year else "Not in Text",
+        countries,
+        "Not in Text", "Not in Text", "Not in Text",
+        "Not in Text","Not in Text","Not in Text","Not in Text"
+    ]
+
+
+# ==========================================================
+# 8) MAIN
+# ==========================================================
+if __name__ == "__main__":
+    rawm = lese_einstellungen()
+    print(f"Raw material filter: {rawm}")
+
+    links = read_scraped_links(rohst)
+    print(f"Links found: {len(links)}")
+
+    analysed_rows = []
+
+    for idx, link in enumerate(links, start=1):
+        print(f"[{idx}/{len(links)}] analysing: {link}")
+
+        try:
+            # download text
+            if link.lower().endswith(".pdf"):
+                text = extract_pdf_text(link)
+            else:
+                text = extract_html_text(link)
+
+            # apply strict filters
+            if not material_context(text, rawm):
+                print("  ⛔ skip (material not in proper context)")
+                continue
+
+            year = extract_pub_date(text, link)
+            if not year or year < 2021:
+                print("  ⛔ skip (no recent publication)")
+                continue
+
+            if not contains_risk(text):
+                print("  ⛔ skip (no risk context)")
+                continue
+
+            # rule-based extraction
+            row_data = analyse_text(text)
+            analysed_rows.append([link] + row_data)
+            print("  ✅ analysed")
+
+        except Exception as e:
+            print("  ❌ failed:", e)
+
+    write_analysis_csv(rohst, analysed_rows)
