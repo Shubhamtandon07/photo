@@ -819,7 +819,15 @@ def run_bot_once():
 
     print(f"Done. Checked={checked}, Drafted={drafted}")
 
+from datetime import datetime
 
+def run_bot_once():
+    print("\n=== RUN START ===")
+    print("Run timestamp:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    print("=================\n")
+
+    time.sleep(STARTUP_DELAY_SEC)
+    ...
 # Notebook: run_bot_once()
 if __name__ == "__main__":
     run_bot_once()
