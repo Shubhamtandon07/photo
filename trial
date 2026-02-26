@@ -1,2 +1,319 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# KI Risiko – Executive Summaries (LLM via GenAI-Nexus Azure-style)
+# MAX RECALL VERSION: NO FILTERING / NO REJECTIONS
+#
+# Reads:  C:\Users\SHTANDO\Desktop\KI Risko\Analyse_Tabelle\analyse_tabelle_<rohst>.csv
+# Writes: C:\Users\SHTANDO\Desktop\KI Risko\Executive_Summary_<rohst>\Executive_Summary_Artikelweise_<rohst>.xlsx
+# ============================================================
+
 import os
-os.environ["OPENAI_API_KEY"] = "PASTE_YOUR_NEW_KEY"
+import csv
+import re
+from pathlib import Path
+from collections import Counter
+
+from openpyxl import Workbook
+from openai import AzureOpenAI
+
+
+# -----------------------------
+# 1) Paths
+# -----------------------------
+PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
+ANALYSE_DIR = PROJECT_ROOT / "Analyse_Tabelle"
+SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
+EINSTELLUNGEN_CSV = SETTINGS_DIR / "Einstellungen_Analyse.csv"
+
+
+# -----------------------------
+# 2) Nexus / Azure OpenAI client
+# -----------------------------
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"  # IMPORTANT: no /apikey/
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-5.1"  # change if your deployment name differs
+
+LLM_TEMPERATURE = 0.2
+LLM_MAX_COMPLETION_TOKENS = 750
+
+client = AzureOpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    api_version=AZURE_API_VERSION,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+)
+
+
+# -----------------------------
+# 3) Load settings (rohst/rawm)
+# -----------------------------
+rohst = rawm = None
+
+def lese_einstellungen():
+    global rohst, rawm
+    with EINSTELLUNGEN_CSV.open("r", encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.reader(f, delimiter=","))
+
+    def get_row(idx, default=""):
+        if len(rows) > idx and len(rows[idx]) > 0:
+            return (rows[idx][0] or "").strip()
+        return default
+
+    rohst = get_row(5, "Stahl")
+    rawm  = get_row(8, "Steel")
+    print(f"Loaded settings → rohst={rohst}, rawm={rawm}")
+
+
+# -----------------------------
+# 4) Load analyse table
+# -----------------------------
+def lade_analyse_tabelle():
+    analyse_path = ANALYSE_DIR / f"analyse_tabelle_{rohst}.csv"
+    if not analyse_path.exists():
+        raise FileNotFoundError(f"Analysis file not found: {analyse_path}")
+
+    with analyse_path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f, delimiter=";")
+        rows = list(reader)
+
+    if not rows:
+        raise ValueError(f"Analysis file is empty: {analyse_path}")
+
+    header = rows[0]
+    data_rows = rows[1:]
+    print(f"Loaded {len(data_rows)} analysed rows from: {analyse_path}")
+    return header, data_rows
+
+
+def get_cell(header, row, col, default="Not in Text"):
+    if col in header:
+        idx = header.index(col)
+        if idx < len(row) and (row[idx] or "").strip():
+            return (row[idx] or "").strip()
+    return default
+
+
+# -----------------------------
+# 5) LLM prompts + calls
+# -----------------------------
+def build_case_prompt(header, row) -> str:
+    link = get_cell(header, row, "link", "")
+
+    ctx = {
+        "Link": link,
+        "Risk categories": get_cell(header, row, "Risikokategorien (A–M)", ""),
+        "Types of harm": get_cell(header, row, "Arten der Menschenrechts-/Umweltschädigungen", ""),
+        "Reason / evidence": get_cell(header, row, "Begründung", ""),
+        "Years": get_cell(header, row, "Jahr(e)", ""),
+        "Countries": get_cell(header, row, "Land/Länder", ""),
+        "Locations": get_cell(header, row, "Ort(e)", ""),
+        "Supply-chain stage": get_cell(header, row, "Stufe der Rohstoffgewinnung", ""),
+        "Companies involved": get_cell(header, row, "Involvierte Unternehmen", ""),
+        "Affected groups / ecosystems": get_cell(header, row, "Betroffene Personengruppen/Ökosysteme", ""),
+        "Minimum affected persons": get_cell(header, row, "Mindestzahl der betroffenen Personen", ""),
+        "Reason for minimum": get_cell(header, row, "Begründung Mindestzahl", ""),
+        "Severity": get_cell(header, row, "Schwere", ""),
+        "Reason for severity": get_cell(header, row, "Begründung Schwere", ""),
+    }
+
+    ctx_lines = "\n".join([f"{k}: {v}" for k, v in ctx.items() if v and v != "Not in Text"])
+
+    return f"""
+You are an ESG / human-rights and environmental-risk analyst.
+
+Write an executive summary for ONE case about the raw material "{rawm}".
+
+Rules:
+- Use ONLY the structured case data below. Do NOT invent facts, numbers, actors, places, or years.
+- If something is missing, do not guess; write more generally.
+- Focus on whether the case indicates negative impacts (human rights or environmental), and why it matters.
+- Professional, neutral tone.
+- No bullet points, no headings.
+- Length: 140–240 words.
+
+End with:
+[Article link: {link}]
+
+Structured case data:
+{ctx_lines}
+""".strip()
+
+
+def llm_text(prompt: str) -> str:
+    resp = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+        messages=[
+            {"role": "system", "content": "You never add facts not supported by the input. If uncertain, omit."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=LLM_TEMPERATURE,
+        max_completion_tokens=LLM_MAX_COMPLETION_TOKENS,
+    )
+    out = (resp.choices[0].message.content or "").strip()
+    return out if out else "Summary generation returned empty output."
+
+
+# -----------------------------
+# 6) Overall facts (from ALL rows)
+# -----------------------------
+def compute_overall_facts(header, rows):
+    countries = Counter()
+    years = Counter()
+    companies = Counter()
+    severities = Counter()
+    categories = Counter()
+
+    def split_values(cell: str) -> list[str]:
+        if not cell or cell.strip().lower() == "not in text":
+            return []
+        parts = re.split(r"[;,/|]+", cell)
+        return [p.strip() for p in parts if p.strip() and p.strip().lower() != "not in text"]
+
+    for row in rows:
+        for c in split_values(get_cell(header, row, "Land/Länder", "")):
+            countries[c] += 1
+
+        y_raw = get_cell(header, row, "Jahr(e)", "")
+        for y in re.findall(r"\b(19\d{2}|20\d{2})\b", y_raw or ""):
+            years[y] += 1
+
+        for comp in split_values(get_cell(header, row, "Involvierte Unternehmen", "")):
+            companies[comp] += 1
+
+        sev = (get_cell(header, row, "Schwere", "") or "").strip().lower()
+        if sev and sev != "not in text":
+            severities[sev] += 1
+
+        cat = get_cell(header, row, "Risikokategorien (A–M)", "")
+        for token in re.findall(r"\b[A-M]\b", (cat or "").upper()):
+            categories[token] += 1
+
+    return {
+        "total_cases": len(rows),
+        "top_countries": countries.most_common(6),
+        "top_years": years.most_common(8),
+        "top_companies": companies.most_common(8),
+        "severity_counts": dict(severities),
+        "top_categories": categories.most_common(8),
+    }
+
+
+def build_overall_prompt(facts: dict) -> str:
+    return f"""
+You are an ESG / human-rights and environmental-risk analyst.
+
+Write ONE overall executive summary (240–420 words) for the raw material "{rawm}",
+based ONLY on the aggregated facts below (computed from all cases).
+
+Rules:
+- Do NOT invent incidents, actors, locations, or numbers not present below.
+- Mention: top countries and years if available.
+- Mention severity distribution exactly as given.
+- No bullet points, no headings.
+
+Aggregated facts:
+Total cases: {facts.get("total_cases")}
+Top countries (count): {facts.get("top_countries")}
+Top years (count): {facts.get("top_years")}
+Top companies (count): {facts.get("top_companies")}
+Top risk-category letters (count): {facts.get("top_categories")}
+Severity counts: {facts.get("severity_counts")}
+""".strip()
+
+
+# -----------------------------
+# 7) Write Excel
+# -----------------------------
+def write_excel(header, rows_all) -> Path:
+    exec_dir = PROJECT_ROOT / f"Executive_Summary_{rohst}"
+    exec_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = exec_dir / f"Executive_Summary_Artikelweise_{rohst}.xlsx"
+
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    # Per case sheets (ALL rows)
+    for i, row in enumerate(rows_all, start=1):
+        ws = wb.create_sheet(title=f"Case_{i}"[:31])
+
+        ws["A1"] = "Status"
+        ws["B1"] = "INCLUDED (no filtering)"
+        ws["A2"] = "Link"
+        ws["B2"] = get_cell(header, row, "link", "")
+
+        rr = 4
+        for col in header:
+            ws.cell(row=rr, column=1).value = col
+            ws.cell(row=rr, column=2).value = get_cell(header, row, col, "")
+            rr += 1
+
+        rr += 1
+        ws.cell(row=rr, column=1).value = "Executive Summary"
+        ws.cell(row=rr, column=2).value = llm_text(build_case_prompt(header, row))
+
+        ws.column_dimensions["A"].width = 45
+        ws.column_dimensions["B"].width = 120
+
+    # Overall summary (ALL rows)
+    ws_overall = wb.create_sheet(title="Overall_Summary")
+    facts = compute_overall_facts(header, rows_all)
+
+    overall_text = "No cases found in the analysis table."
+    if rows_all:
+        overall_text = llm_text(build_overall_prompt(facts))
+
+    ws_overall["A1"] = "Overall Executive Summary"
+    ws_overall["A3"] = overall_text
+
+    ws_overall["A5"] = "Traceability (computed facts from all cases)"
+    ws_overall["A6"] = "Total cases"
+    ws_overall["B6"] = facts.get("total_cases", 0)
+
+    r = 8
+    ws_overall["A8"] = "Top countries (count)"
+    r = 9
+    for name, cnt in facts.get("top_countries", []):
+        ws_overall.cell(row=r, column=1).value = name
+        ws_overall.cell(row=r, column=2).value = cnt
+        r += 1
+
+    r += 1
+    ws_overall.cell(row=r, column=1).value = "Top years (count)"
+    r += 1
+    for name, cnt in facts.get("top_years", []):
+        ws_overall.cell(row=r, column=1).value = name
+        ws_overall.cell(row=r, column=2).value = cnt
+        r += 1
+
+    r += 1
+    ws_overall.cell(row=r, column=1).value = "Severity counts"
+    r += 1
+    for sev, cnt in (facts.get("severity_counts") or {}).items():
+        ws_overall.cell(row=r, column=1).value = sev
+        ws_overall.cell(row=r, column=2).value = cnt
+        r += 1
+
+    r += 1
+    ws_overall.cell(row=r, column=1).value = "Top risk-category letters (count)"
+    r += 1
+    for name, cnt in facts.get("top_categories", []):
+        ws_overall.cell(row=r, column=1).value = name
+        ws_overall.cell(row=r, column=2).value = cnt
+        r += 1
+
+    ws_overall.column_dimensions["A"].width = 55
+    ws_overall.column_dimensions["B"].width = 40
+
+    wb.save(out_path)
+    return out_path
+
+
+# -----------------------------
+# 8) Main
+# -----------------------------
+if __name__ == "__main__":
+    lese_einstellungen()
+    header, data_rows = lade_analyse_tabelle()
+
+    out_file = write_excel(header, data_rows)
+    print(f"\n✅ Excel written to:\n{out_file}")
