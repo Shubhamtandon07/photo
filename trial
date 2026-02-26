@@ -1,239 +1,719 @@
 # -*- coding: utf-8 -*-
 """
-ANALYSE-SCRIPT with strict filtering (material context + harm)
-Reads:  gescrapte_links_<rohst>.csv
-Writes: analyse_tabelle_<rohst>.csv
+OUTLOOK DRAFT BOT (LLM + GROUNDED RAG + REQUIREMENT EXTRACTION)
+Notebook-safe (VSCode .ipynb) + Python 3.14
+==============================================================
+
+- Triggers on Outlook emails with subject exactly "bot" (case-insensitive).
+- Builds KB chunk index from KB_DIR (docx/pdf/xlsx/txt).
+- Retrieves evidence chunks (AW_/RE_/FW_/WG_ demoted but allowed).
+- Deterministic extraction:
+    * selects requirement-like sentences/lines
+    * groups them into Copilot-style sections
+    * deduplicates & removes table-noise
+- LLM (GenAI-Nexus GPT-5.1) rewrites extracted requirements into a polished DE+EN email:
+    * numbered sections
+    * concise, human style
+    * "Sources used" at end
+    * short summary bullets at end only if answer is long
+- Marks original mail as Read + adds category to prevent duplicates.
+- Optional self-notify + Outlook Task reminder.
+
+Requires:
+  pip install -U openai pywin32
+Optional:
+  pip install -U python-docx pdfplumber pypdf openpyxl scikit-learn
 """
 
+from __future__ import annotations
+
 import os
-import csv
 import re
-import random
-import requests
-import pdfplumber
+import time
 from pathlib import Path
-from urllib.parse import urlparse
-from bs4 import BeautifulSoup
-from dateutil import parser as date_parser
+from datetime import datetime, timedelta
+from html import escape
+from typing import List, Tuple, Dict, Optional
 
-# Pub date extractor
-from htmldate import find_date
+import win32com.client as win32
+from openai import AzureOpenAI
 
+# =========================
+# CONFIG — EDIT THESE
+# =========================
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"
+WATCH_FOLDER_NAME = "Inbox"
+KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
 
-# ==========================================================
-# 1) PATHS
-# ==========================================================
-PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
-SCRAPED_DIR = PROJECT_ROOT / "gescrapte_Artikel-Links"
-OUTPUT_DIR = PROJECT_ROOT / "Analyse_Tabelle"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+STRICT_SUBJECT = "bot"
+REQUIRE_UNREAD = True
+PROCESS_PER_RUN = 3
+SCAN_LIMIT = 250
+STARTUP_DELAY_SEC = 1
 
-SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
-EINSTELLUNGEN_CSV = SETTINGS_DIR / "Einstellungen_Analyse.csv"
+PROCESSED_CATEGORY = "Drafted-RAG-LLM-v2"
 
-# ==========================================================
-# 2) READ SETTINGS
-# ==========================================================
-rohst = rawm = None
+SELF_NOTIFY = True
+SELF_NOTIFY_TO = TARGET_MAILBOX
+CREATE_REMINDER_TASK = True
+REMINDER_DAYS = 2
 
-def lese_einstellungen():
-    global rohst, rawm
-    if not EINSTELLUNGEN_CSV.exists():
-        raise FileNotFoundError(f"Settings file not found: {EINSTELLUNGEN_CSV}")
-    with EINSTELLUNGEN_CSV.open("r", encoding="utf-8-sig") as f:
-        rows = list(csv.reader(f))
-    def get_row(idx, default=""):
-        return (rows[idx][0].strip() if len(rows) > idx and rows[idx] else default)
-    rohst = get_row(5, "Stahl")
-    rawm = get_row(8, "").strip()
-    return rawm
+# KB parsing
+SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
+MAX_DOCS = 5000
+MAX_CHARS_PER_DOC = 220_000
 
+# Chunking
+MAX_CHARS_PER_CHUNK = 1400
+MAX_CHUNKS_PER_DOC = 180
 
-# ==========================================================
-# 3) TEXT EXTRACTION (HTML + PDF)
-# ==========================================================
-def extract_html_text(url: str) -> str:
+# Retrieval
+TOP_K_CHUNKS = 20
+EVIDENCE_MAX_CHUNKS_TO_LLM = 18  # keep prompt bounded
+
+# De-prioritize mail-chain-like docs but still allow
+MAILY_PREFIXES = ("aw_", "re_", "fw_", "wg_")
+MAILY_HINTS = ("subject", "mail", "email", "outlook", ".msg", "conversation")
+
+# LLM (GenAI-Nexus / Azure-style)
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"   # NO /apikey/
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-5.1"  # your deployment
+LLM_TEMPERATURE = 0.15
+LLM_MAX_COMPLETION_TOKENS = 650     # IMPORTANT: GPT-5.x uses max_completion_tokens
+
+# =========================
+# BASIC UTILS
+# =========================
+STOPWORDS = set("""
+the a an and or to of in on for with without from by at is are was were be been being
+der die das und oder zu von im in am an auf für mit ohne aus bei ist sind war waren
+""".split())
+
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def strict_subject_ok(subject: str) -> bool:
+    return (subject or "").strip().casefold() == STRICT_SUBJECT.casefold()
+
+def clean_html_to_text(html: str) -> str:
+    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
+    return clean_ws(txt)
+
+def safe_firstname_from_email(email: str) -> str:
+    email = (email or "").strip()
+    local = email.split("@", 1)[0] if "@" in email else email
+    first = local.split(".", 1)[0].strip()
+    return (first[:1].upper() + first[1:]) if first else "Colleague"
+
+def format_outlook_html(text: str) -> str:
+    """
+    Plain -> Outlook HTML.
+    Bullets: lines starting with "- ".
+    """
+    text = (text or "").replace("\r\n", "\n").strip()
+    if not text:
+        return "<p></p>"
+
+    blocks = re.split(r"\n\s*\n", text)
+    out = []
+    for block in blocks:
+        lines = [ln.rstrip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        if all(ln.lstrip().startswith("- ") for ln in lines):
+            out.append("<ul>")
+            for ln in lines:
+                out.append(f"<li>{escape(ln.lstrip()[2:].strip())}</li>")
+            out.append("</ul>")
+        else:
+            out.append("<p>" + "<br>".join(escape(ln.strip()) for ln in lines) + "</p>")
+    return "\n".join(out)
+
+def tokenize(s: str) -> List[str]:
+    toks = re.split(r"[^a-zA-Z0-9ÄÖÜäöüß]+", (s or "").lower())
+    return [t for t in toks if t and t not in STOPWORDS and len(t) >= 3]
+
+def is_maily_filename(name: str) -> bool:
+    n = (name or "").lower()
+    stem = Path(n).stem.lower()
+    if stem.startswith("~$"):
+        return True
+    if stem.startswith(MAILY_PREFIXES):
+        return True
+    return any(h in n for h in MAILY_HINTS)
+
+def doc_priority_adjustment(filename: str) -> float:
+    """
+    Higher is better.
+    Strongly demote AW_/RE_/FW_/WG_ and mail-ish docs.
+    """
+    fn = (filename or "").lower()
+    score = 0.0
+    if fn.startswith(MAILY_PREFIXES):
+        score -= 0.70
+    if any(h in fn for h in MAILY_HINTS):
+        score -= 0.30
+    # small boost to authoritative words
+    if re.search(r"(?i)\b(mbn|din|iso|vda|standard|policy|guideline|kapitel|chapter|requirements|norm)\b", fn):
+        score += 0.25
+    return score
+
+# =========================
+# KB READERS (skip missing libs)
+# =========================
+def read_txt(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="ignore")
+
+def read_docx(p: Path) -> str:
     try:
-        resp = requests.get(url, timeout=15)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        # remove scripts/styles
-        for tag in soup(["script", "style", "nav", "footer"]):
-            tag.decompose()
-        return soup.get_text(separator="\n", strip=True)
+        from docx import Document as DocxDocument  # type: ignore
     except Exception:
         return ""
+    doc = DocxDocument(str(p))
+    paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
+    table_lines = []
+    for t in doc.tables:
+        for row in t.rows:
+            cells = [clean_ws(c.text) for c in row.cells]
+            if any(cells):
+                table_lines.append(" | ".join(cells))
+    return (paras + "\n" + "\n".join(table_lines)).strip()
 
-def extract_pdf_text(url: str) -> str:
+def read_pdf(p: Path) -> str:
     try:
-        # download PDF temporarily
-        r = requests.get(url, timeout=20)
-        path = Path("temp.pdf")
-        with path.open("wb") as f:
-            f.write(r.content)
-        text = ""
-        with pdfplumber.open(path) as pdf:
+        import pdfplumber  # type: ignore
+        out = []
+        with pdfplumber.open(str(p)) as pdf:
             for page in pdf.pages:
-                page_text = page.extract_text() or ""
-                text += page_text + "\n"
-        path.unlink()
-        return text
-    except Exception:
-        return ""
-
-
-# ==========================================================
-# 4) CONTEXT FILTERS
-# ==========================================================
-RISK_PATTERNS = [
-    r"\bhuman rights?\b", r"\bviolat(e|ed|ion|ions)\b",
-    r"\babuse(s|d)?\b", r"\bforced\s+labou?r\b",
-    r"\bchild\s+labou?r\b", r"\bpollut(ion|ed|ing)\b",
-    r"\bcontaminat(e|ed|ion)\b", r"\bspill(s|ed)?\b",
-    r"\benvironment(al)?\b", r"\blawsuit\b", r"\balleg(ation|ed)\b"
-]
-RISK_RE = re.compile("|".join(RISK_PATTERNS), flags=re.IGNORECASE)
-
-
-def material_context(text: str, material: str) -> bool:
-    """True if material is a whole word in context of domain terms."""
-    if not material:
-        return False
-    t = text.lower()
-    m = material.lower()
-    if not re.search(rf"\b{re.escape(m)}\b", t):
-        return False
-    related = [
-        "mine", "mining", "extraction", "processing", "smelt",
-        "pollut", "contamin", "risk", "environment", "labour", "labor",
-        "human rights", "lawsuit", "violation", "abuse"
-    ]
-    for kw in related:
-        if re.search(rf"\b{kw}\b.*\b{re.escape(m)}\b", t) or re.search(rf"\b{re.escape(m)}\b.*\b{kw}\b", t):
-            return True
-    return False
-
-
-# ==========================================================
-# 5) YEAR & RISK CHECKS
-# ==========================================================
-def extract_pub_date(html_text: str, url: str) -> int:
-    try:
-        # attempt using htmldate heuristics
-        date_str = find_date(url)
-        if date_str:
-            dt = date_parser.parse(date_str)
-            return dt.year
+                out.append(page.extract_text() or "")
+        return "\n".join(out).strip()
     except Exception:
         pass
-    # fallback: search for yyyy in text
-    years = re.findall(r"\b(20\d{2})\b", html_text)
-    if years:
-        return max(int(y) for y in years)
+    try:
+        from pypdf import PdfReader  # type: ignore
+        r = PdfReader(str(p))
+        out = []
+        for pg in r.pages:
+            try:
+                out.append(pg.extract_text() or "")
+            except Exception:
+                pass
+        return "\n".join(out).strip()
+    except Exception:
+        return ""
+
+def read_xlsx(p: Path) -> str:
+    try:
+        import openpyxl  # type: ignore
+    except Exception:
+        return ""
+    wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+    out = []
+    for ws in wb.worksheets:
+        out.append(f"Sheet: {ws.title}")
+        max_rows = min(ws.max_row or 0, 250)
+        max_cols = min(ws.max_column or 0, 50)
+        for r in range(1, max_rows + 1):
+            row_vals = []
+            for c in range(1, max_cols + 1):
+                v = ws.cell(row=r, column=c).value
+                row_vals.append("" if v is None else str(v))
+            if any(x.strip() for x in row_vals):
+                out.append(" | ".join(clean_ws(x) for x in row_vals))
+    return "\n".join(out).strip()
+
+def extract_text_from_file(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext == ".txt":
+        return read_txt(p)
+    if ext == ".docx":
+        return read_docx(p)
+    if ext == ".pdf":
+        return read_pdf(p)
+    if ext == ".xlsx":
+        return read_xlsx(p)
+    return ""
+
+# =========================
+# BUILD KB CHUNKS
+# =========================
+def split_into_chunks(text: str) -> List[str]:
+    text = text or ""
+    # reduce docx-table noise ("A | B | C | ...")
+    text = re.sub(r"[|]{2,}", "|", text)
+    paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    chunks: List[str] = []
+    for p in paras:
+        if len(p) <= MAX_CHARS_PER_CHUNK:
+            chunks.append(p)
+        else:
+            for i in range(0, len(p), MAX_CHARS_PER_CHUNK):
+                chunks.append(p[i:i + MAX_CHARS_PER_CHUNK])
+        if len(chunks) >= MAX_CHUNKS_PER_DOC:
+            break
+    return chunks
+
+def build_kb_index(kb_dir: str) -> List[Tuple[str, str, str, str]]:
+    """
+    Returns list of chunks:
+      (fullpath, filename, chunk_id, chunk_text)
+    """
+    base = Path(kb_dir)
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"KB_DIR not found: {kb_dir}")
+
+    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    files = files[:MAX_DOCS]
+
+    chunks: List[Tuple[str, str, str, str]] = []
+    for p in sorted(files):
+        try:
+            txt = extract_text_from_file(p)
+            txt = (txt or "").strip()
+            if not txt:
+                continue
+            txt = txt[:MAX_CHARS_PER_DOC]
+            parts = split_into_chunks(txt)
+            for i, ch in enumerate(parts, start=1):
+                if not ch.strip():
+                    continue
+                cid = f"{p.name}#p{i}"
+                chunks.append((str(p), p.name, cid, ch))
+        except Exception:
+            continue
+    return chunks
+
+# =========================
+# RETRIEVAL
+# =========================
+def score_chunk(query: str, chunk_text: str, filename: str) -> float:
+    q_toks = tokenize(query)
+    if not q_toks:
+        return 0.0
+    t = chunk_text.lower()
+
+    overlap = 0
+    for tk in set(q_toks):
+        if tk in t:
+            overlap += 1
+
+    # anchor bonus for standards questions
+    anchor_bonus = 0
+    if re.search(r"(?i)\b(which|welche|welchem|in accordance|gemäß|standard|norm)\b", query):
+        if re.search(r"(?i)\b(MBN\s*\d{3,6}|DIN\s*\w+|ISO\s*\d{3,6}|VDA\s*\d+)\b", chunk_text):
+            anchor_bonus = 3
+
+    # requirement bonus
+    req_bonus = 0
+    if re.search(r"(?i)\b(must|shall|required|requirement|within|by|submit|complete|template|platform|muss|soll|erforder|anforder|innerhalb|bis|einreichen|ausfüllen|vorlage|plattform)\b", chunk_text):
+        req_bonus = 2
+
+    base = overlap + req_bonus + anchor_bonus
+    base += doc_priority_adjustment(filename) * 10.0
+    return float(base)
+
+def pick_best_chunks(kb_chunks: List[Tuple[str, str, str, str]], query: str, top_k: int = TOP_K_CHUNKS):
+    scored = []
+    for fullpath, fname, cid, ch in kb_chunks:
+        s = score_chunk(query, ch, fname)
+        if s > 0:
+            scored.append((s, fullpath, fname, cid, ch))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:top_k]
+
+def sources_used(best_chunks) -> List[str]:
+    """
+    Return doc titles + chunk ids, excluding email-like docs from dominating sources list.
+    But we still allow them if they are the only evidence.
+    """
+    srcs = []
+    for _, _, fname, cid, _ in best_chunks:
+        # Always include chunk id so you can trace
+        tag = f"{fname} ({cid})"
+        if tag not in srcs:
+            srcs.append(tag)
+    return srcs[:10]
+
+# =========================
+# REQUIREMENT EXTRACTION (core of Option 2)
+# =========================
+REQ_WORDS = re.compile(
+    r"(?i)\b(must|shall|required|requirement|within|by|submit|complete|provide|ensure|obliged|"
+    r"muss|soll|erforder|anforderung|innerhalb|bis|einreichen|ausfüllen|bereitstellen|sicherstellen|verpflichtet)\b"
+)
+
+TIME_WORDS = re.compile(r"(?i)\b(within\s+\d+|by\s+\d+|bis\s+\d+|innerhalb\s+\d+|weeks?|wochen?|tage?|days?)\b")
+PLATFORM_WORDS = re.compile(r"(?i)\b(platform|portal|template|vorlage|certus|supplierassurance|docmaster|prosource|smaragd|nx)\b")
+STANDARD_WORDS = re.compile(r"(?i)\b(MBN\s*\d{3,6}|DIN\s*\w+|ISO\s*\d{3,6}|VDA\s*\d+)\b")
+
+def split_sentences_loose(text: str) -> List[str]:
+    t = (text or "").replace("\n", " ")
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return []
+    # keep semi-colon splits too
+    parts = re.split(r"(?<=[\.\!\?])\s+|;\s+", t)
+    out = []
+    for p in parts:
+        p = p.strip(" -•\t\r\n")
+        if len(p) >= 20:
+            out.append(p)
+    return out
+
+def cleanup_pipe_noise(s: str) -> str:
+    """
+    Fix docx table lines that became: 'foo | foo | foo | bar'
+    Keep only meaningful unique tokens and remove obvious repetition.
+    """
+    s = clean_ws(s)
+    if "|" not in s:
+        return s
+    parts = [clean_ws(x) for x in s.split("|")]
+    # drop empties and exact duplicates while preserving order
+    seen = set()
+    keep = []
+    for p in parts:
+        key = p.lower()
+        if not p:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        keep.append(p)
+    # If still too many fragments, join first 2-3 plus last (often bilingual)
+    if len(keep) > 10:
+        keep = keep[:3] + (keep[-2:] if len(keep) >= 2 else [])
+    return " | ".join(keep)
+
+def classify_section(sentence: str) -> str:
+    s = sentence.lower()
+    # Copilot-like buckets (extend as you like)
+    if any(k in s for k in ["tier", "lieferkette", "supply chain", "transparen", "origin", "herkunft"]):
+        return "Supply Chain Transparency / Lieferkettentransparenz"
+    if any(k in s for k in ["saq", "supplierassurance", "self assessment", "questionnaire", "assessment"]):
+        return "Sustainability Assessment (SAQ)"
+    if any(k in s for k in ["ddq", "due diligence", "sorgfalt", "human rights", "menschenrecht"]):
+        return "Due Diligence / Sorgfaltspflichten"
+    if any(k in s for k in ["3tg", "cmrt", "rmap", "tin", "tantal", "tungsten", "gold"]):
+        return "3TG Materials / 3TG-Materialien"
+    if any(k in s for k in ["co2", "carbon", "emission", "grünstrom", "ppa", "renewable electricity"]):
+        return "CO₂ & Energy / CO₂ & Energie"
+    if any(k in s for k in ["recycled", "rezyklat", "sekundärmaterial", "secondary material"]):
+        return "Recycled / Secondary Material"
+    if any(k in s for k in ["documented", "documentation", "dokumentation", "smaragd", "nx", "3d record"]):
+        return "Documentation / Dokumentation"
+    return "General Requirements / Allgemeine Anforderungen"
+
+def extract_requirements(best_chunks, query: str) -> Dict[str, List[Tuple[str, str]]]:
+    """
+    Returns dict:
+      section -> list of (requirement_sentence, source_chunk_id)
+    Selects requirement-like sentences strongly related to query tokens.
+    """
+    q_tokens = set(tokenize(query))
+    extracted: Dict[str, List[Tuple[str, str]]] = {}
+
+    for _, _, fname, cid, ch in best_chunks:
+        # break chunk into sentences
+        for sent in split_sentences_loose(ch):
+            sent2 = cleanup_pipe_noise(sent)
+
+            # must look like a requirement OR contain standard reference for "which standard" questions
+            is_req = bool(REQ_WORDS.search(sent2)) or bool(TIME_WORDS.search(sent2)) or bool(PLATFORM_WORDS.search(sent2))
+            is_std = bool(STANDARD_WORDS.search(sent2))
+
+            if not (is_req or is_std):
+                continue
+
+            # must have some overlap with query to prevent random quoting
+            stoks = set(tokenize(sent2))
+            overlap = len(q_tokens & stoks)
+            if overlap < max(1, min(2, len(q_tokens)//6)):
+                # allow standards questions with standard refs even if overlap low
+                if not (is_std and re.search(r"(?i)\b(which|welche|welchem|standard|norm|gemäß|in accordance)\b", query)):
+                    continue
+
+            section = classify_section(sent2)
+            extracted.setdefault(section, []).append((sent2, cid))
+
+    # Deduplicate within each section (by lowercase sentence)
+    for sec in list(extracted.keys()):
+        seen = set()
+        uniq = []
+        for s, cid in extracted[sec]:
+            k = s.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append((s, cid))
+        extracted[sec] = uniq
+
+    return extracted
+
+def build_extraction_pack(extracted: Dict[str, List[Tuple[str, str]]], max_per_section: int = 4) -> str:
+    """
+    What we feed into the LLM: structured, clean, finite.
+    """
+    if not extracted:
+        return "(no extracted requirements)"
+
+    lines = []
+    for sec in extracted.keys():
+        items = extracted[sec][:max_per_section]
+        if not items:
+            continue
+        lines.append(f"## {sec}")
+        for s, cid in items:
+            lines.append(f"- {s}  [source: {cid}]")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+# =========================
+# LLM PROMPT (Copilot-like)
+# =========================
+def build_llm_prompt(question: str, greeting_name: str, signature_name: str, extraction_pack: str, sources: List[str]) -> str:
+    src_line = ", ".join(sources) if sources else "(none)"
+    q = clean_ws(question)
+
+    return f"""
+You are drafting a professional corporate email reply in procurement/sustainability.
+
+STRICT RULES:
+1) Use ONLY the extracted requirement pack below. Do not invent.
+2) If the pack is insufficient, ask 1 short clarifying question and stop.
+3) Output MUST be bilingual: German first, then a separator line '---', then English.
+4) Style must be like a strong Copilot draft: clear headings, numbered sections, concrete requirements.
+5) Do NOT include personal names, supplier names, emails, phones, IDs, addresses, internal org codes.
+6) At the end of EACH language section add: "Sources used: <doc titles + chunk ids>" using only the provided list.
+7) Also add a short "Kurzfassung:" / "Short summary:" at the end ONLY if the body has 4+ sections or >160 words.
+
+EMAIL FORMAT:
+- German starts: "Hallo {greeting_name},"
+- German ends: "Mit freundlichen Grüßen" + "{signature_name}"
+- English starts: "Hello {greeting_name},"
+- English ends: "Best regards," + "{signature_name}"
+
+Question:
+{q}
+
+Allowed sources list:
+{src_line}
+
+Extracted requirement pack:
+{extraction_pack}
+""".strip()
+
+def build_azure_client() -> AzureOpenAI:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise SystemExit("OPENAI_API_KEY env var missing (set it in notebook session or OS env).")
+    return AzureOpenAI(
+        api_key=key,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_version=AZURE_API_VERSION,
+    )
+
+def call_llm(client: AzureOpenAI, prompt: str) -> str:
+    # GPT-5.1 expects max_completion_tokens, not max_tokens
+    resp = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+        temperature=LLM_TEMPERATURE,
+        max_completion_tokens=LLM_MAX_COMPLETION_TOKENS,
+        messages=[
+            {"role": "system", "content": "Follow instructions exactly. Use only provided extracted pack."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+# =========================
+# OUTLOOK HELPERS
+# =========================
+def get_sender_smtp(mail) -> str:
+    try:
+        addr = (mail.SenderEmailAddress or "").lower()
+        if addr.startswith("/o="):
+            ex = mail.Sender.GetExchangeUser()
+            if ex:
+                return (ex.PrimarySmtpAddress or "").lower()
+        return addr
+    except Exception:
+        return (mail.SenderEmailAddress or "").lower()
+
+def get_target_folder():
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+    target_store = None
+    for st in ns.Stores:
+        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
+            target_store = st
+            break
+
+    if not target_store:
+        print("Available stores:")
+        for st in ns.Stores:
+            print(" -", st.DisplayName)
+        raise SystemExit("Target mailbox not found. Adjust TARGET_MAILBOX.")
+
+    inbox = target_store.GetDefaultFolder(6)  # Inbox
+    if WATCH_FOLDER_NAME.lower() == "inbox":
+        return ns, inbox, target_store.DisplayName, "Inbox"
+
+    for f in inbox.Folders:
+        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
+            return ns, f, target_store.DisplayName, f.Name
+
+    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox.")
+
+def add_processed_category(mail):
+    try:
+        cats = mail.Categories or ""
+        if PROCESSED_CATEGORY.lower() not in cats.lower():
+            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
+        mail.Save()
+    except Exception:
+        pass
+
+def mark_read(mail):
+    try:
+        mail.UnRead = False
+        mail.Save()
+    except Exception:
+        pass
+
+def get_account_for_mailbox(ns, mailbox_substring: str):
+    try:
+        for acc in ns.Session.Accounts:
+            smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
+            if mailbox_substring.lower() in smtp or smtp in mailbox_substring.lower():
+                return acc
+    except Exception:
+        pass
     return None
 
-def contains_risk(text: str) -> bool:
-    return bool(RISK_RE.search(text))
+def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
+    msg = ns.Application.CreateItem(0)
+    msg.To = to_addr
+    msg.Subject = f"Draft created (review needed): {orig_subject}"
+    msg.Body = (
+        "A draft reply has been created in Outlook.\n\n"
+        f"Original subject: {orig_subject}\n"
+        f"Requester: {requester_email}\n\n"
+        "Please review the draft carefully before sending.\n"
+    )
+    acc = get_account_for_mailbox(ns, from_mailbox)
+    if acc:
+        try:
+            msg.SendUsingAccount = acc
+        except Exception:
+            pass
+    msg.Send()
 
+def create_outlook_task_reminder(ns, subject: str, days: int = 2):
+    try:
+        task = ns.Application.CreateItem(3)  # olTaskItem
+        task.Subject = f"Reminder: review/send draft for '{subject}'"
+        task.DueDate = (datetime.now() + timedelta(days=days)).date()
+        task.ReminderSet = True
+        task.ReminderTime = datetime.now() + timedelta(days=days)
+        task.Body = "A draft reply was created by the bot. Please review and send it."
+        task.Save()
+    except Exception:
+        pass
 
-# ==========================================================
-# 6) CSV READ/WRITE
-# ==========================================================
-def read_scraped_links(rohstoff: str) -> list[str]:
-    fpath = SCRAPED_DIR / f"gescrapte_links_{rohstoff}.csv"
-    if not fpath.exists():
-        raise FileNotFoundError(f"Scrape CSV not found: {fpath}")
-    with fpath.open("r", encoding="utf-8-sig") as f:
-        rows = list(csv.reader(f, delimiter=";"))
-    return list({row[0].strip() for row in rows[1:] if row and row[0].strip()})
+# =========================
+# MAIN
+# =========================
+def run_bot_once():
+    time.sleep(STARTUP_DELAY_SEC)
 
-def write_analysis_csv(rohstoff: str, data_rows: list):
-    out_path = OUTPUT_DIR / f"analyse_tabelle_{rohstoff}.csv"
-    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f, delimiter=";")
-        w.writerow([
-            "link","Risikokategorien (A–M)",
-            "Arten der Menschenrechts-/Umweltschädigungen","Begründung",
-            "Jahr(e)","Land/Länder","Ort(e)",
-            "Stufe der Rohstoffgewinnung","Involvierte Unternehmen",
-            "Betroffene Personengruppen/Ökosysteme",
-            "Mindestzahl der betroffenen Personen",
-            "Begründung Mindestzahl","Schwere","Begründung Schwere"
-        ])
-        for row in data_rows:
-            w.writerow(row)
-    print(f"✅ Analysis written to: {out_path}")
+    print("Building KB index from:", KB_DIR)
+    kb_chunks = build_kb_index(KB_DIR)
+    print("KB chunks:", len(kb_chunks))
 
+    client = build_azure_client()
 
-# ==========================================================
-# 7) SIMPLE ANALYSIS (rule-based)
-# ==========================================================
-def analyse_text(text: str) -> list[str]:
-    # risk categories & harm description
-    risks = ", ".join(set(m.group(0) for m in RISK_RE.finditer(text)))
-    harms = risks or "Not in Text"
+    ns, folder, store_name, folder_name = get_target_folder()
+    print(f"Mailbox={store_name} | Folder={folder_name}")
 
-    # simple justification
-    justific = "Article mentions relevant harm context." if risks else "No harm context found."
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True)
 
-    year = extract_pub_date(text, "")
+    drafted = 0
+    checked = 0
 
-    countries = ", ".join(
-        sorted(set(c for c in re.findall(r"\b([A-Z][a-z]+)\b", text) if len(c) > 2))
-    ) or "Not in Text"
+    signature_name = safe_firstname_from_email(TARGET_MAILBOX)
 
-    return [
-        risks or "Not in Text",
-        harms,
-        justific,
-        str(year) if year else "Not in Text",
-        countries,
-        "Not in Text", "Not in Text", "Not in Text",
-        "Not in Text","Not in Text","Not in Text","Not in Text"
-    ]
-
-
-# ==========================================================
-# 8) MAIN
-# ==========================================================
-if __name__ == "__main__":
-    rawm = lese_einstellungen()
-    print(f"Raw material filter: {rawm}")
-
-    links = read_scraped_links(rohst)
-    print(f"Links found: {len(links)}")
-
-    analysed_rows = []
-
-    for idx, link in enumerate(links, start=1):
-        print(f"[{idx}/{len(links)}] analysing: {link}")
+    for mail in items:
+        checked += 1
+        if checked > SCAN_LIMIT:
+            break
+        if drafted >= PROCESS_PER_RUN:
+            break
 
         try:
-            # download text
-            if link.lower().endswith(".pdf"):
-                text = extract_pdf_text(link)
-            else:
-                text = extract_html_text(link)
-
-            # apply strict filters
-            if not material_context(text, rawm):
-                print("  ⛔ skip (material not in proper context)")
+            if getattr(mail, "Class", None) != 43:
                 continue
 
-            year = extract_pub_date(text, link)
-            if not year or year < 2021:
-                print("  ⛔ skip (no recent publication)")
+            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
                 continue
 
-            if not contains_risk(text):
-                print("  ⛔ skip (no risk context)")
+            if REQUIRE_UNREAD and not mail.UnRead:
                 continue
 
-            # rule-based extraction
-            row_data = analyse_text(text)
-            analysed_rows.append([link] + row_data)
-            print("  ✅ analysed")
+            subject = mail.Subject or ""
+            if not strict_subject_ok(subject):
+                continue
+
+            sender = get_sender_smtp(mail)
+            greeting_name = safe_firstname_from_email(sender)
+
+            body_text = clean_html_to_text(mail.HTMLBody or "")
+            question = re.split(r"(?i)\b(von:|from:|gesendet:|sent:|-----original message-----)\b", body_text)[0].strip()
+            if not question:
+                question = body_text.strip()
+
+            # Retrieve top chunks
+            best = pick_best_chunks(kb_chunks, query=question, top_k=TOP_K_CHUNKS)
+
+            # Extract requirements and build pack
+            extracted = extract_requirements(best, query=question)
+            extraction_pack = build_extraction_pack(extracted, max_per_section=4)
+
+            # Sources list (doc titles + chunk ids)
+            srcs = sources_used(best)
+
+            prompt = build_llm_prompt(
+                question=question,
+                greeting_name=greeting_name,
+                signature_name=signature_name,
+                extraction_pack=extraction_pack,
+                sources=srcs,
+            )
+
+            reply_text = call_llm(client, prompt)
+
+            reply = mail.Reply()
+            reply.HTMLBody = f"<div>{format_outlook_html(reply_text)}</div><hr>" + reply.HTMLBody
+            reply.Save()
+
+            mark_read(mail)
+            add_processed_category(mail)
+
+            drafted += 1
+            print("Draft created for:", subject)
+
+            if SELF_NOTIFY:
+                send_self_notification(ns, TARGET_MAILBOX, SELF_NOTIFY_TO, subject, sender)
+
+            if CREATE_REMINDER_TASK:
+                create_outlook_task_reminder(ns, subject=subject, days=REMINDER_DAYS)
 
         except Exception as e:
-            print("  ❌ failed:", e)
+            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", repr(e))
 
-    write_analysis_csv(rohst, analysed_rows)
+    print(f"Done. Checked={checked}, Drafted={drafted}")
+
+# Run in notebook:
+# run_bot_once()
