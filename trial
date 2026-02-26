@@ -1,514 +1,825 @@
 # -*- coding: utf-8 -*-
-# ============================================================
-# KI Risiko – HIGH ACCURACY material-aware HR/ENV scraper
-# Outputs: gescrapte_links_<rohst>.csv
-#
-# Reads:
-#   Einstellungen_Analyse.csv   (rohst/rawm/date)
-#   Bekannte_Seiten.csv        (your sites)
-#   Schlagwörter.csv           (optional extra keywords)
-#
-# Writes:
-#   gescrapte_links_<rohst>.csv with columns:
-#   url;datum_raw;datum_iso;site;query;title;snippet
-#
-# Key behavior:
-# - Deep discovery: MAX_DDG_PAGES=5, QUERIES_PER_SITE=10
-# - High accuracy: filters out non-material context (e.g., "Copperfield")
-# - PDFs are allowed (do PDF parsing in analysis step)
-# - Prints timestamp + keeps DDG date if present
-# ============================================================
+"""
+OUTLOOK DRAFT BOT (LLM + GROUNDED RAG, Copilot-style output) — Notebook-safe + VSCode-friendly (Python 3.14)
 
-import csv
-import time
+Goal
+- Draft reply for emails with subject exactly "bot".
+- Grounded RAG over KB documents only.
+- Prefer real docs (standards/policies/specs) first; AW_/RE_ etc are secondary.
+- Produce Copilot-like structure:
+  - numbered sections with bilingual headings (EN / DE),
+  - inline citations [file#pX],
+  - bilingual output (DE then --- then EN),
+  - short summary only when answer is long.
+
+Key fixes vs your prior working version
+- "Coverage" extraction: we extract many requirement/definition sentences first, then ask LLM to synthesize.
+- "Standards" anchor boost: prioritizes MBN/DIN/ISO/VDA sentences when user asks "which standard / gemäß".
+- Avoid "docs not enough" when the answer exists: extraction tries harder before giving up.
+- Uses max_completion_tokens (not max_tokens) for GPT-5.1.
+
+Dependencies
+- pywin32, openai
+Optional KB parsers:
+- python-docx, pdfplumber or pypdf, openpyxl, scikit-learn (improves retrieval)
+"""
+
+from __future__ import annotations
+
+import os
 import re
-import random
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote_plus, urlparse
-from datetime import datetime
+from datetime import datetime, timedelta
+from html import escape
+from typing import List, Tuple, Dict, Optional
 
-import dateparser
-
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+import win32com.client as win32
+from openai import AzureOpenAI
 
 
 # =========================
-# 1) PATHS / CONFIG
+# CONFIG — EDIT THESE
 # =========================
-PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
-SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
-SCRAPED_DIR = PROJECT_ROOT / "gescrapte_Artikel-Links"
-SCRAPED_DIR.mkdir(parents=True, exist_ok=True)
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"
+WATCH_FOLDER_NAME = "Inbox"
+STRICT_SUBJECT = "bot"
 
-EINSTELLUNGEN_CSV = SETTINGS_DIR / "Einstellungen_Analyse.csv"
-BEKANNTE_SEITEN_CSV = SETTINGS_DIR / "Bekannte_Seiten.csv"
-SCHLAGWORT_CSV = SETTINGS_DIR / "Schlagwörter.csv"
+KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
 
-HEADLESS = False
+REQUIRE_UNREAD = True
+PROCESS_PER_RUN = 3
+SCAN_LIMIT = 250
+STARTUP_DELAY_SEC = 1
 
-# Deep discovery
-MAX_DDG_PAGES = 5
-QUERIES_PER_SITE = 10
+PROCESSED_CATEGORY = "Drafted-LLM-CopilotStyle"
 
-# Fallback (keep small; high accuracy prefers fewer but better)
-MIN_AFTER_SITES = 5
-FALLBACK_TARGET_TOTAL = 20
+SELF_NOTIFY = True
+SELF_NOTIFY_TO = TARGET_MAILBOX
+CREATE_REMINDER_TASK = True
+REMINDER_DAYS = 2
 
-PAUSE_BETWEEN_QUERIES_SEC = (1.2, 2.5)
-PAUSE_BETWEEN_SITES_SEC = (1.5, 3.0)
+# KB reading
+SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
+MAX_DOCS = 5000
+MAX_CHARS_PER_DOC = 220_000
+MAX_CHARS_PER_CHUNK = 1400
+MAX_CHUNKS_PER_DOC = 180
 
+# De-prioritize mail-chain-like documents (still usable as secondary)
+MAILY_PREFIXES = ("aw_", "re_", "fw_", "wg_")
+MAILY_HINTS = ("subject", "mail", "email", "outlook", ".msg", "conversation")
 
-# =========================
-# 2) RISK TERMS (tight)
-# =========================
-RISK_PATTERNS = [
-    r"\bhuman rights?\b",
-    r"\bviolat(e|ed|ion|ions)\b",
-    r"\babuse(s|d)?\b",
-    r"\bforced\s+labou?r\b",
-    r"\bchild\s+labou?r\b",
-    r"\bmodern\s+slavery\b",
-    r"\btraffick(ing|ed)?\b",
-    r"\bdiscriminat(ion|e|ed)\b",
-    r"\bpollut(ion|ed|ing)\b",
-    r"\bcontaminat(e|ed|ion)\b",
-    r"\btoxic\b",
-    r"\bspill(s|ed)?\b",
-    r"\btailing(s)?\b|\btailings dam\b",
-    r"\bdeforest(ation|ed|ing)\b",
-    r"\blawsuit(s)?\b|\bsued\b",
-    r"\balleg(ation|ed|edly)\b",
-    r"\binvestigat(e|ed|ion|ions)\b",
-    r"\bprotest(s|ed|ing)?\b",
-]
-RISK_RE = re.compile("|".join(RISK_PATTERNS), flags=re.IGNORECASE)
+# Exclude maily docs from “Sources used” unless we had to rely on them
+EXCLUDE_AS_SOURCES_PREFIXES = ("aw_", "re_", "fw_", "wg_")
 
-# context terms to ensure we are talking about materials/metals/mining chain
-CONTEXT_TERMS = [
-    "mine", "mining", "extraction", "extractive", "ore",
-    "refin", "refining", "smelt", "smelting", "concentrate",
-    "processing", "beneficiation", "tailings", "dam",
-    "supply chain", "upstream", "downstream",
-    "metals", "mineral", "minerals", "raw material",
-    "pollut", "contamin", "toxic", "spill",
-    "lawsuit", "investigation", "allegation", "violation", "abuse",
-]
+# LLM settings (GenAI-Nexus / Azure-style)
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"  # NO /apikey/
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-5.1"
+
+LLM_TEMPERATURE = 0.15
+LLM_MAX_COMPLETION_TOKENS = 900  # GPT-5.x: use max_completion_tokens
 
 
 # =========================
-# 3) EXTRA SITES (your list)
+# Optional TF-IDF ranking (recommended)
 # =========================
-TOP_EXTRA_SITES = [
-    "reuters.com",
-    "apnews.com",
-    "bbc.com",
-    "dw.com",
-    "aljazeera.com",
-    "nytimes.com",
-    "washingtonpost.com",
-    "zeit.de",
-    "ft.com",
-    "rfa.org",
-    "spiegel.de",
-    "cnn.com",
-]
+def _try_import_sklearn():
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
+        from sklearn.metrics.pairwise import cosine_similarity       # type: ignore
+        return TfidfVectorizer, cosine_similarity
+    except Exception:
+        return None, None
+
+TFIDF_VECTORIZER, COSINE_SIM = _try_import_sklearn()
 
 
 # =========================
-# 4) READ SETTINGS
+# BASIC TEXT UTILS
 # =========================
-rohst = rawm = max_datum_str = None
+STOPWORDS = set("""
+the a an and or to of in on for with without from by at is are was were be been being
+der die das und oder zu von im in am an auf für mit ohne aus bei ist sind war waren
+""".split())
 
-def lese_einstellungen():
-    global rohst, rawm, max_datum_str
-    if not EINSTELLUNGEN_CSV.exists():
-        raise FileNotFoundError(f"Settings file not found: {EINSTELLUNGEN_CSV}")
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
 
-    with EINSTELLUNGEN_CSV.open("r", encoding="utf-8-sig", newline="") as f:
-        rows = list(csv.reader(f, delimiter=","))
+def strict_subject_ok(subject: str) -> bool:
+    return (subject or "").strip().casefold() == STRICT_SUBJECT.casefold()
 
-    def get_row(idx, default=""):
-        if len(rows) > idx and len(rows[idx]) > 0:
-            return (rows[idx][0] or "").strip()
-        return default
+def clean_html_to_text(html: str) -> str:
+    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
+    return clean_ws(txt)
 
-    rohst = get_row(5, "Stahl")
-    rawm = get_row(8, "Steel")
-    max_datum_str = get_row(11, "20.11.2020")
+def safe_firstname_from_email(email: str) -> str:
+    email = (email or "").strip()
+    local = email.split("@", 1)[0] if "@" in email else email
+    first = local.split(".", 1)[0].strip()
+    if not first:
+        return "Colleague"
+    return first[:1].upper() + first[1:]
 
-    max_date = dateparser.parse(max_datum_str, languages=["de", "en"]) if max_datum_str else None
-    return max_date.date() if max_date else None
-
-
-# =========================
-# 5) LOAD CSV LISTS
-# =========================
-def lese_einfache_liste(pfad: Path, delimiter=",") -> list[str]:
-    if not pfad.exists():
-        return []
-    items = []
-    with pfad.open("r", encoding="utf-8-sig", newline="") as f:
-        r = csv.reader(f, delimiter=delimiter)
-        for row in r:
-            for cell in row:
-                v = (cell or "").strip()
-                if v:
-                    items.append(v.lower())
-    # uniq keep order
-    seen = set()
+def format_outlook_html(text: str) -> str:
+    text = (text or "").replace("\r\n", "\n").strip()
+    if not text:
+        return "<p></p>"
+    blocks = re.split(r"\n\s*\n", text)
     out = []
-    for x in items:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
+    for block in blocks:
+        lines = [ln.rstrip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        if all(ln.lstrip().startswith("- ") for ln in lines):
+            out.append("<ul>")
+            for ln in lines:
+                ln2 = ln.lstrip()[2:].strip()
+                out.append(f"<li>{escape(ln2)}</li>")
+            out.append("</ul>")
+        else:
+            out.append("<p>" + "<br>".join(escape(ln.strip()) for ln in lines) + "</p>")
+    return "\n".join(out)
+
+def tokenize(s: str) -> List[str]:
+    toks = re.split(r"[^a-zA-Z0-9ÄÖÜäöüß]+", (s or "").lower())
+    return [t for t in toks if t and t not in STOPWORDS and len(t) >= 3]
+
+
+# =========================
+# VERY LIGHT REDACTION (keep minimal; avoid killing useful content)
+# =========================
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+PHONE_RE = re.compile(r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d")
+URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
+
+def redact_light(text: str) -> str:
+    if not text:
+        return ""
+    t = text
+    t = EMAIL_RE.sub("", t)
+    t = PHONE_RE.sub("", t)
+    t = URL_RE.sub("", t)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    return t.strip()
+
+
+# =========================
+# KB READERS (skip missing libs)
+# =========================
+def read_txt(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="ignore")
+
+def read_docx(p: Path) -> str:
+    try:
+        from docx import Document as DocxDocument  # type: ignore
+    except Exception:
+        return ""
+    doc = DocxDocument(str(p))
+    paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
+    table_lines = []
+    for t in doc.tables:
+        for row in t.rows:
+            cells = [clean_ws(c.text) for c in row.cells]
+            if any(cells):
+                table_lines.append(" | ".join(cells))
+    return (paras + "\n" + "\n".join(table_lines)).strip()
+
+def read_pdf(p: Path) -> str:
+    try:
+        import pdfplumber  # type: ignore
+        out = []
+        with pdfplumber.open(str(p)) as pdf:
+            for page in pdf.pages:
+                out.append(page.extract_text() or "")
+        return "\n".join(out).strip()
+    except Exception:
+        pass
+    try:
+        from pypdf import PdfReader  # type: ignore
+        r = PdfReader(str(p))
+        out = []
+        for pg in r.pages:
+            try:
+                out.append(pg.extract_text() or "")
+            except Exception:
+                pass
+        return "\n".join(out).strip()
+    except Exception:
+        return ""
+
+def read_xlsx(p: Path) -> str:
+    try:
+        import openpyxl  # type: ignore
+    except Exception:
+        return ""
+    wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+    out = []
+    for ws in wb.worksheets:
+        out.append(f"Sheet: {ws.title}")
+        max_rows = min(ws.max_row or 0, 200)
+        max_cols = min(ws.max_column or 0, 40)
+        for r in range(1, max_rows + 1):
+            row_vals = []
+            for c in range(1, max_cols + 1):
+                v = ws.cell(row=r, column=c).value
+                row_vals.append("" if v is None else str(v))
+            if any(x.strip() for x in row_vals):
+                out.append(" | ".join(clean_ws(x) for x in row_vals))
+    return "\n".join(out).strip()
+
+def extract_text_from_file(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext == ".txt":
+        return read_txt(p)
+    if ext == ".docx":
+        return read_docx(p)
+    if ext == ".pdf":
+        return read_pdf(p)
+    if ext == ".xlsx":
+        return read_xlsx(p)
+    return ""
+
+
+# =========================
+# BUILD KB INDEX (docs -> chunks)
+# =========================
+def is_maily_filename(p: Path) -> bool:
+    name = (p.name or "").lower()
+    stem = (p.stem or "").lower()
+    if stem.startswith("~$"):
+        return True
+    if stem.startswith(MAILY_PREFIXES):
+        return True
+    if any(h in name for h in MAILY_HINTS):
+        return True
+    return False
+
+def split_into_chunks(text: str) -> List[str]:
+    text = text or ""
+    # normalize repeated pipes from docx tables
+    text = re.sub(r"[|]{2,}", "|", text)
+    paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    chunks: List[str] = []
+    for p in paras:
+        if len(p) <= MAX_CHARS_PER_CHUNK:
+            chunks.append(p)
+        else:
+            for i in range(0, len(p), MAX_CHARS_PER_CHUNK):
+                chunks.append(p[i:i + MAX_CHARS_PER_CHUNK])
+        if len(chunks) >= MAX_CHUNKS_PER_DOC:
+            break
+    return chunks
+
+def doc_priority_adjustment(filename: str) -> float:
+    fn = (filename or "").lower()
+    score = 0.0
+    if fn.startswith(MAILY_PREFIXES):
+        score -= 0.70
+    if any(h in fn for h in MAILY_HINTS):
+        score -= 0.25
+    if re.search(r"(?i)\b(mbn|din|iso|vda|standard|policy|guideline|kapitel|chapter|requirements|norm)\b", fn):
+        score += 0.25
+    return score
+
+def build_kb_index(kb_dir: str) -> List[Tuple[str, str, str, bool, str]]:
+    """
+    Returns list of chunks:
+      (source_fullpath, filename, chunk_text, is_maily, chunk_id)
+    chunk_id = filename#pX
+    """
+    base = Path(kb_dir)
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"KB_DIR not found: {kb_dir}")
+
+    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    files = files[:MAX_DOCS]
+
+    chunks: List[Tuple[str, str, str, bool, str]] = []
+    for p in sorted(files):
+        try:
+            txt = extract_text_from_file(p)
+            txt = (txt or "").strip()
+            if not txt:
+                continue
+            txt = txt[:MAX_CHARS_PER_DOC]
+            maily = is_maily_filename(p)
+            parts = split_into_chunks(txt)
+            for i, ch in enumerate(parts, start=1):
+                ch2 = ch.strip()
+                if not ch2:
+                    continue
+                cid = f"{p.name}#p{i}"
+                chunks.append((str(p), p.name, ch2, maily, cid))
+        except Exception:
+            continue
+    return chunks
+
+
+# =========================
+# Retrieval (Doc ranking + Chunk ranking)
+# =========================
+def rank_docs(kb_chunks: List[Tuple[str, str, str, bool, str]], query: str, include_maily: bool) -> List[Tuple[float, str]]:
+    """
+    Return list of (score, filename) ranked.
+    """
+    query = clean_ws(query)
+    if not query:
+        return []
+
+    # group by filename
+    doc_text: Dict[str, List[str]] = {}
+    for _fp, fname, ch, is_maily, _cid in kb_chunks:
+        if (not include_maily) and is_maily:
+            continue
+        doc_text.setdefault(fname, []).append(ch)
+
+    filenames = list(doc_text.keys())
+    texts = ["\n\n".join(doc_text[f])[:60_000] for f in filenames]
+
+    scored: List[Tuple[float, str]] = []
+
+    if TFIDF_VECTORIZER and COSINE_SIM and texts:
+        vec = TFIDF_VECTORIZER(min_df=1, ngram_range=(1, 2), max_features=80_000)
+        X = vec.fit_transform(texts)
+        qv = vec.transform([query])
+        sims = COSINE_SIM(qv, X).ravel()
+        for fname, sim in zip(filenames, sims):
+            score = float(sim) + doc_priority_adjustment(fname)
+            scored.append((score, fname))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored
+
+    q_toks = set(tokenize(query))
+    for fname, t in zip(filenames, texts):
+        tl = t.lower()
+        overlap = sum(1 for tk in q_toks if tk in tl)
+        base = overlap / max(1, len(q_toks))
+        score = float(base) + doc_priority_adjustment(fname)
+        scored.append((score, fname))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored
+
+def rank_chunks_within_docs(
+    kb_chunks: List[Tuple[str, str, str, bool, str]],
+    query: str,
+    top_doc_filenames: List[str],
+    top_k: int
+) -> List[Tuple[float, str, str, bool, str]]:
+    """
+    Returns ranked chunks: (score, filename, chunk_text, is_maily, chunk_id)
+    """
+    q = clean_ws(query)
+    if not q:
+        return []
+    docset = set(top_doc_filenames)
+    pool = [(fname, ch, is_maily, cid) for _fp, fname, ch, is_maily, cid in kb_chunks if fname in docset]
+    if not pool:
+        return []
+
+    # anchor boost for "which standard" questions
+    want_standard = any(k in q.lower() for k in ["which standard", "welche norm", "welchem standard", "gemäß", "in accordance", "according to"])
+    anchor_re = re.compile(r"(?i)\b(MBN\s*\d{3,6}|DIN\s*[A-Z0-9\-]+|ISO\s*\d{3,6}|VDA\s*\d+)\b")
+
+    scored = []
+    q_toks = set(tokenize(q))
+    for fname, ch, is_maily, cid in pool:
+        tl = ch.lower()
+        overlap = sum(1 for tk in q_toks if tk in tl)
+        req_bonus = 2 if re.search(r"(?i)\b(must|shall|required|requirement|muss|soll|erforder|anforder|nachweis|beleg)\b", ch) else 0
+        base = overlap + req_bonus
+        base += doc_priority_adjustment(fname) * 10.0
+        if is_maily:
+            base -= 1.0
+        if want_standard and anchor_re.search(ch):
+            base += 8.0
+        scored.append((float(base), fname, ch, is_maily, cid))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:top_k]
+
+def retrieve_best_chunks(kb_chunks, query: str, chunk_top_k: int = 80) -> Tuple[List[Tuple[float, str, str, bool, str]], bool]:
+    """
+    Two-pass:
+    A) docs excluding maily
+    B) include maily if A is weak
+    Returns (chunks, used_maily_flag)
+    """
+    # Pass A
+    docs_A = rank_docs(kb_chunks, query, include_maily=False)
+    top_docs_A = [fname for _s, fname in docs_A[:DOC_TOP_K]]
+    chunks_A = rank_chunks_within_docs(kb_chunks, query, top_docs_A, top_k=chunk_top_k)
+    if len(chunks_A) >= 6:
+        return chunks_A, False
+
+    # Pass B (include maily)
+    docs_B = rank_docs(kb_chunks, query, include_maily=True)
+    top_docs_B = [fname for _s, fname in docs_B[:max(DOC_TOP_K, 25)]]
+    chunks_B = rank_chunks_within_docs(kb_chunks, query, top_docs_B, top_k=max(chunk_top_k, 120))
+    return chunks_B, True
+
+
+# =========================
+# “Coverage extraction” (Copilot-like): extract ALL relevant requirement points with citations
+# =========================
+REQ_CUES = re.compile(
+    r"(?i)\b("
+    r"must|shall|required|requirement|need to|has to|"
+    r"muss|soll|erforderlich|anforder|ist\s+zu|sind\s+zu|"
+    r"verpflichtet|ist\s+verpflichtet|sicherzustellen|nachweis|beleg|"
+    r"gemäß|in\s+accordance\s+with|according\s+to"
+    r")\b"
+)
+
+ANCHOR_STD = re.compile(r"(?i)\b(MBN\s*\d{3,6}|DIN\s*[A-Z0-9\-]+|ISO\s*\d{3,6}|VDA\s*\d+)\b")
+
+def sentence_split(text: str) -> List[str]:
+    txt = re.sub(r"\s+", " ", text or "").strip()
+    if not txt:
+        return []
+    parts = re.split(r"(?<=[\.\!\?])\s+", txt)
+    out = [p.strip(" -•\t\r\n") for p in parts if len(p.strip()) >= 12]
+    return out
+
+def extract_points_with_citations(
+    ranked_chunks: List[Tuple[float, str, str, bool, str]],
+    query: str,
+    max_points: int = 12
+) -> List[Tuple[str, str]]:
+    """
+    Returns list of (citation_tag, point_sentence)
+      citation_tag like: [file.docx#p12]
+    """
+    q = clean_ws(query)
+    qt = set(tokenize(q))
+    want_standard = any(k in q.lower() for k in ["which standard", "welche norm", "welchem standard", "gemäß", "in accordance", "according to"])
+
+    pts: List[Tuple[int, str, str]] = []  # (priority, citation, sentence)
+    seen = set()
+
+    for score, fname, ch, is_maily, cid in ranked_chunks[:120]:
+        for sent in sentence_split(ch):
+            s = clean_ws(sent)
+            if not s:
+                continue
+
+            # overlap gate (prevents random quoting)
+            st = set(tokenize(s))
+            overlap = len(qt & st)
+            min_ov = 1 if len(qt) <= 6 else 2
+            if overlap < min_ov and not want_standard:
+                continue
+
+            has_req = bool(REQ_CUES.search(s))
+            has_std = bool(ANCHOR_STD.search(s))
+
+            if not (has_req or has_std):
+                continue
+
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+
+            pr = overlap
+            if want_standard and has_std:
+                pr += 50
+            if has_std:
+                pr += 15
+            if has_req:
+                pr += 10
+            if (not is_maily):
+                pr += 3  # prefer real docs
+            citation = f"[{cid}]"
+            pts.append((pr, citation, s))
+
+    pts.sort(key=lambda x: x[0], reverse=True)
+
+    out: List[Tuple[str, str]] = []
+    for pr, cit, s in pts:
+        out.append((cit, s))
+        if len(out) >= max_points:
+            break
+
     return out
 
 
-# =========================
-# 6) SELENIUM DRIVER
-# =========================
-def make_driver() -> webdriver.Chrome:
-    opts = Options()
-    if HEADLESS:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--enable-javascript")
-    opts.add_argument("--start-maximized")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    return webdriver.Chrome(options=opts)
-
-
-# =========================
-# 7) DDG SEARCH + SCRAPE
-# =========================
-def ddg_search_url(query: str) -> str:
-    return "https://duckduckgo.com/?q=" + quote_plus(query) + "&kp=1&ia=web"
-
-def scrape_ddg_results(driver: webdriver.Chrome, search_url: str, max_pages: int = MAX_DDG_PAGES) -> list[dict]:
-    items = []
-    try:
-        driver.get(search_url)
-    except Exception:
-        return items
-
-    pages_seen = 0
-    while pages_seen < max_pages:
-        time.sleep(2.2)
-
-        try:
-            WebDriverWait(driver, 8).until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, 'article[data-testid="result"]'))
-            )
-        except Exception:
-            break
-
-        articles = driver.find_elements(By.CSS_SELECTOR, 'article[data-testid="result"]')
-        for art in articles:
-            try:
-                link_el = art.find_element(By.CSS_SELECTOR, "a[data-testid='result-title-a']")
-                url = link_el.get_attribute("href") or ""
-                title = (link_el.text or "").strip()
-                if not url or "duckduckgo.com" in url:
-                    continue
-            except Exception:
-                continue
-
-            snippet = ""
-            try:
-                snippet = (art.find_element(By.CSS_SELECTOR, "div[data-testid='result-snippet']").text or "").strip()
-            except Exception:
-                pass
-
-            date_txt = ""
-            try:
-                date_txt = (art.find_element(By.CSS_SELECTOR, "span.MILR5XIVy9h75WrLvKiq").text or "").strip()
-            except Exception:
-                pass
-
-            items.append({"url": url, "title": title, "snippet": snippet, "date_txt": date_txt})
-
-        try:
-            more_btn = WebDriverWait(driver, 3).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "#more-results"))
-            )
-            driver.execute_script("arguments[0].scrollIntoView(true);", more_btn)
-            time.sleep(0.8)
-            more_btn.click()
-            pages_seen += 1
-        except Exception:
-            break
-
-    return items
-
-
-# =========================
-# 8) FILTERS (HIGH ACCURACY)
-# =========================
-SOCIAL_BAD = [
-    "facebook.com", "instagram.com", "tiktok.com", "youtube.com",
-    "twitter.com", "x.com", "reddit.com",
-]
-ALLOW_LIST = ["linkedin.com"]
-
-BAD_PATH_HINTS = [
-    "/jobs", "/careers", "/career", "/job/", "/vacancies", "/vacancy",
-    "/investor", "/investors", "/ir/", "/financial", "/finance", "/stock",
-    "/press-release", "/pressreleases", "/media-kit",
-]
-
-def is_bad_social_domain(domain: str) -> bool:
-    d = domain.lower()
-    if any(a in d for a in ALLOW_LIST):
-        return False
-    return any(b in d for b in SOCIAL_BAD)
-
-def is_bad_path(url: str) -> bool:
-    u = url.lower()
-    return any(h in u for h in BAD_PATH_HINTS)
-
-def date_ok(date_txt: str, min_date) -> bool:
-    if not min_date or not date_txt:
-        return True
-    dt = dateparser.parse(date_txt, languages=["de", "en"])
-    if not dt:
-        return True
-    return dt.date() >= min_date
-
-def parse_ddg_date_to_iso(date_txt: str) -> str:
-    if not date_txt:
-        return ""
-    dt = dateparser.parse(date_txt, languages=["de", "en"])
-    if not dt:
-        return ""
-    return dt.date().isoformat()
-
-def material_word_match(text: str, material: str) -> bool:
-    if not text or not material:
-        return False
-    return bool(re.search(rf"\b{re.escape(material.lower())}\b", text.lower()))
-
-def material_context_match(text: str, material: str) -> bool:
-    """Material as whole word + at least one mining/processing/risk context term nearby."""
-    if not material_word_match(text, material):
-        return False
-    t = text.lower()
-    for kw in CONTEXT_TERMS:
-        if kw in t:
-            return True
-    return False
-
-def risk_snippet(title: str, snippet: str) -> bool:
-    return bool(RISK_RE.search(f"{title} {snippet}"))
-
-
-# =========================
-# 9) QUERY BUILDERS
-# =========================
-def build_site_queries(domain: str, material: str, schlagwoerter: list[str]) -> list[str]:
-    base = [
-        "mining", "extraction", "smelting", "refining",
-        "human rights", "forced labor", "child labor",
-        "pollution", "contamination", "toxic", "spill",
-        "lawsuit", "allegations", "investigation",
-        "supply chain",
-    ]
-
-    kws = schlagwoerter[:8] if schlagwoerter else []
-    queries = []
-
-    # high-precision combos
-    combos = [
-        ("mining",),
-        ("extraction",),
-        ("refining",),
-        ("smelting",),
-        ("human rights",),
-        ("pollution",),
-        ("lawsuit",),
-        ("supply chain",),
-    ]
-    for c in combos:
-        queries.append(f"site:{domain} {material} " + " ".join(c))
-
-    for k in kws[:4]:
-        queries.append(f"site:{domain} {material} {k.replace('+',' ')}")
-
-    # last: broad material-only within site
-    queries.append(f"site:{domain} {material}")
-
-    # uniq keep order and cap
-    seen = set()
-    out = []
-    for q in queries:
-        q = re.sub(r'[\u201C\u201D\"\']', "", q).strip()
-        if q and q not in seen:
-            seen.add(q)
-            out.append(q)
-    return out[:QUERIES_PER_SITE]
-
-def build_fallback_queries(material: str) -> list[str]:
-    return [
-        f"{material} mining human rights violation",
-        f"{material} mining pollution contamination",
-        f"{material} smelting toxic emissions",
-        f"{material} refining wastewater",
-        f"{material} lawsuit environmental damage",
-        f"{material} forced labor supply chain",
-    ]
-
-
-# =========================
-# 10) MAIN
-# =========================
-if __name__ == "__main__":
-    min_date = lese_einstellungen()
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] SETTINGS: rohst={rohst} | rawm={rawm} | min_date={max_datum_str}")
-
-    seiten_user = lese_einfache_liste(BEKANNTE_SEITEN_CSV, delimiter=",")
-    schlagwoerter = lese_einfache_liste(SCHLAGWORT_CSV, delimiter=",")
-
-    if not seiten_user:
-        raise FileNotFoundError(f"Bekannte_Seiten.csv is empty or missing: {BEKANNTE_SEITEN_CSV}")
-
-    merged_sites = []
-    seen_sites = set()
-    for s in seiten_user + TOP_EXTRA_SITES:
-        s = (s or "").strip().lower()
-        if not s:
+def build_sources_used(ranked_chunks, used_maily: bool, max_sources: int = 10) -> List[str]:
+    srcs = []
+    for _score, fname, _ch, is_maily, cid in ranked_chunks[:60]:
+        if (not used_maily) and fname.lower().startswith(EXCLUDE_AS_SOURCES_PREFIXES):
             continue
-        s = s[4:] if s.startswith("www.") else s
-        if s not in seen_sites:
-            seen_sites.add(s)
-            merged_sites.append(s)
+        entry = f"{fname} ({cid})"
+        if entry not in srcs:
+            srcs.append(entry)
+        if len(srcs) >= max_sources:
+            break
+    return srcs
 
-    out_path = SCRAPED_DIR / f"gescrapte_links_{rohst}.csv"
 
-    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
-        csv.writer(f, delimiter=";").writerow(
-            ["url", "datum_raw", "datum_iso", "site", "query", "title", "snippet"]
-        )
+# =========================
+# LLM (Copilot-like structured generation)
+# =========================
+def build_azure_client() -> AzureOpenAI:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise SystemExit("OPENAI_API_KEY env var missing (GenAI-Nexus key). Set it in notebook/session.")
+    return AzureOpenAI(
+        api_key=key,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_version=AZURE_API_VERSION,
+    )
 
-    driver = make_driver()
-    global_seen_urls = set()
-    collected_total = 0
+def build_llm_prompt_copilot_style(
+    question: str,
+    greeting_name: str,
+    signature_name: str,
+    extracted_points: List[Tuple[str, str]],
+    sources_used: List[str],
+    used_maily: bool
+) -> str:
+    q_red = redact_light(question)
+    src_line = ", ".join(sources_used) if sources_used else "(none)"
 
+    points_block = "\n".join([f"- {s} {cit}" for cit, s in extracted_points]) if extracted_points else "(none)"
+
+    # Copilot-style structure template
+    mail_note = "Secondary MAIL-CHAIN docs were used for style/identical Q&A only." if used_maily else "MAIL-CHAIN docs were not needed."
+
+    return f"""
+You are drafting a professional corporate email reply in procurement/sustainability context.
+
+HARD RULES (strict):
+- Use ONLY the extracted points below. Do not invent facts.
+- If extracted points do not answer the question, ask 1–2 short clarifying questions instead of guessing.
+- Answer ONLY what the user asked. Do not add adjacent topics.
+- Include ALL relevant extracted points; do not arbitrarily output only 1–2 if there are more.
+- Output MUST be bilingual: German first, then a separator line '---', then English.
+- Do NOT include personal names, supplier names, email addresses, phone numbers, addresses, IDs, internal org codes, or money amounts.
+- Keep citations exactly as given (e.g., [file.docx#p12]) and place them at the end of the sentence/point they support.
+- At the end of EACH language section add: "Sources used: <doc titles only>" using the allowed list.
+
+STRUCTURE (Copilot-like):
+German:
+- Start with greeting.
+- Then a short intro sentence (1 line).
+- Then numbered sections, each with bilingual header:
+  "1. <English header> / <German header>"
+  Under each section: 1–3 bullets max, each bullet ends with citation(s).
+- Finish with: if the answer is long (>=4 bullets total OR >120 words), add:
+  "Kurzfassung:" with 2–4 short bullets (NO new info).
+- Close with signature.
+
+English:
+- Same structure and content, fully translated, and keep the same citations.
+- If long, add "Short summary:" (2–4 bullets) else omit.
+
+Question:
+{q_red}
+
+Extracted points (ground truth; use these only):
+{points_block}
+
+Allowed sources list for "Sources used":
+{src_line}
+
+Note:
+{mail_note}
+""".strip()
+
+def call_llm(client: AzureOpenAI, prompt: str) -> str:
+    resp = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+        temperature=LLM_TEMPERATURE,
+        max_completion_tokens=LLM_MAX_COMPLETION_TOKENS,
+        messages=[
+            {"role": "system", "content": "Follow the hard rules exactly. Use only extracted points."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+def fallback_reply(greeting_name: str, signature_name: str, question: str, srcs: List[str]) -> str:
+    src_line = ", ".join(srcs) if srcs else "(none)"
+    q = clean_ws(question)
+    return (
+        f"Hallo {greeting_name},\n"
+        f"ich hoffe, es geht Ihnen gut.\n\n"
+        f"Ich konnte in den aktuell geladenen Dokumentauszügen keine eindeutige, belastbare Antwort finden.\n"
+        f"Können Sie bitte den Dokumentennamen/Abschnitt nennen oder kurz präzisieren, worauf Sie genau abzielen?\n\n"
+        f"Frage: {q}\n\n"
+        f"Sources used: {src_line}\n\n"
+        f"Mit freundlichen Grüßen\n"
+        f"{signature_name}\n\n---\n\n"
+        f"Hello {greeting_name},\n"
+        f"I hope you are doing well.\n\n"
+        f"I could not find a clear, well-supported answer in the currently loaded document excerpts.\n"
+        f"Could you please point to the document/section or clarify the exact requirement you mean?\n\n"
+        f"Question: {q}\n\n"
+        f"Sources used: {src_line}\n\n"
+        f"Best regards,\n"
+        f"{signature_name}"
+    )
+
+
+# =========================
+# OUTLOOK HELPERS
+# =========================
+def get_sender_smtp(mail) -> str:
     try:
-        # ---- Phase 1: site-based
-        for idx_site, domain in enumerate(merged_sites, start=1):
-            print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🌐 Site {idx_site}/{len(merged_sites)}: {domain}")
-            queries = build_site_queries(domain, rawm, schlagwoerter)
-            print(f"   → queries: {len(queries)}")
+        addr = (mail.SenderEmailAddress or "").lower()
+        if addr.startswith("/o="):
+            ex = mail.Sender.GetExchangeUser()
+            if ex:
+                return (ex.PrimarySmtpAddress or "").lower()
+        return addr
+    except Exception:
+        return (mail.SenderEmailAddress or "").lower()
 
-            accepted_for_site = 0
+def get_target_folder():
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    target_store = None
+    for st in ns.Stores:
+        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
+            target_store = st
+            break
+    if not target_store:
+        print("Available stores (use one of these in TARGET_MAILBOX):")
+        for st in ns.Stores:
+            print(" -", st.DisplayName)
+        raise SystemExit("Target mailbox not found.")
 
-            for q_i, q in enumerate(queries, start=1):
-                print(f"   [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🔎 {q_i}/{len(queries)} | total collected = {collected_total}")
-                results = scrape_ddg_results(driver, ddg_search_url(q), max_pages=MAX_DDG_PAGES)
-                print(f"      → raw hits: {len(results)}")
+    inbox = target_store.GetDefaultFolder(6)  # Inbox
+    if WATCH_FOLDER_NAME.lower() == "inbox":
+        return ns, inbox, target_store.DisplayName, "Inbox"
 
-                for r in results:
-                    u = (r.get("url") or "").strip()
-                    if not u or u in global_seen_urls:
-                        continue
+    for f in inbox.Folders:
+        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
+            return ns, f, target_store.DisplayName, f.Name
 
-                    dom = urlparse(u).netloc.lower()
-                    if is_bad_social_domain(dom):
-                        continue
-                    if is_bad_path(u):
-                        continue
-                    if not date_ok(r.get("date_txt", ""), min_date):
-                        continue
+    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
 
-                    title = r.get("title", "") or ""
-                    snippet = r.get("snippet", "") or ""
-                    text = f"{title} {snippet}"
+def add_processed_category(mail):
+    try:
+        cats = mail.Categories or ""
+        if PROCESSED_CATEGORY.lower() not in cats.lower():
+            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
+        mail.Save()
+    except Exception:
+        pass
 
-                    # HIGH ACCURACY GATE:
-                    # accept if (material is in real context) OR (risk terms appear AND material is a whole word)
-                    if not (material_context_match(text, rawm) or (risk_snippet(title, snippet) and material_word_match(text, rawm))):
-                        continue
+def mark_read(mail):
+    try:
+        mail.UnRead = False
+        mail.Save()
+    except Exception:
+        pass
 
-                    global_seen_urls.add(u)
-                    collected_total += 1
-                    accepted_for_site += 1
+def get_account_for_mailbox(ns, mailbox_substring: str):
+    try:
+        for acc in ns.Session.Accounts:
+            smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
+            if mailbox_substring.lower() in smtp or smtp in mailbox_substring.lower():
+                return acc
+    except Exception:
+        pass
+    return None
 
-                    with out_path.open("a", newline="", encoding="utf-8-sig") as f:
-                        csv.writer(f, delimiter=";").writerow([
-                            u,
-                            r.get("date_txt", ""),
-                            parse_ddg_date_to_iso(r.get("date_txt", "")),
-                            domain,
-                            q,
-                            title,
-                            snippet,
-                        ])
-
-                    print(f"      ✅ accepted | total={collected_total} | site={accepted_for_site} | {title[:80]}")
-
-                time.sleep(random.uniform(*PAUSE_BETWEEN_QUERIES_SEC))
-
-            print(f"   → accepted from site: {accepted_for_site}")
-            time.sleep(random.uniform(*PAUSE_BETWEEN_SITES_SEC))
-
-        # ---- Phase 2: fallback web-wide (still high accuracy)
-        if collected_total < MIN_AFTER_SITES:
-            print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Only {collected_total} after sites. Web-wide fallback…")
-            for q_i, q in enumerate(build_fallback_queries(rawm), start=1):
-                if collected_total >= FALLBACK_TARGET_TOTAL:
-                    break
-
-                print(f"   [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🌍 Fallback {q_i} | total={collected_total} | {q}")
-                results = scrape_ddg_results(driver, ddg_search_url(q), max_pages=MAX_DDG_PAGES)
-
-                for r in results:
-                    if collected_total >= FALLBACK_TARGET_TOTAL:
-                        break
-
-                    u = (r.get("url") or "").strip()
-                    if not u or u in global_seen_urls:
-                        continue
-
-                    dom = urlparse(u).netloc.lower()
-                    if is_bad_social_domain(dom):
-                        continue
-                    if is_bad_path(u):
-                        continue
-
-                    title = r.get("title", "") or ""
-                    snippet = r.get("snippet", "") or ""
-                    text = f"{title} {snippet}"
-
-                    if not (material_context_match(text, rawm) or (risk_snippet(title, snippet) and material_word_match(text, rawm))):
-                        continue
-
-                    global_seen_urls.add(u)
-                    collected_total += 1
-
-                    with out_path.open("a", newline="", encoding="utf-8-sig") as f:
-                        csv.writer(f, delimiter=";").writerow([
-                            u,
-                            r.get("date_txt", ""),
-                            parse_ddg_date_to_iso(r.get("date_txt", "")),
-                            "WEB_WIDE",
-                            q,
-                            title,
-                            snippet,
-                        ])
-
-                    print(f"      ✅ fallback accepted | total={collected_total} | {title[:80]}")
-
-                time.sleep(random.uniform(*PAUSE_BETWEEN_QUERIES_SEC))
-
-    finally:
+def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
+    msg = ns.Application.CreateItem(0)
+    msg.To = to_addr
+    msg.Subject = f"Draft created (review needed): {orig_subject}"
+    msg.Body = (
+        "A draft reply has been created in Outlook.\n\n"
+        f"Original subject: {orig_subject}\n"
+        f"Requester: {requester_email}\n\n"
+        "Please review the draft carefully before sending.\n"
+    )
+    acc = get_account_for_mailbox(ns, from_mailbox)
+    if acc:
         try:
-            driver.quit()
+            msg.SendUsingAccount = acc
         except Exception:
             pass
+    msg.Send()
 
-    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ✅ Done. Collected total: {collected_total}\nOutput:\n{out_path}")
+def create_outlook_task_reminder(ns, subject: str, days: int = 2):
+    try:
+        task = ns.Application.CreateItem(3)  # olTaskItem
+        task.Subject = f"Reminder: review/send draft for '{subject}'"
+        task.DueDate = (datetime.now() + timedelta(days=days)).date()
+        task.ReminderSet = True
+        task.ReminderTime = datetime.now() + timedelta(days=days)
+        task.Body = "A draft reply was created by the bot. Please review and send it."
+        task.Save()
+    except Exception:
+        pass
+
+
+# =========================
+# MAIN
+# =========================
+def run_bot_once():
+    time.sleep(STARTUP_DELAY_SEC)
+
+    print("Building KB index from:", KB_DIR)
+    kb_chunks = build_kb_index(KB_DIR)
+    print("KB chunks:", len(kb_chunks))
+
+    client = build_azure_client()
+
+    ns, folder, store_name, folder_name = get_target_folder()
+    print(f"Mailbox={store_name} | Folder={folder_name}")
+
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True)
+
+    drafted = 0
+    checked = 0
+
+    signature_name = safe_firstname_from_email(TARGET_MAILBOX)
+
+    for mail in items:
+        checked += 1
+        if checked > SCAN_LIMIT:
+            break
+        if drafted >= PROCESS_PER_RUN:
+            break
+
+        try:
+            if getattr(mail, "Class", None) != 43:
+                continue
+
+            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
+                continue
+
+            if REQUIRE_UNREAD and not mail.UnRead:
+                continue
+
+            subject = mail.Subject or ""
+            if not strict_subject_ok(subject):
+                continue
+
+            sender = get_sender_smtp(mail)
+            greeting_name = safe_firstname_from_email(sender)
+
+            body_text = clean_html_to_text(mail.HTMLBody or "")
+            question = re.split(r"(?i)\b(von:|from:|gesendet:|sent:|-----original message-----)\b", body_text)[0].strip()
+            if not question:
+                question = body_text.strip()
+
+            ranked_chunks, used_maily = retrieve_best_chunks(kb_chunks, query=question, chunk_top_k=120)
+
+            # Extract many relevant requirement points with inline citations
+            extracted_points = extract_points_with_citations(ranked_chunks, query=question, max_points=12)
+
+            # Sources used list
+            srcs = build_sources_used(ranked_chunks, used_maily=used_maily, max_sources=10)
+
+            prompt = build_llm_prompt_copilot_style(
+                question=question,
+                greeting_name=greeting_name,
+                signature_name=signature_name,
+                extracted_points=extracted_points,
+                sources_used=srcs,
+                used_maily=used_maily
+            )
+
+            reply_text = ""
+            try:
+                reply_text = call_llm(client, prompt)
+            except Exception as e_llm:
+                print("LLM error fallback used:", repr(e_llm))
+                reply_text = fallback_reply(greeting_name, signature_name, question, srcs)
+
+            if not (reply_text or "").strip():
+                reply_text = fallback_reply(greeting_name, signature_name, question, srcs)
+
+            # Draft
+            reply = mail.Reply()
+            reply.HTMLBody = f"<div>{format_outlook_html(reply_text)}</div><hr>" + reply.HTMLBody
+            reply.Save()
+
+            mark_read(mail)
+            add_processed_category(mail)
+
+            drafted += 1
+            print("Draft created for:", subject)
+
+            if SELF_NOTIFY:
+                send_self_notification(ns, TARGET_MAILBOX, SELF_NOTIFY_TO, subject, sender)
+
+            if CREATE_REMINDER_TASK:
+                create_outlook_task_reminder(ns, subject=subject, days=REMINDER_DAYS)
+
+        except Exception as e:
+            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", repr(e))
+
+    print(f"Done. Checked={checked}, Drafted={drafted}")
+
+
+# Notebook: run_bot_once()
+if __name__ == "__main__":
+    run_bot_once()
