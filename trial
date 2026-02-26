@@ -1,28 +1,41 @@
 # -*- coding: utf-8 -*-
 """
-OUTLOOK DRAFT BOT (LLM + GROUNDED RAG + REQUIREMENT EXTRACTION)
-Notebook-safe (VSCode .ipynb) + Python 3.14
-==============================================================
+OUTLOOK DRAFT BOT (LLM + GROUNDED RAG) — Notebook-safe & VSCode-friendly (Python 3.14)
+====================================================================================
 
-- Triggers on Outlook emails with subject exactly "bot" (case-insensitive).
-- Builds KB chunk index from KB_DIR (docx/pdf/xlsx/txt).
-- Retrieves evidence chunks (AW_/RE_/FW_/WG_ demoted but allowed).
-- Deterministic extraction:
-    * selects requirement-like sentences/lines
-    * groups them into Copilot-style sections
-    * deduplicates & removes table-noise
-- LLM (GenAI-Nexus GPT-5.1) rewrites extracted requirements into a polished DE+EN email:
-    * numbered sections
-    * concise, human style
-    * "Sources used" at end
-    * short summary bullets at end only if answer is long
-- Marks original mail as Read + adds category to prevent duplicates.
-- Optional self-notify + Outlook Task reminder.
+What this does
+- Looks for Outlook emails with subject exactly "bot" (case-insensitive).
+- Reads your KB folder (docx/pdf/xlsx/txt).
+- Retrieves best-matching snippets (RAG), with strong de-prioritization for AW_/RE_/FW_/WG_ docs.
+  - Still allows AW_/RE_ as secondary evidence (Pass B) if needed.
+- Extracts "requirement-like" sentences (EN + DE legal phrasing) so the model sees the full set of points.
+- Calls GenAI-Nexus (Azure-style) GPT deployment to write a human email:
+  - German + English
+  - Greeting + closing
+  - “Sources used” at end (doc titles + chunk ids)
+  - Adds a short summary at the end ONLY if the answer is long enough.
+- Marks original email as Read + adds category to prevent duplicates.
+- Optional: self-notify + Outlook Task reminder.
 
-Requires:
-  pip install -U openai pywin32
-Optional:
-  pip install -U python-docx pdfplumber pypdf openpyxl scikit-learn
+Important fixes vs your previous runs
+- Uses max_completion_tokens (not max_tokens) to avoid 400 error on some models.
+- Never creates an empty draft: if LLM returns empty, we fallback to a safe bilingual reply.
+- Retrieval is two-pass:
+  Pass A prefers non-mail docs.
+  Pass B includes AW_/RE_ (still penalized) if Pass A is weak.
+
+Prereqs
+- pip install -U openai pywin32
+Optional for KB parsing:
+- pip install -U python-docx pdfplumber pypdf openpyxl scikit-learn
+
+Key / Endpoint
+- You said this works:
+  Endpoint: https://genai-nexus.api.corpinter.net
+  Deployment: gpt-5.1
+- Set your key in the current session (notebook) or OS env:
+    import os
+    os.environ["OPENAI_API_KEY"] = "PASTE_KEY"
 """
 
 from __future__ import annotations
@@ -30,35 +43,50 @@ from __future__ import annotations
 import os
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta
 from html import escape
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Optional, Dict
 
 import win32com.client as win32
+
+# ========= LLM (Azure-style via Nexus) =========
 from openai import AzureOpenAI
 
-# =========================
+
+# =========================================================
 # CONFIG — EDIT THESE
-# =========================
-TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"
-WATCH_FOLDER_NAME = "Inbox"
+# =========================================================
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"   # Outlook store DisplayName substring match
+WATCH_FOLDER_NAME = "Inbox"                           # "Inbox" or a subfolder under Inbox
+STRICT_SUBJECT = "bot"                                # subject must be exactly this (case-insensitive)
+
 KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
 
-STRICT_SUBJECT = "bot"
 REQUIRE_UNREAD = True
 PROCESS_PER_RUN = 3
 SCAN_LIMIT = 250
 STARTUP_DELAY_SEC = 1
 
-PROCESSED_CATEGORY = "Drafted-RAG-LLM-v2"
+# Avoid duplicate processing
+PROCESSED_CATEGORY = "Drafted-RAG-LLM"
 
+# Notify + reminder
 SELF_NOTIFY = True
 SELF_NOTIFY_TO = TARGET_MAILBOX
 CREATE_REMINDER_TASK = True
 REMINDER_DAYS = 2
 
-# KB parsing
+# ====== Nexus / Azure OpenAI settings ======
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"  # NOTE: no /apikey/
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-5.1"  # your deployment name
+
+LLM_TEMPERATURE = 0.2
+LLM_MAX_COMPLETION_TOKENS = 700     # use max_completion_tokens (not max_tokens)
+
+# ===== KB parsing =====
 SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
 MAX_DOCS = 5000
 MAX_CHARS_PER_DOC = 220_000
@@ -68,23 +96,39 @@ MAX_CHARS_PER_CHUNK = 1400
 MAX_CHUNKS_PER_DOC = 180
 
 # Retrieval
-TOP_K_CHUNKS = 20
-EVIDENCE_MAX_CHUNKS_TO_LLM = 18  # keep prompt bounded
+DOC_TOP_K = 15
+CHUNK_TOP_K = 60
+PASS_A_REQUIRE_NON_MAIL = True        # Pass A ignores AW_/RE_/FW_/WG_ entirely
+ENABLE_PASS_B_INCLUDE_MAIL = True     # Pass B includes AW_/RE_/FW_/WG_ if needed
 
-# De-prioritize mail-chain-like docs but still allow
+# Mail-chain doc detection
 MAILY_PREFIXES = ("aw_", "re_", "fw_", "wg_")
 MAILY_HINTS = ("subject", "mail", "email", "outlook", ".msg", "conversation")
 
-# LLM (GenAI-Nexus / Azure-style)
-AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"   # NO /apikey/
-AZURE_API_VERSION = "2024-06-01"
-AZURE_DEPLOYMENT_NAME = "gpt-5.1"  # your deployment
-LLM_TEMPERATURE = 0.15
-LLM_MAX_COMPLETION_TOKENS = 650     # IMPORTANT: GPT-5.x uses max_completion_tokens
+# Exclude these from "Sources used" unless Pass B was needed
+EXCLUDE_AS_SOURCES_PREFIXES = ("aw_", "re_", "fw_", "wg_")
 
-# =========================
-# BASIC UTILS
-# =========================
+# Dedup / cleanup of ugly table-converted text
+PIPE_HEAVY_THRESHOLD = 0.20  # if >20% of chars are '|', treat as table-style noise
+
+
+# =========================================================
+# OPTIONAL: TF-IDF ranking (better retrieval)
+# =========================================================
+def _try_import_sklearn():
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
+        from sklearn.metrics.pairwise import cosine_similarity       # type: ignore
+        return TfidfVectorizer, cosine_similarity
+    except Exception:
+        return None, None
+
+TFIDF_VECTORIZER, COSINE_SIM = _try_import_sklearn()
+
+
+# =========================================================
+# TEXT UTILS
+# =========================================================
 STOPWORDS = set("""
 the a an and or to of in on for with without from by at is are was were be been being
 der die das und oder zu von im in am an auf für mit ohne aus bei ist sind war waren
@@ -104,13 +148,11 @@ def safe_firstname_from_email(email: str) -> str:
     email = (email or "").strip()
     local = email.split("@", 1)[0] if "@" in email else email
     first = local.split(".", 1)[0].strip()
-    return (first[:1].upper() + first[1:]) if first else "Colleague"
+    if not first:
+        return "Colleague"
+    return first[:1].upper() + first[1:]
 
 def format_outlook_html(text: str) -> str:
-    """
-    Plain -> Outlook HTML.
-    Bullets: lines starting with "- ".
-    """
     text = (text or "").replace("\r\n", "\n").strip()
     if not text:
         return "<p></p>"
@@ -124,7 +166,8 @@ def format_outlook_html(text: str) -> str:
         if all(ln.lstrip().startswith("- ") for ln in lines):
             out.append("<ul>")
             for ln in lines:
-                out.append(f"<li>{escape(ln.lstrip()[2:].strip())}</li>")
+                ln2 = ln.lstrip()[2:].strip()
+                out.append(f"<li>{escape(ln2)}</li>")
             out.append("</ul>")
         else:
             out.append("<p>" + "<br>".join(escape(ln.strip()) for ln in lines) + "</p>")
@@ -134,34 +177,77 @@ def tokenize(s: str) -> List[str]:
     toks = re.split(r"[^a-zA-Z0-9ÄÖÜäöüß]+", (s or "").lower())
     return [t for t in toks if t and t not in STOPWORDS and len(t) >= 3]
 
-def is_maily_filename(name: str) -> bool:
-    n = (name or "").lower()
-    stem = Path(n).stem.lower()
-    if stem.startswith("~$"):
-        return True
-    if stem.startswith(MAILY_PREFIXES):
-        return True
-    return any(h in n for h in MAILY_HINTS)
+def looks_like_table_noise(text: str) -> bool:
+    if not text:
+        return False
+    pipe_ratio = text.count("|") / max(1, len(text))
+    return pipe_ratio >= PIPE_HEAVY_THRESHOLD
 
-def doc_priority_adjustment(filename: str) -> float:
-    """
-    Higher is better.
-    Strongly demote AW_/RE_/FW_/WG_ and mail-ish docs.
-    """
-    fn = (filename or "").lower()
-    score = 0.0
-    if fn.startswith(MAILY_PREFIXES):
-        score -= 0.70
-    if any(h in fn for h in MAILY_HINTS):
-        score -= 0.30
-    # small boost to authoritative words
-    if re.search(r"(?i)\b(mbn|din|iso|vda|standard|policy|guideline|kapitel|chapter|requirements|norm)\b", fn):
-        score += 0.25
-    return score
+def normalize_tableish_line(line: str) -> str:
+    # collapse repeated pipes/spaces to reduce duplicates like:
+    # "über ... | über ... | über ..."
+    s = line
+    s = re.sub(r"\s*\|\s*", " | ", s)
+    s = re.sub(r"(?:\s\|\s)+", " | ", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    # if it's repeating same segment many times, compress
+    parts = [p.strip() for p in s.split("|")]
+    if len(parts) >= 4:
+        # keep unique parts while preserving order
+        seen = set()
+        uniq = []
+        for p in parts:
+            k = p.lower()
+            if k and k not in seen:
+                seen.add(k)
+                uniq.append(p)
+        # if uniq got much shorter, use it
+        if len(uniq) <= max(2, len(parts)//3):
+            s = " | ".join(uniq)
+    return s
 
-# =========================
-# KB READERS (skip missing libs)
-# =========================
+
+# =========================================================
+# REDACTION (belt + suspenders)
+# (Note: very broad; adjust if you find it removes too much.)
+# =========================================================
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+PHONE_RE = re.compile(r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d")
+URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
+IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b", re.I)
+ADDRESS_RE = re.compile(
+    r"\b([A-ZÄÖÜ][a-zäöüß]+(?:\s[A-ZÄÖÜ][a-zäöüß]+){0,3})\s"
+    r"(Straße|Strasse|Str\.|Weg|Allee|Platz|Ring|Gasse|Damm|Ufer)\s"
+    r"\d{1,5}[a-zA-Z]?\b"
+)
+HEADER_LINE_RE = re.compile(r"(?im)^\s*(von|from|an|to|cc|bcc|gesendet|sent|betreff|subject)\s*:\s*.*$", re.M)
+TITLE_NAME_RE = re.compile(r"\b(?:Mr|Mrs|Ms|Miss|Dr|Prof|Herr|Frau)\.?\s+[A-ZÄÖÜ][a-zäöüß]+(?:\s+[A-ZÄÖÜ][a-zäöüß]+){0,2}\b")
+FIRST_LAST_RE = re.compile(r"\b[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}\b")
+
+def redact_remove(text: str) -> str:
+    if not text:
+        return ""
+    t = text
+    t = HEADER_LINE_RE.sub("", t)
+    t = EMAIL_RE.sub("", t)
+    t = PHONE_RE.sub("", t)
+    t = URL_RE.sub("", t)
+    t = IBAN_RE.sub("", t)
+    t = ADDRESS_RE.sub("", t)
+    t = TITLE_NAME_RE.sub("", t)
+    t = FIRST_LAST_RE.sub("", t)
+    # cleanup
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"\s+,", ",", t)
+    t = re.sub(r"\(\s*\)", "", t)
+    t = re.sub(r"\s+\.", ".", t)
+    return t.strip()
+
+
+# =========================================================
+# KB READERS (skip missing libs gracefully)
+# =========================================================
 def read_txt(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="ignore")
 
@@ -212,8 +298,8 @@ def read_xlsx(p: Path) -> str:
     out = []
     for ws in wb.worksheets:
         out.append(f"Sheet: {ws.title}")
-        max_rows = min(ws.max_row or 0, 250)
-        max_cols = min(ws.max_column or 0, 50)
+        max_rows = min(ws.max_row or 0, 200)
+        max_cols = min(ws.max_column or 0, 40)
         for r in range(1, max_rows + 1):
             row_vals = []
             for c in range(1, max_cols + 1):
@@ -235,16 +321,37 @@ def extract_text_from_file(p: Path) -> str:
         return read_xlsx(p)
     return ""
 
-# =========================
-# BUILD KB CHUNKS
-# =========================
+
+# =========================================================
+# INDEXING
+# =========================================================
+def is_maily_filename(filename: str) -> bool:
+    n = (filename or "").lower()
+    stem = Path(n).stem.lower()
+    if stem.startswith("~$"):
+        return True
+    if stem.startswith(MAILY_PREFIXES):
+        return True
+    return any(h in n for h in MAILY_HINTS)
+
+@dataclass
+class Chunk:
+    fullpath: str
+    filename: str
+    chunk_id: str        # filename#pX
+    text: str
+    is_maily: bool
+
 def split_into_chunks(text: str) -> List[str]:
     text = text or ""
-    # reduce docx-table noise ("A | B | C | ...")
+    # normalize common docx-table artifacts
     text = re.sub(r"[|]{2,}", "|", text)
+    # paragraph split
     paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
     chunks: List[str] = []
     for p in paras:
+        if looks_like_table_noise(p):
+            p = normalize_tableish_line(p)
         if len(p) <= MAX_CHARS_PER_CHUNK:
             chunks.append(p)
         else:
@@ -254,11 +361,7 @@ def split_into_chunks(text: str) -> List[str]:
             break
     return chunks
 
-def build_kb_index(kb_dir: str) -> List[Tuple[str, str, str, str]]:
-    """
-    Returns list of chunks:
-      (fullpath, filename, chunk_id, chunk_text)
-    """
+def build_kb_index(kb_dir: str) -> List[Chunk]:
     base = Path(kb_dir)
     if not base.exists() or not base.is_dir():
         raise SystemExit(f"KB_DIR not found: {kb_dir}")
@@ -266,7 +369,7 @@ def build_kb_index(kb_dir: str) -> List[Tuple[str, str, str, str]]:
     files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
     files = files[:MAX_DOCS]
 
-    chunks: List[Tuple[str, str, str, str]] = []
+    chunks: List[Chunk] = []
     for p in sorted(files):
         try:
             txt = extract_text_from_file(p)
@@ -274,262 +377,370 @@ def build_kb_index(kb_dir: str) -> List[Tuple[str, str, str, str]]:
             if not txt:
                 continue
             txt = txt[:MAX_CHARS_PER_DOC]
+            maily = is_maily_filename(p.name)
             parts = split_into_chunks(txt)
             for i, ch in enumerate(parts, start=1):
                 if not ch.strip():
                     continue
                 cid = f"{p.name}#p{i}"
-                chunks.append((str(p), p.name, cid, ch))
+                chunks.append(Chunk(str(p), p.name, cid, ch, maily))
         except Exception:
             continue
     return chunks
 
-# =========================
-# RETRIEVAL
-# =========================
-def score_chunk(query: str, chunk_text: str, filename: str) -> float:
-    q_toks = tokenize(query)
-    if not q_toks:
-        return 0.0
-    t = chunk_text.lower()
 
-    overlap = 0
-    for tk in set(q_toks):
-        if tk in t:
-            overlap += 1
+# =========================================================
+# RETRIEVAL (doc->chunk) with two-pass
+# =========================================================
+def doc_priority_adjustment(filename: str) -> float:
+    fn = (filename or "").lower()
+    score = 0.0
 
-    # anchor bonus for standards questions
-    anchor_bonus = 0
-    if re.search(r"(?i)\b(which|welche|welchem|in accordance|gemäß|standard|norm)\b", query):
-        if re.search(r"(?i)\b(MBN\s*\d{3,6}|DIN\s*\w+|ISO\s*\d{3,6}|VDA\s*\d+)\b", chunk_text):
-            anchor_bonus = 3
+    # heavy demotion for mail-chains
+    if fn.startswith(MAILY_PREFIXES):
+        score -= 0.60
+    if any(h in fn for h in MAILY_HINTS):
+        score -= 0.25
 
-    # requirement bonus
-    req_bonus = 0
-    if re.search(r"(?i)\b(must|shall|required|requirement|within|by|submit|complete|template|platform|muss|soll|erforder|anforder|innerhalb|bis|einreichen|ausfüllen|vorlage|plattform)\b", chunk_text):
-        req_bonus = 2
+    # boost authoritative signals
+    if re.search(r"(?i)\b(mbn|din|iso|vda|standard|policy|guideline|kapitel|chapter|requirements|norm)\b", fn):
+        score += 0.20
 
-    base = overlap + req_bonus + anchor_bonus
-    base += doc_priority_adjustment(filename) * 10.0
-    return float(base)
+    return score
 
-def pick_best_chunks(kb_chunks: List[Tuple[str, str, str, str]], query: str, top_k: int = TOP_K_CHUNKS):
+def rank_docs(chunks: List[Chunk], query: str, include_maily: bool) -> List[Tuple[float, str, str]]:
+    query = clean_ws(query)
+    if not query:
+        return []
+
+    doc_map: Dict[Tuple[str, str], List[str]] = {}
+    for c in chunks:
+        if not include_maily and c.is_maily:
+            continue
+        doc_map.setdefault((c.fullpath, c.filename), []).append(c.text)
+
+    docs = list(doc_map.keys())
+    texts = ["\n\n".join(doc_map[d])[:60_000] for d in docs]
+
+    scored: List[Tuple[float, str, str]] = []
+
+    if TFIDF_VECTORIZER and COSINE_SIM and texts:
+        vec = TFIDF_VECTORIZER(min_df=1, ngram_range=(1, 2), max_features=80_000)
+        X = vec.fit_transform(texts)
+        qv = vec.transform([query])
+        sims = COSINE_SIM(qv, X).ravel()
+        for (fullpath, fname), sim in zip(docs, sims):
+            score = float(sim) + doc_priority_adjustment(fname)
+            scored.append((score, fullpath, fname))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored
+
+    # fallback overlap
+    q_toks = set(tokenize(query))
+    for (fullpath, fname), t in zip(docs, texts):
+        tl = t.lower()
+        overlap = sum(1 for tk in q_toks if tk in tl)
+        base = overlap / max(1, len(q_toks))
+        score = float(base) + doc_priority_adjustment(fname)
+        scored.append((score, fullpath, fname))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored
+
+def rank_chunks(chunks: List[Chunk], query: str, top_docs: List[Tuple[float, str, str]], top_k: int) -> List[Tuple[float, Chunk]]:
+    query = clean_ws(query)
+    if not query:
+        return []
+
+    doc_set = set((fp, fn) for _, fp, fn in top_docs)
+    pool = [c for c in chunks if (c.fullpath, c.filename) in doc_set]
+    if not pool:
+        return []
+
+    if TFIDF_VECTORIZER and COSINE_SIM:
+        vec = TFIDF_VECTORIZER(min_df=1, ngram_range=(1, 2), max_features=90_000)
+        X = vec.fit_transform([c.text for c in pool])
+        qv = vec.transform([query])
+        sims = COSINE_SIM(qv, X).ravel()
+        doc_score_map = {(fp, fn): ds for ds, fp, fn in top_docs}
+        scored = []
+        for c, sim in zip(pool, sims):
+            score = float(sim) + doc_score_map.get((c.fullpath, c.filename), 0.0) * 0.10
+            scored.append((score, c))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[:top_k]
+
+    q_toks = set(tokenize(query))
+    doc_score_map = {(fp, fn): ds for ds, fp, fn in top_docs}
     scored = []
-    for fullpath, fname, cid, ch in kb_chunks:
-        s = score_chunk(query, ch, fname)
-        if s > 0:
-            scored.append((s, fullpath, fname, cid, ch))
+    for c in pool:
+        tl = c.text.lower()
+        overlap = sum(1 for tk in q_toks if tk in tl)
+        score = overlap + doc_score_map.get((c.fullpath, c.filename), 0.0) * 0.10
+        scored.append((float(score), c))
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:top_k]
 
-def sources_used(best_chunks) -> List[str]:
+def retrieve_evidence(all_chunks: List[Chunk], question: str) -> Tuple[List[Chunk], bool]:
     """
-    Return doc titles + chunk ids, excluding email-like docs from dominating sources list.
-    But we still allow them if they are the only evidence.
+    Returns (selected_chunks, used_mail_docs_flag)
     """
-    srcs = []
-    for _, _, fname, cid, _ in best_chunks:
-        # Always include chunk id so you can trace
-        tag = f"{fname} ({cid})"
-        if tag not in srcs:
-            srcs.append(tag)
-    return srcs[:10]
+    q = clean_ws(question)
+    if not q:
+        return [], False
 
-# =========================
-# REQUIREMENT EXTRACTION (core of Option 2)
-# =========================
-REQ_WORDS = re.compile(
-    r"(?i)\b(must|shall|required|requirement|within|by|submit|complete|provide|ensure|obliged|"
-    r"muss|soll|erforder|anforderung|innerhalb|bis|einreichen|ausfüllen|bereitstellen|sicherstellen|verpflichtet)\b"
+    # Pass A: non-mail docs only
+    if PASS_A_REQUIRE_NON_MAIL:
+        docs_A = rank_docs(all_chunks, q, include_maily=False)
+        top_docs_A = docs_A[:DOC_TOP_K]
+        chunks_A = rank_chunks(all_chunks, q, top_docs_A, top_k=CHUNK_TOP_K)
+        selected_A = [c for _, c in chunks_A]
+        if selected_A:
+            return selected_A, False
+
+    # Pass B: allow mail docs (still penalized)
+    if ENABLE_PASS_B_INCLUDE_MAIL:
+        docs_B = rank_docs(all_chunks, q, include_maily=True)
+        top_docs_B = docs_B[:max(DOC_TOP_K, 25)]
+        chunks_B = rank_chunks(all_chunks, q, top_docs_B, top_k=max(CHUNK_TOP_K, 100))
+        selected_B = [c for _, c in chunks_B]
+        if selected_B:
+            return selected_B, True
+
+    return [], False
+
+
+# =========================================================
+# REQUIREMENT EXTRACTION (so you get all key points, not just 1–2)
+# =========================================================
+REQ_CUES = re.compile(
+    r"(?i)\b("
+    r"must|shall|required|requirement|need to|has to|"
+    r"muss|soll|erforderlich|Anforderung(en)?|ist\s+zu|sind\s+zu|"
+    r"hat\s+.*\s+zu|hat\s+sicherzustellen|verpflichtet\s+sich|"
+    r"ist\s+verpflichtet|müssen|sicherzustellen|nachweis|beleg|"
+    r"in\s+accordance\s+with|gemäß|in\s+Übereinstimmung\s+mit"
+    r")\b"
 )
 
-TIME_WORDS = re.compile(r"(?i)\b(within\s+\d+|by\s+\d+|bis\s+\d+|innerhalb\s+\d+|weeks?|wochen?|tage?|days?)\b")
-PLATFORM_WORDS = re.compile(r"(?i)\b(platform|portal|template|vorlage|certus|supplierassurance|docmaster|prosource|smaragd|nx)\b")
-STANDARD_WORDS = re.compile(r"(?i)\b(MBN\s*\d{3,6}|DIN\s*\w+|ISO\s*\d{3,6}|VDA\s*\d+)\b")
+STANDARD_ANCHOR = re.compile(r"(?i)\b(MBN\s*\d{3,6}|DIN\s*[A-Z0-9\-]+|ISO\s*\d{3,6}|VDA\s*\d+)\b")
 
-def split_sentences_loose(text: str) -> List[str]:
-    t = (text or "").replace("\n", " ")
-    t = re.sub(r"\s+", " ", t).strip()
-    if not t:
+def sentence_split(text: str) -> List[str]:
+    txt = re.sub(r"\s+", " ", text or "").strip()
+    if not txt:
         return []
-    # keep semi-colon splits too
-    parts = re.split(r"(?<=[\.\!\?])\s+|;\s+", t)
-    out = []
-    for p in parts:
-        p = p.strip(" -•\t\r\n")
-        if len(p) >= 20:
-            out.append(p)
+    parts = re.split(r"(?<=[\.\!\?])\s+", txt)
+    out = [p.strip(" -•\t\r\n") for p in parts if len(p.strip()) >= 12]
     return out
 
-def cleanup_pipe_noise(s: str) -> str:
+def extract_requirements(chunks: List[Chunk], query: str, max_total: int = 10) -> List[Tuple[str, str]]:
     """
-    Fix docx table lines that became: 'foo | foo | foo | bar'
-    Keep only meaningful unique tokens and remove obvious repetition.
+    Returns list of (chunk_id, sentence).
+    Tries to capture ALL relevant requirement sentences, deduped.
+    Special handling:
+      - “which standard” questions: prefer sentences containing MBN/DIN/ISO/VDA anchors.
     """
-    s = clean_ws(s)
-    if "|" not in s:
-        return s
-    parts = [clean_ws(x) for x in s.split("|")]
-    # drop empties and exact duplicates while preserving order
+    q = query.lower()
+    want_standard = any(k in q for k in ["which standard", "welche norm", "welchem standard", "gemäß", "according to", "in accordance"])
+
+    candidates: List[Tuple[int, str, str]] = []  # (priority, chunk_id, sentence)
     seen = set()
-    keep = []
-    for p in parts:
-        key = p.lower()
-        if not p:
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        keep.append(p)
-    # If still too many fragments, join first 2-3 plus last (often bilingual)
-    if len(keep) > 10:
-        keep = keep[:3] + (keep[-2:] if len(keep) >= 2 else [])
-    return " | ".join(keep)
 
-def classify_section(sentence: str) -> str:
-    s = sentence.lower()
-    # Copilot-like buckets (extend as you like)
-    if any(k in s for k in ["tier", "lieferkette", "supply chain", "transparen", "origin", "herkunft"]):
-        return "Supply Chain Transparency / Lieferkettentransparenz"
-    if any(k in s for k in ["saq", "supplierassurance", "self assessment", "questionnaire", "assessment"]):
-        return "Sustainability Assessment (SAQ)"
-    if any(k in s for k in ["ddq", "due diligence", "sorgfalt", "human rights", "menschenrecht"]):
-        return "Due Diligence / Sorgfaltspflichten"
-    if any(k in s for k in ["3tg", "cmrt", "rmap", "tin", "tantal", "tungsten", "gold"]):
-        return "3TG Materials / 3TG-Materialien"
-    if any(k in s for k in ["co2", "carbon", "emission", "grünstrom", "ppa", "renewable electricity"]):
-        return "CO₂ & Energy / CO₂ & Energie"
-    if any(k in s for k in ["recycled", "rezyklat", "sekundärmaterial", "secondary material"]):
-        return "Recycled / Secondary Material"
-    if any(k in s for k in ["documented", "documentation", "dokumentation", "smaragd", "nx", "3d record"]):
-        return "Documentation / Dokumentation"
-    return "General Requirements / Allgemeine Anforderungen"
-
-def extract_requirements(best_chunks, query: str) -> Dict[str, List[Tuple[str, str]]]:
-    """
-    Returns dict:
-      section -> list of (requirement_sentence, source_chunk_id)
-    Selects requirement-like sentences strongly related to query tokens.
-    """
-    q_tokens = set(tokenize(query))
-    extracted: Dict[str, List[Tuple[str, str]]] = {}
-
-    for _, _, fname, cid, ch in best_chunks:
-        # break chunk into sentences
-        for sent in split_sentences_loose(ch):
-            sent2 = cleanup_pipe_noise(sent)
-
-            # must look like a requirement OR contain standard reference for "which standard" questions
-            is_req = bool(REQ_WORDS.search(sent2)) or bool(TIME_WORDS.search(sent2)) or bool(PLATFORM_WORDS.search(sent2))
-            is_std = bool(STANDARD_WORDS.search(sent2))
-
-            if not (is_req or is_std):
+    for c in chunks[:60]:
+        for sent in sentence_split(c.text):
+            s = sent.strip()
+            if not s:
                 continue
 
-            # must have some overlap with query to prevent random quoting
-            stoks = set(tokenize(sent2))
-            overlap = len(q_tokens & stoks)
-            if overlap < max(1, min(2, len(q_tokens)//6)):
-                # allow standards questions with standard refs even if overlap low
-                if not (is_std and re.search(r"(?i)\b(which|welche|welchem|standard|norm|gemäß|in accordance)\b", query)):
-                    continue
+            # reduce tableish repetitions
+            if "|" in s and looks_like_table_noise(s):
+                s = normalize_tableish_line(s)
 
-            section = classify_section(sent2)
-            extracted.setdefault(section, []).append((sent2, cid))
-
-    # Deduplicate within each section (by lowercase sentence)
-    for sec in list(extracted.keys()):
-        seen = set()
-        uniq = []
-        for s, cid in extracted[sec]:
-            k = s.lower()
-            if k in seen:
+            key = s.lower()
+            if key in seen:
                 continue
-            seen.add(k)
-            uniq.append((s, cid))
-        extracted[sec] = uniq
 
-    return extracted
+            # base filter: overlap with query tokens (keeps on-topic)
+            qt = set(tokenize(query))
+            st = set(tokenize(s))
+            overlap = len(qt & st)
 
-def build_extraction_pack(extracted: Dict[str, List[Tuple[str, str]]], max_per_section: int = 4) -> str:
-    """
-    What we feed into the LLM: structured, clean, finite.
-    """
+            # if query is short, allow lower overlap
+            min_ov = 1 if len(qt) <= 6 else 2
+            if overlap < min_ov and not want_standard:
+                continue
+
+            # requirement cue
+            if REQ_CUES.search(s) or STANDARD_ANCHOR.search(s):
+                pr = 0
+                if want_standard and STANDARD_ANCHOR.search(s):
+                    pr += 50
+                if STANDARD_ANCHOR.search(s):
+                    pr += 15
+                if REQ_CUES.search(s):
+                    pr += 10
+                pr += overlap
+
+                candidates.append((pr, c.chunk_id, s))
+                seen.add(key)
+
+    # sort best-first
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    # keep up to max_total
+    out: List[Tuple[str, str]] = []
+    for pr, cid, s in candidates:
+        out.append((cid, s))
+        if len(out) >= max_total:
+            break
+
+    return out
+
+def build_extraction_pack(extracted: List[Tuple[str, str]]) -> str:
     if not extracted:
         return "(no extracted requirements)"
+    lines = ["## Extracted requirement points (grounded)"]
+    for cid, s in extracted:
+        lines.append(f"- ({cid}) {s}")
+    return "\n".join(lines)
 
-    lines = []
-    for sec in extracted.keys():
-        items = extracted[sec][:max_per_section]
-        if not items:
+def sources_used(chunks: List[Chunk], used_mail_docs: bool) -> List[str]:
+    """
+    Return unique sources; exclude AW/RE unless pass B used them (or they were truly needed).
+    """
+    srcs = []
+    for c in chunks[:30]:
+        fn = c.filename
+        if (not used_mail_docs) and fn.lower().startswith(EXCLUDE_AS_SOURCES_PREFIXES):
             continue
-        lines.append(f"## {sec}")
-        for s, cid in items:
-            lines.append(f"- {s}  [source: {cid}]")
-        lines.append("")
-    return "\n".join(lines).strip()
+        entry = f"{fn} ({c.chunk_id})"
+        if entry not in srcs:
+            srcs.append(entry)
+    return srcs[:10]
 
-# =========================
-# LLM PROMPT (Copilot-like)
-# =========================
-def build_llm_prompt(question: str, greeting_name: str, signature_name: str, extraction_pack: str, sources: List[str]) -> str:
-    src_line = ", ".join(sources) if sources else "(none)"
-    q = clean_ws(question)
 
-    return f"""
-You are drafting a professional corporate email reply in procurement/sustainability.
-
-STRICT RULES:
-1) Use ONLY the extracted requirement pack below. Do not invent.
-2) If the pack is insufficient, ask 1 short clarifying question and stop.
-3) Output MUST be bilingual: German first, then a separator line '---', then English.
-4) Style must be like a strong Copilot draft: clear headings, numbered sections, concrete requirements.
-5) Do NOT include personal names, supplier names, emails, phones, IDs, addresses, internal org codes.
-6) At the end of EACH language section add: "Sources used: <doc titles + chunk ids>" using only the provided list.
-7) Also add a short "Kurzfassung:" / "Short summary:" at the end ONLY if the body has 4+ sections or >160 words.
-
-EMAIL FORMAT:
-- German starts: "Hallo {greeting_name},"
-- German ends: "Mit freundlichen Grüßen" + "{signature_name}"
-- English starts: "Hello {greeting_name},"
-- English ends: "Best regards," + "{signature_name}"
-
-Question:
-{q}
-
-Allowed sources list:
-{src_line}
-
-Extracted requirement pack:
-{extraction_pack}
-""".strip()
-
+# =========================================================
+# LLM PROMPT + CALL
+# =========================================================
 def build_azure_client() -> AzureOpenAI:
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
-        raise SystemExit("OPENAI_API_KEY env var missing (set it in notebook session or OS env).")
+        raise SystemExit("OPENAI_API_KEY env var missing. Set it in your notebook/session or OS.")
     return AzureOpenAI(
         api_key=key,
         azure_endpoint=AZURE_OPENAI_ENDPOINT,
         api_version=AZURE_API_VERSION,
     )
 
+def build_llm_prompt(
+    question: str,
+    greeting_name: str,
+    signature_name: str,
+    extraction_pack: str,
+    sources: List[str],
+    used_mail_docs: bool
+) -> str:
+    src_line = ", ".join(sources) if sources else "(none)"
+    mail_note = (
+        "Mail-chain sources (AW_/RE_) were used only as secondary evidence."
+        if used_mail_docs else
+        "Mail-chain sources (AW_/RE_) were not used for the answer."
+    )
+
+    q_red = redact_remove(question)
+    pack_red = redact_remove(extraction_pack)
+
+    return f"""
+You are drafting a professional corporate email reply in procurement/sustainability context.
+
+HARD RULES (must follow):
+- Use ONLY the extracted points below. Do not invent facts.
+- If the extracted points do not answer the question, ask 1–2 short clarifying questions instead of guessing.
+- Output MUST be bilingual: German first, then a separator line '---', then English.
+- Keep it human and complete: include all relevant points from the extracted list (do not drop points arbitrarily).
+- Do NOT answer unrelated questions. Answer only what is asked.
+- Include greeting + closing as specified.
+- Do NOT include personal names, supplier names, emails, phone numbers, addresses, IDs, internal codes, or money amounts.
+- At the end of EACH language section, add "Sources used:" with the allowed list only (titles+chunk ids).
+
+STRUCTURE:
+German:
+Hallo {greeting_name},
+(1–2 sentences context)
+Then either short paragraphs or bullet points (use bullets if multiple points).
+If the answer is long (>= 4 bullets or >= ~120 words), add a short "Kurzfassung:" with 2–4 bullets at the end of German.
+If the answer is already short, skip the short summary.
+Close:
+Mit freundlichen Grüßen
+{signature_name}
+
+English:
+Hello {greeting_name},
+Same content in English.
+If long, add "Short summary:" 2–4 bullets; else omit.
+Close:
+Best regards,
+{signature_name}
+
+Question:
+{q_red}
+
+Extracted grounded points:
+{pack_red}
+
+Allowed sources list:
+{src_line}
+
+Note:
+{mail_note}
+""".strip()
+
 def call_llm(client: AzureOpenAI, prompt: str) -> str:
-    # GPT-5.1 expects max_completion_tokens, not max_tokens
+    # Azure chat.completions path (works with your Nexus deployment)
     resp = client.chat.completions.create(
         model=AZURE_DEPLOYMENT_NAME,
         temperature=LLM_TEMPERATURE,
         max_completion_tokens=LLM_MAX_COMPLETION_TOKENS,
         messages=[
-            {"role": "system", "content": "Follow instructions exactly. Use only provided extracted pack."},
+            {"role": "system", "content": "Follow the hard rules exactly. Use only extracted points."},
             {"role": "user", "content": prompt},
         ],
     )
     return (resp.choices[0].message.content or "").strip()
 
-# =========================
+
+# =========================================================
+# NEVER-EMPTY FALLBACK
+# =========================================================
+def build_fallback_reply(greeting_name: str, signature_name: str, question: str, sources: List[str]) -> str:
+    src_line = ", ".join(sources) if sources else "(none)"
+    q = (question or "").strip()
+    return (
+        f"Hallo {greeting_name},\n"
+        f"ich hoffe, es geht Ihnen gut.\n\n"
+        f"Ich habe in den verfügbaren Dokumentenauszügen keine eindeutige, belastbare Antwort gefunden.\n"
+        f"Können Sie bitte den Dokumentennamen/Abschnitt nennen oder kurz präzisieren, worauf Sie genau abzielen?\n\n"
+        f"Frage (Kurzform): {q}\n\n"
+        f"Mit freundlichen Grüßen\n"
+        f"{signature_name}\n\n"
+        f"Sources used: {src_line}\n\n"
+        f"---\n\n"
+        f"Hello {greeting_name},\n"
+        f"I hope you are doing well.\n\n"
+        f"I could not find a clear, well-supported answer in the available document excerpts.\n"
+        f"Could you please point to the document/section or clarify the exact requirement you mean?\n\n"
+        f"Question (short): {q}\n\n"
+        f"Best regards,\n"
+        f"{signature_name}\n\n"
+        f"Sources used: {src_line}"
+    )
+
+def safe_nonempty(text: str) -> str:
+    return (text or "").strip()
+
+
+# =========================================================
 # OUTLOOK HELPERS
-# =========================
+# =========================================================
 def get_sender_smtp(mail) -> str:
     try:
         addr = (mail.SenderEmailAddress or "").lower()
@@ -551,10 +762,10 @@ def get_target_folder():
             break
 
     if not target_store:
-        print("Available stores:")
+        print("Available stores (use one of these in TARGET_MAILBOX):")
         for st in ns.Stores:
             print(" -", st.DisplayName)
-        raise SystemExit("Target mailbox not found. Adjust TARGET_MAILBOX.")
+        raise SystemExit("Target mailbox not found.")
 
     inbox = target_store.GetDefaultFolder(6)  # Inbox
     if WATCH_FOLDER_NAME.lower() == "inbox":
@@ -564,7 +775,7 @@ def get_target_folder():
         if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
             return ns, f, target_store.DisplayName, f.Name
 
-    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox.")
+    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
 
 def add_processed_category(mail):
     try:
@@ -622,9 +833,10 @@ def create_outlook_task_reminder(ns, subject: str, days: int = 2):
     except Exception:
         pass
 
-# =========================
+
+# =========================================================
 # MAIN
-# =========================
+# =========================================================
 def run_bot_once():
     time.sleep(STARTUP_DELAY_SEC)
 
@@ -670,19 +882,36 @@ def run_bot_once():
             greeting_name = safe_firstname_from_email(sender)
 
             body_text = clean_html_to_text(mail.HTMLBody or "")
-            question = re.split(r"(?i)\b(von:|from:|gesendet:|sent:|-----original message-----)\b", body_text)[0].strip()
+
+            # keep only the top part (strip quoted chain)
+            question = re.split(
+                r"(?i)\b(von:|from:|gesendet:|sent:|-----original message-----)\b",
+                body_text
+            )[0].strip()
             if not question:
                 question = body_text.strip()
 
-            # Retrieve top chunks
-            best = pick_best_chunks(kb_chunks, query=question, top_k=TOP_K_CHUNKS)
+            # Retrieval (two-pass)
+            evidence_chunks, used_mail_docs = retrieve_evidence(kb_chunks, question)
 
-            # Extract requirements and build pack
-            extracted = extract_requirements(best, query=question)
-            extraction_pack = build_extraction_pack(extracted, max_per_section=4)
+            # Extract ALL key requirement points
+            extracted = extract_requirements(evidence_chunks, query=question, max_total=10)
+            extraction_pack = build_extraction_pack(extracted)
 
-            # Sources list (doc titles + chunk ids)
-            srcs = sources_used(best)
+            # If extractor found nothing, still provide raw evidence blocks (grounded)
+            if extraction_pack.strip() == "(no extracted requirements)":
+                raw_lines = ["## Evidence (no explicit requirement sentences detected)"]
+                for i, c in enumerate(evidence_chunks[:12], start=1):
+                    snippet = clean_ws(c.text)
+                    if len(snippet) > 650:
+                        snippet = snippet[:650] + "…"
+                    raw_lines.append(f"- ({c.chunk_id}) {snippet}")
+                extraction_pack = "\n".join(raw_lines)
+
+            srcs = sources_used(evidence_chunks, used_mail_docs=used_mail_docs)
+
+            # Debug (optional)
+            print("PASS:", subject, "| q chars:", len(question), "| evidence:", len(evidence_chunks), "| extracted:", len(extracted))
 
             prompt = build_llm_prompt(
                 question=question,
@@ -690,14 +919,34 @@ def run_bot_once():
                 signature_name=signature_name,
                 extraction_pack=extraction_pack,
                 sources=srcs,
+                used_mail_docs=used_mail_docs
             )
 
-            reply_text = call_llm(client, prompt)
+            reply_text = ""
+            try:
+                reply_text = call_llm(client, prompt)
+            except Exception as e_llm:
+                print("LLM error:", repr(e_llm))
 
+            reply_text = safe_nonempty(reply_text)
+
+            # If model returned empty, fallback (never empty draft)
+            if not reply_text:
+                reply_text = build_fallback_reply(greeting_name, signature_name, question, srcs)
+
+            # Final redaction pass
+            reply_text = redact_remove(reply_text)
+
+            html = format_outlook_html(reply_text)
+            if not html.strip() or html.strip() == "<p></p>":
+                html = format_outlook_html(build_fallback_reply(greeting_name, signature_name, question, srcs))
+
+            # Create draft reply
             reply = mail.Reply()
-            reply.HTMLBody = f"<div>{format_outlook_html(reply_text)}</div><hr>" + reply.HTMLBody
+            reply.HTMLBody = f"<div>{html}</div><hr>" + reply.HTMLBody
             reply.Save()
 
+            # Mark original as processed
             mark_read(mail)
             add_processed_category(mail)
 
@@ -705,7 +954,10 @@ def run_bot_once():
             print("Draft created for:", subject)
 
             if SELF_NOTIFY:
-                send_self_notification(ns, TARGET_MAILBOX, SELF_NOTIFY_TO, subject, sender)
+                try:
+                    send_self_notification(ns, TARGET_MAILBOX, SELF_NOTIFY_TO, subject, sender)
+                except Exception as e:
+                    print("Self notify failed:", repr(e))
 
             if CREATE_REMINDER_TASK:
                 create_outlook_task_reminder(ns, subject=subject, days=REMINDER_DAYS)
@@ -715,5 +967,9 @@ def run_bot_once():
 
     print(f"Done. Checked={checked}, Drafted={drafted}")
 
-# Run in notebook:
-# run_bot_once()
+
+# === Run (Notebook or VSCode) ===
+# In notebook: just call run_bot_once()
+# In .py script: keep the block below.
+if __name__ == "__main__":
+    run_bot_once()
