@@ -1,16 +1,5 @@
-import os
-from openai import AzureOpenAI
-
-# 1) Set your key (paste your real key here)
-os.environ["AZURE_OPENAI_API_KEY"] = "PASTE_YOUR_KEY_HERE"
-
-# 2) Set endpoint + version (no /apikey/ at the end)
-os.environ["AZURE_OPENAI_ENDPOINT"] = "https://genai-nexus.api.corpinter.net"
-os.environ["OPENAI_API_VERSION"] = "2024-06-01"
-
-# 3) Create client
 client = AzureOpenAI(
-    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-    api_version=os.getenv("OPENAI_API_VERSION"),
+    api_key="e485facd-19fe-4c41-ae78-e5f2c444e39d",
+    azure_endpoint="https://genai-nexus.api.corpinter.net",
+    api_version="2024-06-01",
 )
