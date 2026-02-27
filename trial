@@ -1,20 +1,54 @@
-=== RUN START ===
-Run timestamp: 2026-02-27 13:50:12
-=================
+# === Nexus GPT-5.1 quick health check (Notebook-safe) ===
+# Run this cell first. It verifies:
+# 1) OPENAI_API_KEY is present
+# 2) Endpoint + deployment works (expects exactly "OK")
+# 3) Prints response shape + finish_reason + content (so you see if empty)
 
-Loading KB docs from: C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data
-KB docs: 22
-Mailbox=shubham.tandon@mercedes-benz.com | Folder=Inbox
+import os, json
+from openai import AzureOpenAI
 
-[PASS] bot mail: sustainable-procurement@mercedes-benz.com
-Question: Was sind die Fokusprämissen Nachhaltigkeit für die Vergabe Umweltbezogene Anforderungen
-Top docs: ['m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx', 'm0010_Sustainability_premises_V202302-1-FA.docx', 'm0020_8.6_Sustainability_premises_V202302-1-FA-IND_Brose_signed.docx', '2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx']
-Requirement lines: 120
-Sources: ['m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx', 'm0010_Sustainability_premises_V202302-1-FA.docx', 'm0020_8.6_Sustainability_premises_V202302-1-FA-IND_Brose_signed.docx']
-DEBUG message.content type: <class 'str'>
-LLM reply len: 0
-LLM preview: ''
-WARNING: LLM returned empty. Using fallback deterministic email.
-Draft created for: bot
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"   # no /apikey/
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-5.1"
 
-Done. Checked=251, Drafted=1
+key = os.getenv("OPENAI_API_KEY", "")
+print("OPENAI_API_KEY present:", bool(key), "len:", len(key))
+
+client = AzureOpenAI(
+    api_key=key,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_version=AZURE_API_VERSION,
+)
+
+resp = client.chat.completions.create(
+    model=AZURE_DEPLOYMENT_NAME,
+    temperature=0.0,
+    max_completion_tokens=30,
+    messages=[
+        {"role": "system", "content": "Reply with exactly: OK"},
+        {"role": "user", "content": "ping"},
+    ],
+)
+
+print("\n=== RESPONSE META ===")
+print("type(resp):", type(resp))
+print("choices:", len(resp.choices) if hasattr(resp, "choices") else None)
+try:
+    print("finish_reason:", getattr(resp.choices[0], "finish_reason", None))
+except Exception as e:
+    print("finish_reason: <err>", repr(e))
+
+print("\n=== CONTENT ===")
+try:
+    content = resp.choices[0].message.content
+    print("message.content type:", type(content))
+    print("message.content:", repr(content))
+except Exception as e:
+    print("content read error:", repr(e))
+
+print("\n=== DUMP (first 1200 chars) ===")
+try:
+    d = resp.model_dump()
+    print(json.dumps(d, ensure_ascii=False)[:1200])
+except Exception as e:
+    print("model_dump error:", repr(e))
