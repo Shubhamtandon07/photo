@@ -1,57 +1,12 @@
-from openai import AzureOpenAI
-import os, json
+=== BASIC SHAPE ===
+type(resp): <class 'openai.types.chat.chat_completion.ChatCompletion'>
+has choices: True
+choices len: 1
 
-# Use the same env var you already set in the notebook:
-# os.environ["OPENAI_API_KEY"] = "..."
+=== message.content ===
+type(message.content): <class 'str'>
+message.content repr: 'OK'
 
-AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"
-AZURE_API_VERSION = "2024-06-01"
-AZURE_DEPLOYMENT_NAME = "gpt-5.1"
-
-client = AzureOpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_version=AZURE_API_VERSION,
-)
-
-resp = client.chat.completions.create(
-    model=AZURE_DEPLOYMENT_NAME,
-    temperature=0.0,
-    max_completion_tokens=80,
-    messages=[
-        {"role":"system","content":"Reply with exactly OK (no punctuation)."},
-        {"role":"user","content":"ping"},
-    ],
-)
-
-print("=== BASIC SHAPE ===")
-print("type(resp):", type(resp))
-print("has choices:", hasattr(resp, "choices"))
-print("choices len:", len(resp.choices) if hasattr(resp, "choices") else None)
-
-msg = resp.choices[0].message
-mc = getattr(msg, "content", None)
-
-print("\n=== message.content ===")
-print("type(message.content):", type(mc))
-print("message.content repr:", repr(mc)[:400])
-
-# If content is list of parts, print each part
-if isinstance(mc, list):
-    print("\n=== content parts ===")
-    for i, p in enumerate(mc, start=1):
-        print(f"part[{i}] type:", type(p))
-        if isinstance(p, dict):
-            print("  keys:", list(p.keys()))
-            print("  text:", repr(p.get("text"))[:300])
-            print("  content:", repr(p.get("content"))[:300])
-        else:
-            print("  attrs:", [a for a in ["type","text","content","output_text","value"] if hasattr(p, a)])
-            for a in ["type","text","content","output_text","value"]:
-                if hasattr(p, a):
-                    print(f"  {a}:", repr(getattr(p,a))[:300])
-
-print("\n=== model_dump top keys ===")
-d = resp.model_dump()
-print(list(d.keys()))
-print("dump preview:", json.dumps(d, ensure_ascii=False)[:800])
+=== model_dump top keys ===
+['id', 'choices', 'created', 'model', 'object', 'service_tier', 'system_fingerprint', 'usage', 'prompt_filter_results']
+dump preview: {"id": "chatcmpl-DDrPztbCP7ADAQHekEgHBghEZP85G", "choices": [{"finish_reason": "stop", "index": 0, "logprobs": null, "message": {"content": "OK", "refusal": null, "role": "assistant", "annotations": [], "audio": null, "function_call": null, "tool_calls": null}, "content_filter_results": {"hate": {"filtered": false, "severity": "safe"}, "protected_material_code": {"filtered": false, "detected": false}, "protected_material_text": {"filtered": false, "detected": false}, "self_harm": {"filtered": false, "severity": "safe"}, "sexual": {"filtered": false, "severity": "safe"}, "violence": {"filtered": false, "severity": "safe"}}}], "created": 1772195975, "model": "gpt-5.1-2025-11-13", "object": "chat.completion", "service_tier": null, "system_fingerprint": null, "usage": {"completion_tokens": 11,
