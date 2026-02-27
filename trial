@@ -1,7 +1,250 @@
-# LLM settings (GenAI-Nexus / Azure-style)
-AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"  # NO /apikey/
+# -*- coding: utf-8 -*-
+"""
+KI Risiko – Executive Summary Generator (LLM / GenAI-Nexus Azure-style)
+
+Reads:
+  C:\Users\SHTANDO\Desktop\KI Risko\Analyse_Tabelle\analyse_tabelle_<rohst>.csv
+
+Writes:
+  C:\Users\SHTANDO\Desktop\KI Risko\Executive_Summary_<rohst>\Executive_Summary_Artikelweise_<rohst>.xlsx
+"""
+
+import os
+import csv
+import re
+from pathlib import Path
+from collections import Counter
+from datetime import datetime
+
+from openpyxl import Workbook
+from openai import AzureOpenAI
+
+
+# ============================================================
+# 1) LLM SETTINGS (Your Nexus Config)
+# ============================================================
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"   # NO /apikey/
 AZURE_API_VERSION = "2024-06-01"
 AZURE_DEPLOYMENT_NAME = "gpt-5.1"
 
 LLM_TEMPERATURE = 0.10
 LLM_MAX_COMPLETION_TOKENS = 1200
+
+
+# ============================================================
+# 2) PATHS
+# ============================================================
+PROJECT_ROOT = Path(r"C:\Users\SHTANDO\Desktop\KI Risko")
+ANALYSE_DIR = PROJECT_ROOT / "Analyse_Tabelle"
+SETTINGS_DIR = PROJECT_ROOT / "Textdoks_für_Einstellungen_der_Suche"
+EINSTELLUNGEN_CSV = SETTINGS_DIR / "Einstellungen_Analyse.csv"
+
+
+# ============================================================
+# 3) CREATE LLM CLIENT
+# ============================================================
+# IMPORTANT:
+# Before running, set your key in notebook:
+# os.environ["AZURE_OPENAI_API_KEY"] = "PASTE_KEY"
+
+client = AzureOpenAI(
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_version=AZURE_API_VERSION,
+)
+
+
+# ============================================================
+# 4) LOAD SETTINGS (rohst/rawm)
+# ============================================================
+rohst = rawm = None
+
+def lese_einstellungen():
+    global rohst, rawm
+    with EINSTELLUNGEN_CSV.open("r", encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.reader(f, delimiter=","))
+
+    def get_row(idx, default=""):
+        if len(rows) > idx and len(rows[idx]) > 0:
+            return (rows[idx][0] or "").strip()
+        return default
+
+    rohst = get_row(5, "Stahl")
+    rawm  = get_row(8, "Steel")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded settings → rohst={rohst}, rawm={rawm}")
+
+
+# ============================================================
+# 5) LOAD ANALYSIS TABLE
+# ============================================================
+def lade_analyse_tabelle():
+    analyse_path = ANALYSE_DIR / f"analyse_tabelle_{rohst}.csv"
+    if not analyse_path.exists():
+        raise FileNotFoundError(f"Analysis file not found: {analyse_path}")
+
+    with analyse_path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f, delimiter=";")
+        rows = list(reader)
+
+    header = rows[0]
+    data_rows = rows[1:]
+
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Loaded {len(data_rows)} analysed rows")
+    return header, data_rows
+
+
+def get_cell(header, row, col, default="Not in Text"):
+    if col in header:
+        idx = header.index(col)
+        if idx < len(row) and (row[idx] or "").strip():
+            return (row[idx] or "").strip()
+    return default
+
+
+# ============================================================
+# 6) LLM CALL (Safe Wrapper)
+# ============================================================
+def llm_generate(prompt: str) -> str:
+    try:
+        response = client.chat.completions.create(
+            model=AZURE_DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": "You are a professional ESG and human-rights risk analyst. Never invent facts."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=LLM_TEMPERATURE,
+            max_completion_tokens=LLM_MAX_COMPLETION_TOKENS,
+        )
+        return (response.choices[0].message.content or "").strip()
+
+    except Exception as e:
+        print("⚠️ GPT error:", repr(e))
+        return "LLM generation failed due to permission or configuration issue."
+
+
+# ============================================================
+# 7) BUILD ARTICLE PROMPT
+# ============================================================
+def build_case_prompt(header, row):
+    link = get_cell(header, row, "link", "")
+
+    structured = "\n".join([
+        f"Risk categories: {get_cell(header,row,'Risikokategorien (A–M)','')}",
+        f"Types of harm: {get_cell(header,row,'Arten der Menschenrechts-/Umweltschädigungen','')}",
+        f"Reasoning: {get_cell(header,row,'Begründung','')}",
+        f"Years: {get_cell(header,row,'Jahr(e)','')}",
+        f"Countries: {get_cell(header,row,'Land/Länder','')}",
+        f"Companies: {get_cell(header,row,'Involvierte Unternehmen','')}",
+        f"Severity: {get_cell(header,row,'Schwere','')}",
+    ])
+
+    return f"""
+Write a professional executive summary (180–300 words) about ESG and human-rights risks 
+related to the raw material "{rawm}".
+
+Use ONLY the structured data below. Do NOT invent facts.
+Focus on environmental harm, human-rights violations, labour abuse, or discrimination risks.
+
+Structured data:
+{structured}
+
+End with:
+[Article link: {link}]
+"""
+
+
+# ============================================================
+# 8) BUILD OVERALL PROMPT
+# ============================================================
+def build_overall_prompt(facts):
+    return f"""
+Write ONE consolidated executive summary (300–450 words) about ESG and human-rights risks
+associated with the raw material "{rawm}", based ONLY on the aggregated facts below.
+
+Do not invent incidents.
+
+Facts:
+Total cases: {facts['total']}
+Top countries: {facts['countries']}
+Top years: {facts['years']}
+Severity distribution: {facts['severity']}
+"""
+
+
+# ============================================================
+# 9) COMPUTE OVERALL FACTS
+# ============================================================
+def compute_overall_facts(header, rows):
+    countries = Counter()
+    years = Counter()
+    severity = Counter()
+
+    for row in rows:
+        c = get_cell(header,row,"Land/Länder","")
+        if c != "Not in Text":
+            for part in re.split(r"[;,/|]+", c):
+                countries[part.strip()] += 1
+
+        y = get_cell(header,row,"Jahr(e)","")
+        for year in re.findall(r"\b(19\d{{2}}|20\d{{2}})\b", y):
+            years[year] += 1
+
+        s = get_cell(header,row,"Schwere","")
+        if s != "Not in Text":
+            severity[s] += 1
+
+    return {
+        "total": len(rows),
+        "countries": countries.most_common(5),
+        "years": years.most_common(5),
+        "severity": dict(severity)
+    }
+
+
+# ============================================================
+# 10) WRITE EXCEL
+# ============================================================
+def write_excel(header, rows):
+    exec_dir = PROJECT_ROOT / f"Executive_Summary_{rohst}"
+    exec_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = exec_dir / f"Executive_Summary_Artikelweise_{rohst}.xlsx"
+
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    # Article sheets
+    for i, row in enumerate(rows, start=1):
+        print(f"Generating summary for article {i}/{len(rows)}...")
+        ws = wb.create_sheet(title=f"Case_{i}"[:31])
+
+        summary = llm_generate(build_case_prompt(header,row))
+
+        ws["A1"] = "Link"
+        ws["B1"] = get_cell(header,row,"link","")
+        ws["A3"] = "Executive Summary"
+        ws["B3"] = summary
+
+        ws.column_dimensions["A"].width = 40
+        ws.column_dimensions["B"].width = 120
+
+    # Overall sheet
+    ws_overall = wb.create_sheet(title="Overall_Summary")
+    facts = compute_overall_facts(header, rows)
+
+    overall_summary = llm_generate(build_overall_prompt(facts))
+
+    ws_overall["A1"] = "Overall Executive Summary"
+    ws_overall["A3"] = overall_summary
+
+    wb.save(out_path)
+    print(f"\n✅ Excel file written to:\n{out_path}")
+
+
+# ============================================================
+# 11) MAIN
+# ============================================================
+if __name__ == "__main__":
+    lese_einstellungen()
+    header, rows = lade_analyse_tabelle()
+    write_excel(header, rows)
