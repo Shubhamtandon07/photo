@@ -1,19 +1,105 @@
-=== RUN START ===
-Run timestamp: 2026-02-27 13:01:49
-=================
+def _deep_collect_strings(obj, keys=("text", "content", "output_text")) -> list[str]:
+    """
+    Recursively collect string payloads from a nested dict/list structure.
+    Only collects values under common text-bearing keys.
+    """
+    out = []
 
-Loading KB docs from: C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data
-KB docs: 22
-Mailbox=shubham.tandon@mercedes-benz.com | Folder=Inbox
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in keys and isinstance(v, str) and v.strip():
+                out.append(v.strip())
+            else:
+                out.extend(_deep_collect_strings(v, keys=keys))
 
-[PASS] bot mail: sustainable-procurement@mercedes-benz.com
-Question: Was sind die Fokusprämissen Nachhaltigkeit für die Vergabe Umweltbezogene Anforderungen
-Top docs: ['m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx', 'm0010_Sustainability_premises_V202302-1-FA.docx', 'm0020_8.6_Sustainability_premises_V202302-1-FA-IND_Brose_signed.docx', '2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx']
-Requirement lines: 120
-Sources: ['m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx', 'm0010_Sustainability_premises_V202302-1-FA.docx', 'm0020_8.6_Sustainability_premises_V202302-1-FA-IND_Brose_signed.docx']
-LLM reply len: 0
-LLM preview: ''
-WARNING: LLM returned empty. Using fallback deterministic email.
-Draft created for: bot
+    elif isinstance(obj, list):
+        for it in obj:
+            out.extend(_deep_collect_strings(it, keys=keys))
 
-Done. Checked=251, Drafted=1
+    return out
+
+
+def _extract_chat_text(resp) -> str:
+    """
+    Robustly extract assistant text from ChatCompletions response.
+    Works across:
+    - message.content as str
+    - message.content as list of parts (objects or dicts)
+    - fallback deep scan over model_dump()
+    """
+    # 1) Standard path
+    try:
+        msg = resp.choices[0].message
+        content = getattr(msg, "content", None)
+
+        if isinstance(content, str):
+            return content.strip()
+
+        # 2) List-of-parts path
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                # dict part
+                if isinstance(p, dict):
+                    t = p.get("text")
+                    if isinstance(t, str) and t.strip():
+                        parts.append(t.strip())
+                    elif isinstance(t, dict):
+                        # sometimes: {"text": {"value": "..."}}
+                        v = t.get("value")
+                        if isinstance(v, str) and v.strip():
+                            parts.append(v.strip())
+                else:
+                    # object part
+                    t = getattr(p, "text", None)
+                    if isinstance(t, str) and t.strip():
+                        parts.append(t.strip())
+                    elif t is not None:
+                        v = getattr(t, "value", None)
+                        if isinstance(v, str) and v.strip():
+                            parts.append(v.strip())
+
+            joined = "\n".join(parts).strip()
+            if joined:
+                return joined
+
+    except Exception:
+        pass
+
+    # 3) Deep scan fallback
+    try:
+        dump = resp.model_dump()
+        candidates = _deep_collect_strings(dump, keys=("text", "content", "output_text"))
+        # Filter out junk like the user prompt repeating (optional)
+        if candidates:
+            # Prefer longer candidates (usually the actual assistant output)
+            candidates.sort(key=len, reverse=True)
+            return candidates[0].strip()
+    except Exception:
+        pass
+
+    return ""
+
+
+def call_llm(client: AzureOpenAI, prompt: str) -> str:
+    resp = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+        temperature=LLM_TEMPERATURE,
+        max_completion_tokens=LLM_MAX_COMPLETION_TOKENS,
+        messages=[
+            {"role": "system", "content": "Follow the required format exactly. Use only FINDINGS."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+
+    text = _extract_chat_text(resp)
+
+    # Debug (keep this until stable)
+    if DEBUG_PRINT_LLM_PREVIEW:
+        try:
+            mc = resp.choices[0].message.content
+            print("DEBUG message.content type:", type(mc))
+        except Exception:
+            print("DEBUG could not inspect message.content")
+
+    return text.strip()
