@@ -1,54 +1,13 @@
-# === Nexus GPT-5.1 quick health check (Notebook-safe) ===
-# Run this cell first. It verifies:
-# 1) OPENAI_API_KEY is present
-# 2) Endpoint + deployment works (expects exactly "OK")
-# 3) Prints response shape + finish_reason + content (so you see if empty)
+OPENAI_API_KEY present: True len: 36
 
-import os, json
-from openai import AzureOpenAI
+=== RESPONSE META ===
+type(resp): <class 'openai.types.chat.chat_completion.ChatCompletion'>
+choices: 1
+finish_reason: stop
 
-AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"   # no /apikey/
-AZURE_API_VERSION = "2024-06-01"
-AZURE_DEPLOYMENT_NAME = "gpt-5.1"
+=== CONTENT ===
+message.content type: <class 'str'>
+message.content: 'OK'
 
-key = os.getenv("OPENAI_API_KEY", "")
-print("OPENAI_API_KEY present:", bool(key), "len:", len(key))
-
-client = AzureOpenAI(
-    api_key=key,
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_version=AZURE_API_VERSION,
-)
-
-resp = client.chat.completions.create(
-    model=AZURE_DEPLOYMENT_NAME,
-    temperature=0.0,
-    max_completion_tokens=30,
-    messages=[
-        {"role": "system", "content": "Reply with exactly: OK"},
-        {"role": "user", "content": "ping"},
-    ],
-)
-
-print("\n=== RESPONSE META ===")
-print("type(resp):", type(resp))
-print("choices:", len(resp.choices) if hasattr(resp, "choices") else None)
-try:
-    print("finish_reason:", getattr(resp.choices[0], "finish_reason", None))
-except Exception as e:
-    print("finish_reason: <err>", repr(e))
-
-print("\n=== CONTENT ===")
-try:
-    content = resp.choices[0].message.content
-    print("message.content type:", type(content))
-    print("message.content:", repr(content))
-except Exception as e:
-    print("content read error:", repr(e))
-
-print("\n=== DUMP (first 1200 chars) ===")
-try:
-    d = resp.model_dump()
-    print(json.dumps(d, ensure_ascii=False)[:1200])
-except Exception as e:
-    print("model_dump error:", repr(e))
+=== DUMP (first 1200 chars) ===
+{"id": "chatcmpl-DDrqYCXfyp2EnblkbhgiQOmhbAkZ0", "choices": [{"finish_reason": "stop", "index": 0, "logprobs": null, "message": {"content": "OK", "refusal": null, "role": "assistant", "annotations": [], "audio": null, "function_call": null, "tool_calls": null}, "content_filter_results": {"hate": {"filtered": false, "severity": "safe"}, "protected_material_code": {"filtered": false, "detected": false}, "protected_material_text": {"filtered": false, "detected": false}, "self_harm": {"filtered": false, "severity": "safe"}, "sexual": {"filtered": false, "severity": "safe"}, "violence": {"filtered": false, "severity": "safe"}}}], "created": 1772197622, "model": "gpt-5.1-2025-11-13", "object": "chat.completion", "service_tier": null, "system_fingerprint": null, "usage": {"completion_tokens": 11, "prompt_tokens": 16, "total_tokens": 27, "completion_tokens_details": {"accepted_prediction_tokens": 0, "audio_tokens": 0, "reasoning_tokens": 0, "rejected_prediction_tokens": 0}, "prompt_tokens_details": {"audio_tokens": 0, "cached_tokens": 0}}, "prompt_filter_results": [{"prompt_index": 0, "content_filter_results": {"hate": {"filtered": false, "severity": "safe"}, "jailbreak": {"filtered": fals
