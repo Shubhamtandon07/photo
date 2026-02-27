@@ -1,105 +1,57 @@
-def _deep_collect_strings(obj, keys=("text", "content", "output_text")) -> list[str]:
-    """
-    Recursively collect string payloads from a nested dict/list structure.
-    Only collects values under common text-bearing keys.
-    """
-    out = []
+from openai import AzureOpenAI
+import os, json
 
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if k in keys and isinstance(v, str) and v.strip():
-                out.append(v.strip())
-            else:
-                out.extend(_deep_collect_strings(v, keys=keys))
+# Use the same env var you already set in the notebook:
+# os.environ["OPENAI_API_KEY"] = "..."
 
-    elif isinstance(obj, list):
-        for it in obj:
-            out.extend(_deep_collect_strings(it, keys=keys))
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-5.1"
 
-    return out
+client = AzureOpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_version=AZURE_API_VERSION,
+)
 
+resp = client.chat.completions.create(
+    model=AZURE_DEPLOYMENT_NAME,
+    temperature=0.0,
+    max_completion_tokens=80,
+    messages=[
+        {"role":"system","content":"Reply with exactly OK (no punctuation)."},
+        {"role":"user","content":"ping"},
+    ],
+)
 
-def _extract_chat_text(resp) -> str:
-    """
-    Robustly extract assistant text from ChatCompletions response.
-    Works across:
-    - message.content as str
-    - message.content as list of parts (objects or dicts)
-    - fallback deep scan over model_dump()
-    """
-    # 1) Standard path
-    try:
-        msg = resp.choices[0].message
-        content = getattr(msg, "content", None)
+print("=== BASIC SHAPE ===")
+print("type(resp):", type(resp))
+print("has choices:", hasattr(resp, "choices"))
+print("choices len:", len(resp.choices) if hasattr(resp, "choices") else None)
 
-        if isinstance(content, str):
-            return content.strip()
+msg = resp.choices[0].message
+mc = getattr(msg, "content", None)
 
-        # 2) List-of-parts path
-        if isinstance(content, list):
-            parts = []
-            for p in content:
-                # dict part
-                if isinstance(p, dict):
-                    t = p.get("text")
-                    if isinstance(t, str) and t.strip():
-                        parts.append(t.strip())
-                    elif isinstance(t, dict):
-                        # sometimes: {"text": {"value": "..."}}
-                        v = t.get("value")
-                        if isinstance(v, str) and v.strip():
-                            parts.append(v.strip())
-                else:
-                    # object part
-                    t = getattr(p, "text", None)
-                    if isinstance(t, str) and t.strip():
-                        parts.append(t.strip())
-                    elif t is not None:
-                        v = getattr(t, "value", None)
-                        if isinstance(v, str) and v.strip():
-                            parts.append(v.strip())
+print("\n=== message.content ===")
+print("type(message.content):", type(mc))
+print("message.content repr:", repr(mc)[:400])
 
-            joined = "\n".join(parts).strip()
-            if joined:
-                return joined
+# If content is list of parts, print each part
+if isinstance(mc, list):
+    print("\n=== content parts ===")
+    for i, p in enumerate(mc, start=1):
+        print(f"part[{i}] type:", type(p))
+        if isinstance(p, dict):
+            print("  keys:", list(p.keys()))
+            print("  text:", repr(p.get("text"))[:300])
+            print("  content:", repr(p.get("content"))[:300])
+        else:
+            print("  attrs:", [a for a in ["type","text","content","output_text","value"] if hasattr(p, a)])
+            for a in ["type","text","content","output_text","value"]:
+                if hasattr(p, a):
+                    print(f"  {a}:", repr(getattr(p,a))[:300])
 
-    except Exception:
-        pass
-
-    # 3) Deep scan fallback
-    try:
-        dump = resp.model_dump()
-        candidates = _deep_collect_strings(dump, keys=("text", "content", "output_text"))
-        # Filter out junk like the user prompt repeating (optional)
-        if candidates:
-            # Prefer longer candidates (usually the actual assistant output)
-            candidates.sort(key=len, reverse=True)
-            return candidates[0].strip()
-    except Exception:
-        pass
-
-    return ""
-
-
-def call_llm(client: AzureOpenAI, prompt: str) -> str:
-    resp = client.chat.completions.create(
-        model=AZURE_DEPLOYMENT_NAME,
-        temperature=LLM_TEMPERATURE,
-        max_completion_tokens=LLM_MAX_COMPLETION_TOKENS,
-        messages=[
-            {"role": "system", "content": "Follow the required format exactly. Use only FINDINGS."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-
-    text = _extract_chat_text(resp)
-
-    # Debug (keep this until stable)
-    if DEBUG_PRINT_LLM_PREVIEW:
-        try:
-            mc = resp.choices[0].message.content
-            print("DEBUG message.content type:", type(mc))
-        except Exception:
-            print("DEBUG could not inspect message.content")
-
-    return text.strip()
+print("\n=== model_dump top keys ===")
+d = resp.model_dump()
+print(list(d.keys()))
+print("dump preview:", json.dumps(d, ensure_ascii=False)[:800])
