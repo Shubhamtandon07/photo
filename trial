@@ -1,17 +1,6 @@
-
-=== RUN START ===
-Run timestamp: 2026-02-27 11:28:53
-=================
-
-Loading KB docs from: C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data
-KB docs: 22
-Mailbox=shubham.tandon@mercedes-benz.com | Folder=Inbox
-
-[PASS] bot mail: sustainable-procurement@mercedes-benz.com
-Question: Was sind die Fokusprämissen Nachhaltigkeit für die Vergabe Umweltbezogene Anforderungen
-Top docs: ['m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx', 'm0010_Sustainability_premises_V202302-1-FA.docx', 'm0020_8.6_Sustainability_premises_V202302-1-FA-IND_Brose_signed.docx', '2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx']
-Requirement lines: 120
-Sources: ['m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx', 'm0010_Sustainability_premises_V202302-1-FA.docx', 'm0020_8.6_Sustainability_premises_V202302-1-FA-IND_Brose_signed.docx']
-Mail error: bot - AuthenticationError("Error code: 401 - {'message': 'Unauthorized'}")
-
-Done. Checked=251, Drafted=0
+print("=== CONFIG CHECK ===")
+k = os.getenv("OPENAI_API_KEY", "")
+print("OPENAI_API_KEY present:", bool(k), "len:", len(k))
+print("Endpoint:", AZURE_OPENAI_ENDPOINT)
+print("Deployment:", AZURE_DEPLOYMENT_NAME)
+print("====================")
