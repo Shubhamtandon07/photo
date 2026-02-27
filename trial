@@ -1,12 +1,40 @@
-=== BASIC SHAPE ===
-type(resp): <class 'openai.types.chat.chat_completion.ChatCompletion'>
-has choices: True
-choices len: 1
+def extract_text_from_chat(resp) -> str:
+    msg = resp.choices[0].message
+    c = getattr(msg, "content", None)
 
-=== message.content ===
-type(message.content): <class 'str'>
-message.content repr: 'OK'
+    if isinstance(c, str):
+        return c.strip()
 
-=== model_dump top keys ===
-['id', 'choices', 'created', 'model', 'object', 'service_tier', 'system_fingerprint', 'usage', 'prompt_filter_results']
-dump preview: {"id": "chatcmpl-DDrPztbCP7ADAQHekEgHBghEZP85G", "choices": [{"finish_reason": "stop", "index": 0, "logprobs": null, "message": {"content": "OK", "refusal": null, "role": "assistant", "annotations": [], "audio": null, "function_call": null, "tool_calls": null}, "content_filter_results": {"hate": {"filtered": false, "severity": "safe"}, "protected_material_code": {"filtered": false, "detected": false}, "protected_material_text": {"filtered": false, "detected": false}, "self_harm": {"filtered": false, "severity": "safe"}, "sexual": {"filtered": false, "severity": "safe"}, "violence": {"filtered": false, "severity": "safe"}}}], "created": 1772195975, "model": "gpt-5.1-2025-11-13", "object": "chat.completion", "service_tier": null, "system_fingerprint": null, "usage": {"completion_tokens": 11,
+    if isinstance(c, list):
+        parts = []
+        for p in c:
+            if isinstance(p, dict):
+                t = p.get("text") or p.get("output_text")
+                if isinstance(t, str) and t.strip():
+                    parts.append(t.strip())
+            else:
+                t = getattr(p, "text", None) or getattr(p, "output_text", None)
+                if isinstance(t, str) and t.strip():
+                    parts.append(t.strip())
+        return "\n".join(parts).strip()
+
+    # last resort
+    try:
+        d = resp.model_dump()
+        # pick longest string among common keys
+        cand = []
+        def walk(x):
+            if isinstance(x, dict):
+                for k,v in x.items():
+                    if k in ("text","content","output_text") and isinstance(v,str) and v.strip():
+                        cand.append(v.strip())
+                    else:
+                        walk(v)
+            elif isinstance(x, list):
+                for it in x:
+                    walk(it)
+        walk(d)
+        cand.sort(key=len, reverse=True)
+        return cand[0].strip() if cand else ""
+    except Exception:
+        return ""
