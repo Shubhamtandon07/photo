@@ -1,40 +1,693 @@
-Hallo Sustainable-procurement,
-für die Vergabe im Bereich „Umweltbezogene Anforderungen“ lassen sich aus den Unterlagen folgende Fokusprämissen Nachhaltigkeit ableiten:
-- **Sekundärmaterial-Ziele (Secondary Material Target Values)**
-Der Partner bestätigt, dass mit der zuständigen Bauteilverantwortung bei Mercedes-Benz eine Vereinbarung zu Zielwerten für den Einsatz von Sekundärmaterial getroffen wurde. Diese Zielwerte sind verbindlicher Bestandteil der umweltbezogenen Anforderungen.
-- **CO₂-Ziele für Rohmaterialien (Metalle, Polymere, Glas) bis SOP – 2039**
-Es bestehen spezifische CO₂-Zielvorgaben für die Produktion der Rohmaterialien
-- Metalle
-- Polymere
-- Glas
-mit einem Zeithorizont bis spätestens SOP 2039. Diese CO₂-Ziele sind als zentrale Nachhaltigkeitsprämisse für die Vergabe hinterlegt.
-- **Strom aus erneuerbaren Energien bei Tier 1**
-Der Partner muss für die Herstellung der Mercedes Benz Produkte in seiner eigenen Produktion Strom aus erneuerbaren Energien einsetzen (Scope 1 + 2).
-Kurzfassung:
-- Vereinbarte Sekundärmaterial-Zielwerte mit Mercedes-Benz.
-- CO₂-Ziele für Metalle, Polymere und Glas bis SOP 2039.
-- Einsatz von erneuerbarem Strom (Scope 1+2) in der Tier 1-Produktion.
-Mit freundlichen Grüßen
-Shubham
-Sources used: m0020_8.6_Sustainability_premises_V202302-1-FA-IND_Brose_signed.docx, sustainability_premises_V202304-1-Software_Bose_IND.docx, m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx, m0010_Sustainability_premises_V202302-1-FA.docx
----
-Hello Sustainable-procurement,
-for sourcing under the “Environmental Requirements” section, the following sustainability focus premises can be derived from the documents:
-- **Secondary material target values**
-The partner confirms that an agreement has been reached with the responsible component manager at Mercedes-Benz regarding target values for the use of secondary material. These target values are a binding part of the environmental requirements.
-- **CO₂ targets for raw materials (metals, polymers, glass) until SOP – 2039**
-There are specific CO₂ target values for the production of the raw materials
-- metals
-- polymers
-- glass
-with a time horizon up to SOP 2039. These CO₂ targets are defined as key sustainability premises for awarding.
-- **Electricity from renewable energies at Tier 1**
-The partner must use electricity from renewable energies (Scope 1 + 2) in its own production for manufacturing Mercedes-Benz products.
-Short summary:
-- Agreed secondary material target values with Mercedes-Benz.
-- CO₂ targets for metals, polymers and glass until SOP 2039.
-- Use of renewable electricity (Scope 1+2) in Tier 1 production.
-Best regards,
-Shubham
-Sources used: m0020_8.6_Sustainability_premises_V202302-1-FA-IND_Brose_signed.docx, sustainability_premises_V202304-1-Software_Bose_IND.docx, m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx, m0010_Sustainability_premises_V202302-1-FA.docx
+# -*- coding: utf-8 -*-
+"""
+OUTLOOK DRAFT BOT (LLM + COVERAGE RAG) — Notebook-safe + VSCode-friendly (Python 3.14)
+====================================================================================
 
+What changed vs your last version:
+- Retrieval is now COVERAGE-DRIVEN:
+  1) pick top documents (authority first; AW/RE demoted but allowed)
+  2) extract MANY requirement-like lines from those docs (not just a few sentences)
+  3) feed GPT a clean "Requirement Pack"
+- Output is forced into Copilot-like structure:
+  - Subject line
+  - Numbered sections
+  - Short bilingual summary if needed
+  - Sources used (doc titles only)
+
+Still:
+- Subject must be exactly "bot"
+- Marks read + category
+- Self notify + Task reminder
+- Uses Nexus AzureOpenAI gpt-5.1 with max_completion_tokens
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import time
+from pathlib import Path
+from datetime import datetime, timedelta
+from html import escape
+from typing import List, Tuple, Dict
+
+import win32com.client as win32
+from openai import AzureOpenAI
+
+
+# =========================
+# CONFIG — EDIT THESE
+# =========================
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"
+WATCH_FOLDER_NAME = "Inbox"
+
+KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
+
+STRICT_SUBJECT = "bot"
+
+REQUIRE_UNREAD = True
+PROCESS_PER_RUN = 3
+SCAN_LIMIT = 250
+STARTUP_DELAY_SEC = 1
+
+PROCESSED_CATEGORY = "Drafted-LLM"
+
+SELF_NOTIFY = True
+SELF_NOTIFY_TO = TARGET_MAILBOX
+CREATE_REMINDER_TASK = True
+REMINDER_DAYS = 2
+
+PRINT_RUN_TIMESTAMP = True
+
+# KB reading
+SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
+MAX_DOCS = 5000
+MAX_CHARS_PER_DOC = 220_000
+
+# Retrieval behavior
+TOP_DOCS_PASS_A = 4     # prefer non-mail docs
+TOP_DOCS_PASS_B = 2     # add up to 2 mail-chain docs if needed
+MAX_REQUIREMENT_LINES = 120   # what we feed to GPT (clean lines)
+MAX_EVIDENCE_CHARS_PER_LINE = 280
+
+# De-prioritize mail-chain-like documents
+MAILY_PREFIXES = ("aw_", "re_", "fw_", "wg_")
+MAILY_HINTS = ("subject", "mail", "email", "outlook", ".msg", "conversation")
+
+# Exclude maily docs from Sources list (but still can be used as evidence)
+EXCLUDE_AS_SOURCES_PREFIXES = ("aw_", "re_", "fw_", "wg_")
+
+# LLM settings (GenAI-Nexus / Azure-style)
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"  # NO /apikey/
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-5.1"
+
+LLM_TEMPERATURE = 0.10
+LLM_MAX_COMPLETION_TOKENS = 1100
+
+
+# =========================
+# BASIC TEXT UTILS
+# =========================
+STOPWORDS = set("""
+the a an and or to of in on for with without from by at is are was were be been being
+der die das und oder zu von im in am an auf für mit ohne aus bei ist sind war waren
+""".split())
+
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def strict_subject_ok(subject: str) -> bool:
+    return (subject or "").strip().casefold() == STRICT_SUBJECT.casefold()
+
+def clean_html_to_text(html: str) -> str:
+    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
+    return clean_ws(txt)
+
+def clean_question(q: str) -> str:
+    try:
+        import html as _html
+        q = _html.unescape(q or "")
+    except Exception:
+        q = q or ""
+    q = q.replace("\xa0", " ")
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+def safe_firstname_from_email(email: str) -> str:
+    email = (email or "").strip()
+    local = email.split("@", 1)[0] if "@" in email else email
+    first = local.split(".", 1)[0].strip()
+    if not first:
+        return "Colleague"
+    return first[:1].upper() + first[1:]
+
+def format_outlook_html(text: str) -> str:
+    text = (text or "").replace("\r\n", "\n").strip()
+    if not text:
+        return "<p></p>"
+    blocks = re.split(r"\n\s*\n", text)
+    out = []
+    for block in blocks:
+        lines = [ln.rstrip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
+        if all(ln.lstrip().startswith("- ") for ln in lines):
+            out.append("<ul>")
+            for ln in lines:
+                ln2 = ln.lstrip()[2:].strip()
+                out.append(f"<li>{escape(ln2)}</li>")
+            out.append("</ul>")
+        else:
+            out.append("<p>" + "<br>".join(escape(ln.strip()) for ln in lines) + "</p>")
+    return "\n".join(out)
+
+def tokenize(s: str) -> List[str]:
+    toks = re.split(r"[^a-zA-Z0-9ÄÖÜäöüß]+", (s or "").lower())
+    return [t for t in toks if t and t not in STOPWORDS and len(t) >= 3]
+
+
+# =========================
+# KB READERS
+# =========================
+def read_txt(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="ignore")
+
+def read_docx(p: Path) -> str:
+    try:
+        from docx import Document as DocxDocument  # type: ignore
+    except Exception:
+        return ""
+    doc = DocxDocument(str(p))
+    paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
+    table_lines = []
+    for t in doc.tables:
+        for row in t.rows:
+            cells = [clean_ws(c.text) for c in row.cells]
+            if any(cells):
+                table_lines.append(" | ".join(cells))
+    return (paras + "\n" + "\n".join(table_lines)).strip()
+
+def read_pdf(p: Path) -> str:
+    try:
+        import pdfplumber  # type: ignore
+        out = []
+        with pdfplumber.open(str(p)) as pdf:
+            for page in pdf.pages:
+                out.append(page.extract_text() or "")
+        return "\n".join(out).strip()
+    except Exception:
+        pass
+    try:
+        from pypdf import PdfReader  # type: ignore
+        r = PdfReader(str(p))
+        out = []
+        for pg in r.pages:
+            try:
+                out.append(pg.extract_text() or "")
+            except Exception:
+                pass
+        return "\n".join(out).strip()
+    except Exception:
+        return ""
+
+def read_xlsx(p: Path) -> str:
+    try:
+        import openpyxl  # type: ignore
+    except Exception:
+        return ""
+    wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+    out = []
+    for ws in wb.worksheets:
+        out.append(f"Sheet: {ws.title}")
+        max_rows = min(ws.max_row or 0, 200)
+        max_cols = min(ws.max_column or 0, 40)
+        for r in range(1, max_rows + 1):
+            row_vals = []
+            for c in range(1, max_cols + 1):
+                v = ws.cell(row=r, column=c).value
+                row_vals.append("" if v is None else str(v))
+            if any(x.strip() for x in row_vals):
+                out.append(" | ".join(clean_ws(x) for x in row_vals))
+    return "\n".join(out).strip()
+
+def extract_text_from_file(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext == ".txt":
+        return read_txt(p)
+    if ext == ".docx":
+        return read_docx(p)
+    if ext == ".pdf":
+        return read_pdf(p)
+    if ext == ".xlsx":
+        return read_xlsx(p)
+    return ""
+
+def is_maily_filename(p: Path) -> bool:
+    name = (p.name or "").lower()
+    stem = (p.stem or "").lower()
+    if stem.startswith("~$"):
+        return True
+    if stem.startswith(MAILY_PREFIXES):
+        return True
+    if any(h in name for h in MAILY_HINTS):
+        return True
+    return False
+
+
+# =========================
+# LOAD DOCS (doc-level)
+# =========================
+def load_kb_docs(kb_dir: str) -> List[Tuple[str, str, str, bool]]:
+    base = Path(kb_dir)
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"KB_DIR not found: {kb_dir}")
+
+    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    files = files[:MAX_DOCS]
+
+    docs = []
+    for p in sorted(files):
+        try:
+            txt = extract_text_from_file(p)
+            txt = (txt or "").strip()
+            if not txt:
+                continue
+            txt = txt[:MAX_CHARS_PER_DOC]
+            docs.append((str(p), p.name, txt, is_maily_filename(p)))
+        except Exception:
+            continue
+    return docs
+
+
+def doc_priority_adjustment(filename: str) -> float:
+    fn = (filename or "").lower()
+    score = 0.0
+    if fn.startswith(MAILY_PREFIXES):
+        score -= 0.70
+    if any(h in fn for h in MAILY_HINTS):
+        score -= 0.25
+    if re.search(r"(?i)\b(mbn|din|iso|vda|standard|policy|guideline|kapitel|chapter|requirements|norm)\b", fn):
+        score += 0.25
+    return score
+
+
+def rank_docs_simple(docs, query: str, include_maily: bool, top_k: int) -> List[Tuple[float, str, str, str, bool]]:
+    q_toks = set(tokenize(query))
+    scored = []
+    for fullpath, fname, text, is_maily in docs:
+        if (not include_maily) and is_maily:
+            continue
+        tl = text.lower()
+        overlap = sum(1 for tk in q_toks if tk in tl)
+        base = overlap / max(1, len(q_toks))
+        score = float(base) + doc_priority_adjustment(fname)
+        scored.append((score, fullpath, fname, text, is_maily))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:top_k]
+
+
+# =========================
+# REQUIREMENT-LINE EXTRACTION (coverage)
+# =========================
+REQ_LINE_RE = re.compile(
+    r"(?i)\b(must|shall|required|requirement|need to|has to|within\s+\d+\s*(days|weeks)|"
+    r"muss|soll|verpflicht|erforder|anforder|ist\s+innerhalb|innerhalb\s+von|"
+    r"gemäß|in\s+accordance|nachweis|beleg|offenlegung|disclose|submit|"
+    r"CMRT|RMAP|SAQ|DDQ|SupplierAssurance|tier[-\s]*n|lieferkette|transparenz)\b"
+)
+
+SECTION_RE = re.compile(r"^\s*(\d+(\.\d+){0,3})\s+|^\s*(Kapitel|Chapter)\s+\d+", re.I)
+
+def extract_requirement_lines(text: str) -> List[str]:
+    """
+    Pulls "good" lines from a doc:
+    - requirement-like sentences
+    - section headings
+    - table rows with requirement verbs
+    """
+    if not text:
+        return []
+    # split by lines AND by sentence-ish boundaries
+    raw = re.split(r"\n+|(?<=[\.\!\?])\s+", text)
+    out = []
+    for r in raw:
+        s = clean_ws(r)
+        if not s or len(s) < 18:
+            continue
+        # reduce pipe-garbage
+        s = re.sub(r"\s*\|\s*", " | ", s)
+        s = re.sub(r"(\b\w+\b)( \| \1){2,}", r"\1", s, flags=re.I)  # collapse repeats
+        if SECTION_RE.search(s) or REQ_LINE_RE.search(s):
+            # cap line length
+            if len(s) > MAX_EVIDENCE_CHARS_PER_LINE:
+                s = s[:MAX_EVIDENCE_CHARS_PER_LINE] + "…"
+            out.append(s)
+    # de-dup
+    seen = set()
+    uniq = []
+    for s in out:
+        k = s.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(s)
+    return uniq
+
+
+def build_requirement_pack(top_docs, question: str, max_lines: int) -> Tuple[List[Tuple[str,str,bool]], List[str]]:
+    """
+    Returns:
+      - findings: [(filename, line, is_maily)]
+      - sources: up to 6 non-maily docs
+    """
+    q_toks = set(tokenize(question))
+    findings = []
+
+    for score, fullpath, fname, text, is_maily in top_docs:
+        lines = extract_requirement_lines(text)
+
+        # score lines by query overlap + anchors
+        scored_lines = []
+        for ln in lines:
+            ltoks = set(tokenize(ln))
+            overlap = len(q_toks & ltoks)
+            anchor = 0
+            if any(w in ln.lower() for w in ["umwelt", "environment", "co2", "co₂", "sekundär", "rezykl", "grünstrom", "renewable"]):
+                anchor += 2
+            if any(w in ln.lower() for w in ["lieferkette", "tier", "transparenz", "saq", "ddq", "cmrt", "rmap"]):
+                anchor += 2
+            scored_lines.append((overlap + anchor, ln))
+
+        scored_lines.sort(key=lambda x: x[0], reverse=True)
+
+        # take more from real docs, fewer from mail-chains
+        take = 45 if not is_maily else 18
+        for s, ln in scored_lines[:take]:
+            if s <= 0 and not REQ_LINE_RE.search(ln):
+                continue
+            findings.append((fname, ln, is_maily))
+
+    # global de-dup and cap
+    seen = set()
+    final = []
+    for fname, ln, is_maily in findings:
+        k = (fname.lower(), ln.lower())
+        if k in seen:
+            continue
+        seen.add(k)
+        final.append((fname, ln, is_maily))
+        if len(final) >= max_lines:
+            break
+
+    # sources (non-maily only)
+    sources = []
+    for fname, _, _ in final:
+        if fname.lower().startswith(EXCLUDE_AS_SOURCES_PREFIXES):
+            continue
+        if fname not in sources:
+            sources.append(fname)
+    sources = sources[:6]
+
+    return final, sources
+
+
+def build_findings_text(findings: List[Tuple[str,str,bool]]) -> str:
+    lines = []
+    for i, (fname, ln, is_maily) in enumerate(findings, start=1):
+        tag = "MAIL-CHAIN" if is_maily else "DOC"
+        lines.append(f"[{i}] ({tag}) {fname}: {ln}")
+    return "\n".join(lines)
+
+
+# =========================
+# LLM PROMPT (Copilot-like structure)
+# =========================
+def build_llm_prompt(question: str, greeting_name: str, signature_name: str, sources: List[str], findings_text: str) -> str:
+    src_line = ", ".join(sources) if sources else "(none)"
+    return f"""
+You are drafting a professional corporate email reply in procurement/sustainability context.
+
+STRICT GROUNDING:
+- Use ONLY the FINDINGS below. Do NOT invent facts.
+- Answer ONLY the user’s question.
+
+OUTPUT (must follow):
+1) First German section
+2) Line with exactly: ---
+3) Then English section
+
+STYLE (Copilot-like):
+- Start with a clear SUBJECT line:
+  German: "Betreff: <short subject>"
+  English: "Subject: <short subject>"
+- Then greeting + 1 short intro sentence.
+- Then numbered sections (1..N) with short headings (only include sections supported by findings).
+  Each section should be 2–4 lines max.
+- If there are deadlines/platforms/templates mentioned in findings, include them.
+- End with a short closing sentence offering clarification.
+- Add "Sources used: <doc titles only>" at the end of each language section.
+- Add a short summary only if the answer is long (>140 words) or has >4 sections:
+  German: "Kurzfassung:" with 2–4 bullets
+  English: "Short summary:" with 2–4 bullets
+
+SAFETY:
+- Do NOT output personal names, supplier names, emails, phones, addresses, IDs.
+- MAIL-CHAIN findings may be used ONLY if they contain near-identical past Q&A that directly answers the question or show typical MB phrasing.
+
+Greeting/closing:
+- German starts with: "Hallo {greeting_name},"
+- German ends with: "Mit freundlichen Grüßen" + "{signature_name}"
+- English starts with: "Hello {greeting_name},"
+- English ends with: "Best regards," + "{signature_name}"
+
+Question:
+{question}
+
+Allowed sources list (use only these for Sources used):
+{src_line}
+
+FINDINGS:
+{findings_text if findings_text.strip() else "(no findings)"}
+""".strip()
+
+
+def build_azure_client() -> AzureOpenAI:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise SystemExit("OPENAI_API_KEY env var missing (GenAI-Nexus key).")
+    return AzureOpenAI(
+        api_key=key,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_version=AZURE_API_VERSION,
+    )
+
+
+def call_llm(client: AzureOpenAI, prompt: str) -> str:
+    resp = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+        temperature=LLM_TEMPERATURE,
+        max_completion_tokens=LLM_MAX_COMPLETION_TOKENS,
+        messages=[
+            {"role": "system", "content": "Follow the required format exactly. Use only FINDINGS."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+# =========================
+# OUTLOOK HELPERS
+# =========================
+def get_sender_smtp(mail) -> str:
+    try:
+        addr = (mail.SenderEmailAddress or "").lower()
+        if addr.startswith("/o="):
+            ex = mail.Sender.GetExchangeUser()
+            if ex:
+                return (ex.PrimarySmtpAddress or "").lower()
+        return addr
+    except Exception:
+        return (mail.SenderEmailAddress or "").lower()
+
+
+def get_target_folder():
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+
+    target_store = None
+    for st in ns.Stores:
+        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
+            target_store = st
+            break
+
+    if not target_store:
+        print("Available stores (use one of these in TARGET_MAILBOX):")
+        for st in ns.Stores:
+            print(" -", st.DisplayName)
+        raise SystemExit("Target mailbox not found.")
+
+    inbox = target_store.GetDefaultFolder(6)  # Inbox
+    if WATCH_FOLDER_NAME.lower() == "inbox":
+        return ns, inbox, target_store.DisplayName, "Inbox"
+
+    for f in inbox.Folders:
+        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
+            return ns, f, target_store.DisplayName, f.Name
+
+    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
+
+
+def add_processed_category(mail):
+    try:
+        cats = mail.Categories or ""
+        if PROCESSED_CATEGORY.lower() not in cats.lower():
+            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
+        mail.Save()
+    except Exception:
+        pass
+
+
+def mark_read(mail):
+    try:
+        mail.UnRead = False
+        mail.Save()
+    except Exception:
+        pass
+
+
+def get_account_for_mailbox(ns, mailbox_substring: str):
+    try:
+        for acc in ns.Session.Accounts:
+            smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
+            if mailbox_substring.lower() in smtp or smtp in mailbox_substring.lower():
+                return acc
+    except Exception:
+        pass
+    return None
+
+
+def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
+    msg = ns.Application.CreateItem(0)
+    msg.To = to_addr
+    msg.Subject = f"Draft created (review needed): {orig_subject}"
+    msg.Body = (
+        "A draft reply has been created in Outlook.\n\n"
+        f"Original subject: {orig_subject}\n"
+        f"Requester: {requester_email}\n\n"
+        "Please review the draft carefully before sending.\n"
+    )
+    acc = get_account_for_mailbox(ns, from_mailbox)
+    if acc:
+        try:
+            msg.SendUsingAccount = acc
+        except Exception:
+            pass
+    msg.Send()
+
+
+def create_outlook_task_reminder(ns, subject: str, days: int = 2):
+    try:
+        task = ns.Application.CreateItem(3)  # olTaskItem
+        task.Subject = f"Reminder: review/send draft for '{subject}'"
+        task.DueDate = (datetime.now() + timedelta(days=days)).date()
+        task.ReminderSet = True
+        task.ReminderTime = datetime.now() + timedelta(days=days)
+        task.Body = "A draft reply was created by the bot. Please review and send it."
+        task.Save()
+    except Exception:
+        pass
+
+
+# =========================
+# MAIN
+# =========================
+def run_bot_once():
+    if PRINT_RUN_TIMESTAMP:
+        print("\n=== RUN START ===")
+        print("Run timestamp:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        print("=================\n")
+
+    time.sleep(STARTUP_DELAY_SEC)
+
+    print("Loading KB docs from:", KB_DIR)
+    docs = load_kb_docs(KB_DIR)
+    print("KB docs:", len(docs))
+
+    client = build_azure_client()
+
+    ns, folder, store_name, folder_name = get_target_folder()
+    print(f"Mailbox={store_name} | Folder={folder_name}")
+
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True)
+
+    drafted = 0
+    checked = 0
+
+    your_firstname = safe_firstname_from_email(TARGET_MAILBOX)
+
+    for mail in items:
+        checked += 1
+        if checked > SCAN_LIMIT:
+            break
+        if drafted >= PROCESS_PER_RUN:
+            break
+
+        try:
+            if getattr(mail, "Class", None) != 43:
+                continue
+
+            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
+                continue
+
+            if REQUIRE_UNREAD and not mail.UnRead:
+                continue
+
+            subject = mail.Subject or ""
+            if not strict_subject_ok(subject):
+                continue
+
+            sender = get_sender_smtp(mail)
+            greeting_name = safe_firstname_from_email(sender)
+
+            body_text = clean_html_to_text(mail.HTMLBody or "")
+            question = re.split(r"(?i)\b(von:|from:|gesendet:|sent:|-----original message-----)\b", body_text)[0].strip()
+            if not question:
+                question = body_text.strip()
+            question = clean_question(question)
+
+            # Pass A: non-mail docs
+            topA = rank_docs_simple(docs, question, include_maily=False, top_k=TOP_DOCS_PASS_A)
+
+            # Pass B: optionally add some mail docs (lower priority)
+            topB = rank_docs_simple(docs, question, include_maily=True, top_k=12)
+            mail_candidates = [d for d in topB if d[4] is True][:TOP_DOCS_PASS_B]
+
+            top_docs = topA + mail_candidates
+
+            # Coverage extraction
+            findings, sources = build_requirement_pack(top_docs, question, max_lines=MAX_REQUIREMENT_LINES)
+            findings_text = build_findings_text(findings)
+
+            # Debug preview so you can see it is actually extracting lines
+            print("\n[PASS] bot mail:", sender)
+            print("Question:", question)
+            print("Top docs:", [d[2] for d in top_docs])
+            print("Requirement lines:", len(findings))
+            print("Sources:", sources)
+
+            prompt = build_llm_prompt(
+                question=question,
+                greeting_name=greeting_name,
+                signature_name=your_firstname,
+                sources=sources,
+                findings_text=findings_text,
+            )
+
+            reply_text = call_llm(client, prompt)
+
+            reply = mail.Reply()
+            reply.HTMLBody = f"<div>{format_outlook_html(reply_text)}</div><hr>" + reply.HTMLBody
+            reply.Save()
+
+            mark_read(mail)
+            add_processed_category(mail)
+
+            drafted += 1
+            print("Draft created for:", subject)
+
+            if SELF_NOTIFY:
+                send_self_notification(ns, TARGET_MAILBOX, SELF_NOTIFY_TO, subject, sender)
+
+            if CREATE_REMINDER_TASK:
+                create_outlook_task_reminder(ns, subject=subject, days=REMINDER_DAYS)
+
+        except Exception as e:
+            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", repr(e))
+
+    print(f"\nDone. Checked={checked}, Drafted={drafted}")
+
+
+# In notebook: run_bot_once()
+if __name__ == "__main__":
+    run_bot_once()
