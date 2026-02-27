@@ -1,5 +1,7 @@
-client = AzureOpenAI(
-    api_key="e485facd-19fe-4c41-ae78-e5f2c444e39d",
-    azure_endpoint="https://genai-nexus.api.corpinter.net",
-    api_version="2024-06-01",
-)
+# LLM settings (GenAI-Nexus / Azure-style)
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"  # NO /apikey/
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-5.1"
+
+LLM_TEMPERATURE = 0.10
+LLM_MAX_COMPLETION_TOKENS = 1200
