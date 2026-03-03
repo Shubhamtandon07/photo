@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 OUTLOOK DRAFT BOT (LLM + COVERAGE RAG) — Robust LLM Always-Answer
-================================================================
+======================================================
 
 Key changes vs your current version:
 1) Progressive pack shrinking to avoid blank completions:
