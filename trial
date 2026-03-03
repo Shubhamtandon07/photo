@@ -1,13 +1,35 @@
-# DIAGNOSTIC: find recent "bot" mails and show their folder + timestamps (no Restrict)
-import win32com.client as win32
+import csv, hashlib, re
+from pathlib import Path
 from datetime import datetime
+import win32com.client as win32
 
 TARGET_MAILBOX_SUBSTRING = "shubham.tandon@mercedes-benz.com"
 WATCH_FOLDER_NAME = "Inbox"
 STRICT_SUBJECT = "bot"
-SCAN_LAST_N = 200
 
-def get_target_folder():
+AVAILABLE_DATA_DIR = Path(r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data")
+OUT_ROOT = AVAILABLE_DATA_DIR / "New Data" / ("manual_test_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+PDF_EXTS = {".pdf"}
+PNG_EXTS = {".png"}
+
+def _safe_filename(name: str, max_len: int = 120) -> str:
+    name = (name or "").strip()
+    name = re.sub(r"[<>:\"/\\|?*\x00-\x1F]+", "_", name)
+    name = re.sub(r"\s+", " ", name).strip() or "file"
+    if len(name) <= max_len:
+        return name
+    h = hashlib.sha1(name.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    base, dot, ext = name.rpartition(".")
+    if dot:
+        base = base[: max_len - (len(ext) + 1 + 9)]
+        return f"{base}__{h}.{ext}"
+    return name[: max_len - 9] + f"__{h}"
+
+def _hash_entry_id(entry_id: str) -> str:
+    return hashlib.sha1((entry_id or "").encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+def _get_target_folder():
     ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
     target_store = None
     for st in ns.Stores:
@@ -20,24 +42,33 @@ def get_target_folder():
             print(" -", st.DisplayName)
         raise SystemExit("Target mailbox not found.")
 
-    inbox = target_store.GetDefaultFolder(6)  # Inbox
+    inbox = target_store.GetDefaultFolder(6)
     if WATCH_FOLDER_NAME.lower() == "inbox":
         return ns, inbox
-
     for f in inbox.Folders:
         if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
             return ns, f
     raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox.")
 
-ns, folder = get_target_folder()
+# Prepare folders
+msg_dir = OUT_ROOT / "msg"
+pdf_dir = OUT_ROOT / "pdfs"
+png_dir = OUT_ROOT / "pngs"
+for d in (msg_dir, pdf_dir, png_dir):
+    d.mkdir(parents=True, exist_ok=True)
+
+manifest = OUT_ROOT / "manifest.csv"
+with manifest.open("w", newline="", encoding="utf-8") as f:
+    w = csv.writer(f)
+    w.writerow(["received_time", "entry_hash", "saved_msg", "saved_pdfs", "saved_pngs"])
+
+ns, folder = _get_target_folder()
 items = folder.Items
 items.Sort("[ReceivedTime]", True)
 
-print("Store/Folder:", folder.Parent.Name, "/", folder.Name)
-print("Items.Count:", items.Count)
-found = 0
-
-for i in range(1, min(items.Count, SCAN_LAST_N) + 1):
+saved = 0
+scan_n = min(items.Count, 800)  # scan recent
+for i in range(1, scan_n + 1):
     mail = items.Item(i)
     if getattr(mail, "Class", None) != 43:
         continue
@@ -46,10 +77,35 @@ for i in range(1, min(items.Count, SCAN_LAST_N) + 1):
         continue
 
     rt = getattr(mail, "ReceivedTime", None)
-    rt_s = rt.strftime("%Y-%m-%d %H:%M:%S") if rt else "?"
-    sender = (getattr(mail, "SenderEmailAddress", "") or "").strip()
-    eid = (getattr(mail, "EntryID", "") or "")
-    print(f"[FOUND] Received={rt_s} | Sender={sender} | Subject={subj} | EntryID_len={len(eid)}")
-    found += 1
+    rt_s = rt.strftime("%Y-%m-%d %H:%M:%S") if rt else "unknown"
+    entry_id = getattr(mail, "EntryID", "") or ""
+    h = _hash_entry_id(entry_id)
 
-print("Found bot mails in last", SCAN_LAST_N, "items:", found)
+    msg_name = _safe_filename(f"{rt_s.replace(':','-')}_bot_{h}.msg")
+    mail.SaveAs(str(msg_dir / msg_name), 3)
+
+    saved_pdfs = 0
+    saved_pngs = 0
+    atts = getattr(mail, "Attachments", None)
+    if atts:
+        for j in range(1, int(atts.Count) + 1):
+            att = atts.Item(j)
+            fname = (getattr(att, "FileName", "") or "attachment").strip()
+            ext = Path(fname).suffix.lower()
+            if ext in PDF_EXTS:
+                att.SaveAsFile(str(pdf_dir / _safe_filename(f"{h}__{fname}")))
+                saved_pdfs += 1
+            elif ext in PNG_EXTS:
+                att.SaveAsFile(str(png_dir / _safe_filename(f"{h}__{fname}")))
+                saved_pngs += 1
+
+    with manifest.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([rt_s, h, msg_name, saved_pdfs, saved_pngs])
+
+    saved += 1
+    if saved >= 5:
+        break
+
+print("Saved:", saved)
+print("Output folder:", OUT_ROOT)
