@@ -1,343 +1,55 @@
-# -*- coding: utf-8 -*-
-"""
-MONTHLY BOT-MAIL ARCHIVER — Outlook -> .msg + PDFs + PNGs
-========================================================
-
-What it does
-- Collects Outlook emails whose SUBJECT is exactly "bot" (case-insensitive)
-- Filters by ReceivedTime in a given month (or current month)
-- Saves to: <AVAILABLE_DATA>\New Data\<YYYY-MM>\  with:
-    1) msg\   -> .msg files (full email)
-    2) pdfs\  -> PDF attachments found in those mails
-    3) pngs\  -> PNG attachments found in those mails
-- Keeps a manifest.csv to avoid duplicates if you run multiple times.
-
-Run monthly:
-- In a notebook (VSCode ipynb): run this cell, then call:
-    run_month(2026, 3)   # March 2026
-  or:
-    run_current_month()
-  or:
-    run_previous_month()
-
-Requirements
-- Windows + Outlook Desktop
-- pywin32:  !python -m pip install --user pywin32
-"""
-
-from __future__ import annotations
-
-import csv
-import hashlib
-import os
-import re
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Optional, Tuple
-
+# DIAGNOSTIC: find recent "bot" mails and show their folder + timestamps (no Restrict)
 import win32com.client as win32
+from datetime import datetime
 
+TARGET_MAILBOX_SUBSTRING = "shubham.tandon@mercedes-benz.com"
+WATCH_FOLDER_NAME = "Inbox"
+STRICT_SUBJECT = "bot"
+SCAN_LAST_N = 200
 
-# =========================
-# CONFIG (EDIT)
-# =========================
-# Your "Available data" folder:
-AVAILABLE_DATA_DIR = Path(
-    r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data"
-)
-
-# Output root:
-OUT_ROOT = AVAILABLE_DATA_DIR / "New Data"
-
-# Which mailbox + folder to read
-TARGET_MAILBOX_SUBSTRING = "shubham.tandon@mercedes-benz.com"  # store displayname substring
-WATCH_FOLDER_NAME = "Inbox"  # "Inbox" or a subfolder under Inbox
-
-# Subject match
-STRICT_SUBJECT = "bot"  # exact match, case-insensitive
-
-# Start collecting from this date (inclusive)
-START_DATE_INCLUSIVE = datetime(2026, 3, 3, 0, 0, 0)
-
-# Attachment types
-PDF_EXTS = {".pdf"}
-PNG_EXTS = {".png"}
-
-# Export options
-MAX_MAILS_PER_RUN = 5000  # safety cap
-
-
-# =========================
-# Helpers
-# =========================
-def _safe_filename(name: str, max_len: int = 120) -> str:
-    name = (name or "").strip()
-    name = re.sub(r"[<>:\"/\\|?*\x00-\x1F]+", "_", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    if not name:
-        name = "file"
-    if len(name) <= max_len:
-        return name
-    h = hashlib.sha1(name.encode("utf-8", errors="ignore")).hexdigest()[:8]
-    base, dot, ext = name.rpartition(".")
-    if dot:
-        base = base[: max_len - (len(ext) + 1 + 9)]
-        return f"{base}__{h}.{ext}"
-    return name[: max_len - 9] + f"__{h}"
-
-def _hash_entry_id(entry_id: str) -> str:
-    return hashlib.sha1((entry_id or "").encode("utf-8", errors="ignore")).hexdigest()[:12]
-
-def _month_range(year: int, month: int) -> Tuple[datetime, datetime]:
-    start = datetime(year, month, 1, 0, 0, 0)
-    if month == 12:
-        end = datetime(year + 1, 1, 1, 0, 0, 0)
-    else:
-        end = datetime(year, month + 1, 1, 0, 0, 0)
-    return start, end
-
-def _ensure_dirs(base: Path) -> Tuple[Path, Path, Path]:
-    msg_dir = base / "msg"
-    pdf_dir = base / "pdfs"
-    png_dir = base / "pngs"
-    msg_dir.mkdir(parents=True, exist_ok=True)
-    pdf_dir.mkdir(parents=True, exist_ok=True)
-    png_dir.mkdir(parents=True, exist_ok=True)
-    return msg_dir, pdf_dir, png_dir
-
-def _get_target_folder():
+def get_target_folder():
     ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-
     target_store = None
     for st in ns.Stores:
         if TARGET_MAILBOX_SUBSTRING.lower() in (st.DisplayName or "").lower():
             target_store = st
             break
-
     if not target_store:
-        print("Available stores (use one of these in TARGET_MAILBOX_SUBSTRING):")
+        print("Available stores:")
         for st in ns.Stores:
             print(" -", st.DisplayName)
-        raise SystemExit("Target mailbox not found. Adjust TARGET_MAILBOX_SUBSTRING.")
+        raise SystemExit("Target mailbox not found.")
 
-    inbox = target_store.GetDefaultFolder(6)  # 6 = Inbox
-
+    inbox = target_store.GetDefaultFolder(6)  # Inbox
     if WATCH_FOLDER_NAME.lower() == "inbox":
         return ns, inbox
 
     for f in inbox.Folders:
         if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
             return ns, f
-
     raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox.")
 
-def _restrict_by_received(items, start_dt: datetime, end_dt: datetime):
-    """
-    Outlook Restrict requires US-style date formatting in many environments.
-    We'll use: mm/dd/yyyy hh:mm AM/PM
-    """
-    def fmt(dt: datetime) -> str:
-        return dt.strftime("%m/%d/%Y %I:%M %p")
+ns, folder = get_target_folder()
+items = folder.Items
+items.Sort("[ReceivedTime]", True)
 
-    # ReceivedTime is a DateTime; Restrict expects a string date
-    # NOTE: Use [ReceivedTime] with brackets.
-    flt = f"[ReceivedTime] >= '{fmt(start_dt)}' AND [ReceivedTime] < '{fmt(end_dt)}'"
-    return items.Restrict(flt)
+print("Store/Folder:", folder.Parent.Name, "/", folder.Name)
+print("Items.Count:", items.Count)
+found = 0
 
-def _load_manifest(manifest_path: Path) -> set[str]:
-    seen = set()
-    if not manifest_path.exists():
-        return seen
-    with manifest_path.open("r", encoding="utf-8", newline="") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            if row.get("entry_hash"):
-                seen.add(row["entry_hash"])
-    return seen
+for i in range(1, min(items.Count, SCAN_LAST_N) + 1):
+    mail = items.Item(i)
+    if getattr(mail, "Class", None) != 43:
+        continue
+    subj = (mail.Subject or "").strip()
+    if subj.casefold() != STRICT_SUBJECT.casefold():
+        continue
 
-def _append_manifest_row(manifest_path: Path, row: dict):
-    new_file = not manifest_path.exists()
-    with manifest_path.open("a", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=[
-                "timestamp_run",
-                "month",
-                "entry_hash",
-                "received_time",
-                "sender",
-                "subject",
-                "saved_msg",
-                "saved_pdfs",
-                "saved_pngs",
-            ],
-        )
-        if new_file:
-            w.writeheader()
-        w.writerow(row)
+    rt = getattr(mail, "ReceivedTime", None)
+    rt_s = rt.strftime("%Y-%m-%d %H:%M:%S") if rt else "?"
+    sender = (getattr(mail, "SenderEmailAddress", "") or "").strip()
+    eid = (getattr(mail, "EntryID", "") or "")
+    print(f"[FOUND] Received={rt_s} | Sender={sender} | Subject={subj} | EntryID_len={len(eid)}")
+    found += 1
 
-def _append_error(errors_path: Path, line: str):
-    errors_path.parent.mkdir(parents=True, exist_ok=True)
-    with errors_path.open("a", encoding="utf-8") as f:
-        f.write(line.rstrip() + "\n")
-
-
-# =========================
-# Core
-# =========================
-def run_month(year: int, month: int):
-    OUT_ROOT.mkdir(parents=True, exist_ok=True)
-
-    month_start, month_end = _month_range(year, month)
-
-    # enforce global start date
-    if month_end <= START_DATE_INCLUSIVE:
-        print("Nothing to do: month is entirely before START_DATE_INCLUSIVE.")
-        return
-
-    start_dt = max(month_start, START_DATE_INCLUSIVE)
-    end_dt = month_end
-
-    month_tag = f"{year:04d}-{month:02d}"
-    out_dir = OUT_ROOT / month_tag
-    msg_dir, pdf_dir, png_dir = _ensure_dirs(out_dir)
-
-    manifest_path = out_dir / "manifest.csv"
-    errors_path = out_dir / "errors.log"
-    seen = _load_manifest(manifest_path)
-
-    print("\n=== BOT MAIL ARCHIVE RUN ===")
-    print("Run timestamp:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    print("Month:", month_tag)
-    print("Date window:", start_dt, "->", end_dt)
-    print("Output:", out_dir)
-
-    ns, folder = _get_target_folder()
-
-    items = folder.Items
-    items.Sort("[ReceivedTime]", True)  # newest first
-    restricted = _restrict_by_received(items, start_dt, end_dt)
-
-    processed = 0
-    exported = 0
-
-    for mail in restricted:
-        processed += 1
-        if processed > MAX_MAILS_PER_RUN:
-            print("Safety stop: MAX_MAILS_PER_RUN reached.")
-            break
-
-        try:
-            # 43 = MailItem
-            if getattr(mail, "Class", None) != 43:
-                continue
-
-            subject = (getattr(mail, "Subject", "") or "").strip()
-            if subject.casefold() != STRICT_SUBJECT.casefold():
-                continue
-
-            entry_id = getattr(mail, "EntryID", "") or ""
-            h = _hash_entry_id(entry_id)
-            if h in seen:
-                continue
-
-            received = getattr(mail, "ReceivedTime", None)
-            received_str = ""
-            try:
-                # pywin32 datetime
-                if received:
-                    received_str = received.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                received_str = str(received)
-
-            sender = ""
-            try:
-                sender = (getattr(mail, "SenderEmailAddress", "") or "").strip()
-            except Exception:
-                sender = ""
-
-            # Save .msg
-            # 3 = olMSGUnicode, 2 = olMSG (ANSI). Use Unicode.
-            base_name = _safe_filename(f"{received_str.replace(':','-')}_bot_{h}.msg")
-            msg_path = msg_dir / base_name
-            try:
-                mail.SaveAs(str(msg_path), 3)
-            except Exception:
-                # fallback format
-                msg_path = msg_dir / _safe_filename(f"bot_{h}.msg")
-                mail.SaveAs(str(msg_path), 3)
-
-            saved_pdfs = 0
-            saved_pngs = 0
-
-            # Save attachments
-            atts = getattr(mail, "Attachments", None)
-            if atts:
-                count = int(atts.Count)
-                for i in range(1, count + 1):
-                    att = atts.Item(i)
-                    fname = (getattr(att, "FileName", "") or "attachment").strip()
-                    ext = Path(fname).suffix.lower()
-
-                    if ext in PDF_EXTS:
-                        outp = pdf_dir / _safe_filename(f"{h}__{fname}")
-                        try:
-                            att.SaveAsFile(str(outp))
-                            saved_pdfs += 1
-                        except Exception as e:
-                            _append_error(errors_path, f"ATT_PDF_SAVE_ERROR | {h} | {fname} | {repr(e)}")
-
-                    elif ext in PNG_EXTS:
-                        outp = png_dir / _safe_filename(f"{h}__{fname}")
-                        try:
-                            att.SaveAsFile(str(outp))
-                            saved_pngs += 1
-                        except Exception as e:
-                            _append_error(errors_path, f"ATT_PNG_SAVE_ERROR | {h} | {fname} | {repr(e)}")
-
-            _append_manifest_row(
-                manifest_path,
-                {
-                    "timestamp_run": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "month": month_tag,
-                    "entry_hash": h,
-                    "received_time": received_str,
-                    "sender": sender,
-                    "subject": subject,
-                    "saved_msg": msg_path.name,
-                    "saved_pdfs": saved_pdfs,
-                    "saved_pngs": saved_pngs,
-                },
-            )
-            seen.add(h)
-            exported += 1
-
-        except Exception as e:
-            _append_error(errors_path, f"MAIL_ERROR | {repr(e)}")
-
-    print("\n=== DONE ===")
-    print("Processed (after date restrict):", processed)
-    print("Exported bot mails:", exported)
-    print("Manifest:", manifest_path)
-    print("Errors:", errors_path)
-    print("MSG folder:", msg_dir)
-    print("PDF folder:", pdf_dir)
-    print("PNG folder:", png_dir)
-
-
-def run_current_month():
-    now = datetime.now()
-    run_month(now.year, now.month)
-
-
-def run_previous_month():
-    now = datetime.now()
-    first = datetime(now.year, now.month, 1)
-    prev_end = first - timedelta(days=1)
-    run_month(prev_end.year, prev_end.month)
-
-
-# Example calls:
-# run_month(2026, 3)
-# run_current_month()
-# run_previous_month()
+print("Found bot mails in last", SCAN_LAST_N, "items:", found)
