@@ -1,111 +1,32 @@
-import csv, hashlib, re
-from pathlib import Path
-from datetime import datetime
-import win32com.client as win32
+Betreff: Kurze Rückmeldung
+Hallo Sustainable-procurement,
+ich melde mich kurz bei dir zurück.
+Rückmeldung
+•	Vielen Dank für deine Nachricht.
+•	Ich stehe für Fragen zu den Sustainability Premises, RSS oder weiteren Nachhaltigkeitsthemen gerne zur Verfügung.
+•	Bitte lass mich wissen, wobei ich dich konkret unterstützen kann.
+Bei Rückfragen komme ich gerne noch einmal detaillierter darauf zurück.
+Mit freundlichen Grüßen
+Shubham
+Sources used: 0003_AW_ Dringlich_ Bestätigung RSS_e2c273ca.docx, 0008_AW_ RSS Panasonic_95dd714e.docx, 2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx, Legal Feedback CATL RSS Kommentare__709d4832.docx, m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx, m0010_Sustainability_premises_V202302-1-FA.docx
+---
+Subject: Short reply
+Hello Sustainable-procurement,
+I am getting back to you briefly.
+Feedback
+•	Thank you for your message.
+•	I am available for any questions regarding the Sustainability Premises, RSS, or other sustainability topics.
+•	Please let me know how I can support you specifically.
+If anything is unclear, I am happy to clarify further.
+Best regards,
+Shubham
+Sources used: 0003_AW_ Dringlich_ Bestätigung RSS_e2c273ca.docx, 0008_AW_ RSS Panasonic_95dd714e.docx, 2025-11-06 Frageliste MBEAL - Nachhaltigkeit.docx, Legal Feedback CATL RSS Kommentare__709d4832.docx, m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx, m0010_Sustainability_premises_V202302-1-FA.docx
+________________________________________
 
-TARGET_MAILBOX_SUBSTRING = "shubham.tandon@mercedes-benz.com"
-WATCH_FOLDER_NAME = "Inbox"
-STRICT_SUBJECT = "bot"
 
-AVAILABLE_DATA_DIR = Path(r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data")
-OUT_ROOT = AVAILABLE_DATA_DIR / "New Data" / ("manual_test_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+Von: sustainable-procurement (050-NPM) <sustainable-procurement@mercedes-benz.com> 
+Gesendet: Dienstag, 3. März 2026 17:39
+An: Tandon, Shubham (050) <shubham.tandon@mercedes-benz.com>
+Betreff: bot
 
-PDF_EXTS = {".pdf"}
-PNG_EXTS = {".png"}
-
-def _safe_filename(name: str, max_len: int = 120) -> str:
-    name = (name or "").strip()
-    name = re.sub(r"[<>:\"/\\|?*\x00-\x1F]+", "_", name)
-    name = re.sub(r"\s+", " ", name).strip() or "file"
-    if len(name) <= max_len:
-        return name
-    h = hashlib.sha1(name.encode("utf-8", errors="ignore")).hexdigest()[:8]
-    base, dot, ext = name.rpartition(".")
-    if dot:
-        base = base[: max_len - (len(ext) + 1 + 9)]
-        return f"{base}__{h}.{ext}"
-    return name[: max_len - 9] + f"__{h}"
-
-def _hash_entry_id(entry_id: str) -> str:
-    return hashlib.sha1((entry_id or "").encode("utf-8", errors="ignore")).hexdigest()[:12]
-
-def _get_target_folder():
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-    target_store = None
-    for st in ns.Stores:
-        if TARGET_MAILBOX_SUBSTRING.lower() in (st.DisplayName or "").lower():
-            target_store = st
-            break
-    if not target_store:
-        print("Available stores:")
-        for st in ns.Stores:
-            print(" -", st.DisplayName)
-        raise SystemExit("Target mailbox not found.")
-
-    inbox = target_store.GetDefaultFolder(6)
-    if WATCH_FOLDER_NAME.lower() == "inbox":
-        return ns, inbox
-    for f in inbox.Folders:
-        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
-            return ns, f
-    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox.")
-
-# Prepare folders
-msg_dir = OUT_ROOT / "msg"
-pdf_dir = OUT_ROOT / "pdfs"
-png_dir = OUT_ROOT / "pngs"
-for d in (msg_dir, pdf_dir, png_dir):
-    d.mkdir(parents=True, exist_ok=True)
-
-manifest = OUT_ROOT / "manifest.csv"
-with manifest.open("w", newline="", encoding="utf-8") as f:
-    w = csv.writer(f)
-    w.writerow(["received_time", "entry_hash", "saved_msg", "saved_pdfs", "saved_pngs"])
-
-ns, folder = _get_target_folder()
-items = folder.Items
-items.Sort("[ReceivedTime]", True)
-
-saved = 0
-scan_n = min(items.Count, 800)  # scan recent
-for i in range(1, scan_n + 1):
-    mail = items.Item(i)
-    if getattr(mail, "Class", None) != 43:
-        continue
-    subj = (mail.Subject or "").strip()
-    if subj.casefold() != STRICT_SUBJECT.casefold():
-        continue
-
-    rt = getattr(mail, "ReceivedTime", None)
-    rt_s = rt.strftime("%Y-%m-%d %H:%M:%S") if rt else "unknown"
-    entry_id = getattr(mail, "EntryID", "") or ""
-    h = _hash_entry_id(entry_id)
-
-    msg_name = _safe_filename(f"{rt_s.replace(':','-')}_bot_{h}.msg")
-    mail.SaveAs(str(msg_dir / msg_name), 3)
-
-    saved_pdfs = 0
-    saved_pngs = 0
-    atts = getattr(mail, "Attachments", None)
-    if atts:
-        for j in range(1, int(atts.Count) + 1):
-            att = atts.Item(j)
-            fname = (getattr(att, "FileName", "") or "attachment").strip()
-            ext = Path(fname).suffix.lower()
-            if ext in PDF_EXTS:
-                att.SaveAsFile(str(pdf_dir / _safe_filename(f"{h}__{fname}")))
-                saved_pdfs += 1
-            elif ext in PNG_EXTS:
-                att.SaveAsFile(str(png_dir / _safe_filename(f"{h}__{fname}")))
-                saved_pngs += 1
-
-    with manifest.open("a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([rt_s, h, msg_name, saved_pdfs, saved_pngs])
-
-    saved += 1
-    if saved >= 5:
-        break
-
-print("Saved:", saved)
-print("Output folder:", OUT_ROOT)
+hi
