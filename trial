@@ -1,30 +1,910 @@
-Hallo Sustainable-procurement,
-ich beziehe mich auf die CO2-Neutralitätsanforderung für unsere Lieferungen.
-Zeitpunkt der CO2-neutralen Produktion
-•	Alle Produkte, die ich ab dem 01.01.2039 an Mercedes-Benz liefere, müssen über alle Wertschöpfungsstufen hinweg CO2-neutral produziert sein.
-•	Die Verpflichtung bezieht sich damit auf den Lieferzeitpunkt ab dem 01.01.2039, nicht auf früher produzierte und vorher gelieferte Produkte.
-Bei Rückfragen zu diesem Stichtag erläutere ich dies gerne genauer.
-Mit freundlichen Grüßen
-Shubham
-Sources used: m0020_8.6_Sustainability_premises_V202302-1-FA-IND_Brose_signed.docx, m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx
----
-Hello Sustainable-procurement,
-I am referring to the CO2-neutrality requirement for our deliveries.
-Point in time for CO2-neutral production
-•	All products that I deliver to Mercedes-Benz as of 1/1/2039 must be produced CO2-neutral across all value creation stages.
-•	The obligation therefore applies to the delivery date from 1/1/2039 onwards, not to products produced and delivered before that date.
-If anything about this cut-off date is unclear, I am happy to clarify.
-Best regards,
-Shubham
-Sources used: m0020_8.6_Sustainability_premises_V202302-1-FA-IND_Brose_signed.docx, m0001_MB-EA_only__sustainability_premises_V202304-1-FA.docx
-________________________________________
+# -*- coding: utf-8 -*-
+"""
+OUTLOOK DRAFT BOT (LLM + COVERAGE RAG) — Full code (Notebook-safe + VSCode-friendly, Python 3.14)
+=================================================================================================
+
+You asked: "always full code" and "do not change anything else".
+This is your current used code, with ONLY the following changes:
+
+CHANGE #1 (Mercedes POV fix):
+- Force sender POV = Mercedes-Benz (always "we/our" and "wir/unser", never "I/my"/"ich/mein").
+- Explicitly forbid phrases like "I deliver to Mercedes-Benz".
+- Add a small post-processing guard `enforce_mb_pov()`.
+
+CHANGE #2 (from your earlier constraints already in your code):
+- Keep greetings.
+- Remove Subject/Betreff lines (strip_subject_lines()).
+- Keep everything else as-is.
+
+NOTE: You must have OPENAI_API_KEY set in the environment for this Python session.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import time
+from pathlib import Path
+from datetime import datetime, timedelta
+from html import escape
+from typing import List, Tuple, Any
+
+import win32com.client as win32
+from openai import AzureOpenAI
 
 
-Von: sustainable-procurement (050-NPM) <sustainable-procurement@mercedes-benz.com> 
-Gesendet: Donnerstag, 5. März 2026 12:33
-An: Tandon, Shubham (050) <shubham.tandon@mercedes-benz.com>
-Betreff: bot
+# =========================
+# CONFIG — EDIT THESE
+# =========================
+TARGET_MAILBOX = "shubham.tandon@mercedes-benz.com"
+WATCH_FOLDER_NAME = "Inbox"
 
-From when exactly the product must be produced in a net carbon-neutral manner?
+KB_DIR = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
+
+STRICT_SUBJECT = "bot"
+
+REQUIRE_UNREAD = True
+PROCESS_PER_RUN = 3
+SCAN_LIMIT = 250
+STARTUP_DELAY_SEC = 1
+
+PROCESSED_CATEGORY = "Drafted-LLM"
+
+SELF_NOTIFY = True
+SELF_NOTIFY_TO = TARGET_MAILBOX
+CREATE_REMINDER_TASK = True
+REMINDER_DAYS = 2
+
+PRINT_RUN_TIMESTAMP = True
+
+# Debug
+DEBUG_PRINT_LLM_META = True
+DEBUG_PRINT_LLM_PREVIEW = True
+
+# KB reading
+SUPPORTED_EXTS = {".txt", ".docx", ".pdf", ".xlsx"}
+MAX_DOCS = 5000
+MAX_CHARS_PER_DOC = 240_000
+
+# Retrieval behavior (coverage)
+TOP_DOCS_PASS_A = 10
+TOP_DOCS_PASS_B = 2
+
+# Findings pack sizes (progressive shrinking)
+FINDINGS_FULL = 180
+FINDINGS_SMALL = 70
+FINDINGS_TINY = 25
+
+MAX_EVIDENCE_CHARS_PER_LINE = 220  # smaller than before (important)
+
+# De-prioritize mail-chain-like documents
+MAILY_PREFIXES = ("aw_", "re_", "fw_", "wg_")
+MAILY_HINTS = ("subject", "mail", "email", "outlook", ".msg", "conversation")
+EXCLUDE_AS_SOURCES_PREFIXES = ("aw_", "re_", "fw_", "wg_")
+
+# LLM settings (GenAI-Nexus / Azure-style)
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"  # NO /apikey/
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-5.1"
+
+LLM_TEMPERATURE = 0.10
+LLM_MAX_COMPLETION_TOKENS = 1200
+
+# Optional: enforce a stable signature name (otherwise derived from email local-part)
+FORCE_SIGNATURE_NAME: str | None = None  # e.g. "Shubham"
 
 
+# =========================
+# BASIC TEXT UTILS
+# =========================
+STOPWORDS = set("""
+the a an and or to of in on for with without from by at is are was were be been being
+der die das und oder zu von im in am an auf für mit ohne aus bei ist sind war waren
+""".split())
+
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def strict_subject_ok(subject: str) -> bool:
+    return (subject or "").strip().casefold() == STRICT_SUBJECT.casefold()
+
+def clean_html_to_text(html: str) -> str:
+    txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
+    return clean_ws(txt)
+
+def clean_question(q: str) -> str:
+    try:
+        import html as _html
+        q = _html.unescape(q or "")
+    except Exception:
+        q = q or ""
+    q = q.replace("\xa0", " ")
+    q = re.sub(r"\s+", " ", q).strip()
+    return q
+
+def safe_firstname_from_email(email: str) -> str:
+    email = (email or "").strip()
+    local = email.split("@", 1)[0] if "@" in email else email
+    first = local.split(".", 1)[0].strip()
+    if not first:
+        return "Colleague"
+    return first[:1].upper() + first[1:]
+
+def tokenize(s: str) -> List[str]:
+    toks = re.split(r"[^a-zA-Z0-9ÄÖÜäöüß]+", (s or "").lower())
+    return [t for t in toks if t and t not in STOPWORDS and len(t) >= 3]
+
+def looks_english(question: str) -> bool:
+    q = (question or "").lower()
+    en_hits = sum(w in q for w in ["what", "how", "steps", "must", "comply", "requirement", "norm", "standard"])
+    de_hits = sum(w in q for w in ["was", "wie", "muss", "soll", "anforder", "gemäß", "norm", "standard"])
+    return en_hits >= max(2, de_hits)
+
+
+# =========================
+# OUTLOOK HTML RENDERING
+# =========================
+def md_bold_to_html(text: str) -> str:
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text or "")
+
+def format_outlook_html(text: str) -> str:
+    text = (text or "").replace("\r\n", "\n").strip()
+    if not text:
+        return "<p></p>"
+
+    blocks = re.split(r"\n\s*\n", text)
+    out = []
+
+    for block in blocks:
+        raw_lines = [ln.rstrip() for ln in block.split("\n") if ln.strip()]
+        if not raw_lines:
+            continue
+
+        if all(ln.lstrip().startswith("- ") for ln in raw_lines):
+            out.append("<ul>")
+            for ln in raw_lines:
+                ln2 = ln.lstrip()[2:].strip()
+                ln2 = escape(ln2).replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
+                out.append(f"<li>{ln2}</li>")
+            out.append("</ul>")
+        else:
+            safe_lines = []
+            for ln in raw_lines:
+                ln2 = escape(ln.strip()).replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
+                safe_lines.append(ln2)
+            out.append("<p>" + "<br>".join(safe_lines) + "</p>")
+
+    return "\n".join(out)
+
+
+# =========================
+# REDACTION FOR LLM INPUT (no [NAME])
+# =========================
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+PHONE_RE = re.compile(r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d")
+URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
+IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b", re.I)
+REF_RE = re.compile(r"\b(?:VU|SP|PR|PO|NCR|Ticket|Case|Req|Request|ID|Ref)\s*[:#]?\s*[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b", re.I)
+
+def redact_for_llm_input(s: str) -> str:
+    if not s:
+        return ""
+    t = s
+    t = EMAIL_RE.sub("[EMAIL]", t)
+    t = PHONE_RE.sub("[PHONE]", t)
+    t = URL_RE.sub("[URL]", t)
+    t = IBAN_RE.sub("[IBAN]", t)
+    t = REF_RE.sub("[REF]", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+# =========================
+# KB READERS
+# =========================
+def read_txt(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="ignore")
+
+def read_docx(p: Path) -> str:
+    try:
+        from docx import Document as DocxDocument  # type: ignore
+    except Exception:
+        return ""
+    doc = DocxDocument(str(p))
+    paras = "\n".join(clean_ws(par.text) for par in doc.paragraphs if clean_ws(par.text))
+    table_lines = []
+    for t in doc.tables:
+        for row in t.rows:
+            cells = [clean_ws(c.text) for c in row.cells]
+            if any(cells):
+                table_lines.append(" | ".join(cells))
+    return (paras + "\n" + "\n".join(table_lines)).strip()
+
+def read_pdf(p: Path) -> str:
+    try:
+        import pdfplumber  # type: ignore
+        out = []
+        with pdfplumber.open(str(p)) as pdf:
+            for page in pdf.pages:
+                out.append(page.extract_text() or "")
+        return "\n".join(out).strip()
+    except Exception:
+        pass
+    try:
+        from pypdf import PdfReader  # type: ignore
+        r = PdfReader(str(p))
+        out = []
+        for pg in r.pages:
+            try:
+                out.append(pg.extract_text() or "")
+            except Exception:
+                pass
+        return "\n".join(out).strip()
+    except Exception:
+        return ""
+
+def read_xlsx(p: Path) -> str:
+    try:
+        import openpyxl  # type: ignore
+    except Exception:
+        return ""
+    wb = openpyxl.load_workbook(str(p), data_only=True, read_only=True)
+    out = []
+    for ws in wb.worksheets:
+        out.append(f"Sheet: {ws.title}")
+        max_rows = min(ws.max_row or 0, 200)
+        max_cols = min(ws.max_column or 0, 40)
+        for r in range(1, max_rows + 1):
+            row_vals = []
+            for c in range(1, max_cols + 1):
+                v = ws.cell(row=r, column=c).value
+                row_vals.append("" if v is None else str(v))
+            if any(x.strip() for x in row_vals):
+                out.append(" | ".join(clean_ws(x) for x in row_vals))
+    return "\n".join(out).strip()
+
+def extract_text_from_file(p: Path) -> str:
+    ext = p.suffix.lower()
+    if ext == ".txt":
+        return read_txt(p)
+    if ext == ".docx":
+        return read_docx(p)
+    if ext == ".pdf":
+        return read_pdf(p)
+    if ext == ".xlsx":
+        return read_xlsx(p)
+    return ""
+
+def is_maily_filename(p: Path) -> bool:
+    name = (p.name or "").lower()
+    stem = (p.stem or "").lower()
+    if stem.startswith("~$"):
+        return True
+    if stem.startswith(MAILY_PREFIXES):
+        return True
+    if any(h in name for h in MAILY_HINTS):
+        return True
+    return False
+
+
+# =========================
+# LOAD DOCS
+# =========================
+def load_kb_docs(kb_dir: str) -> List[Tuple[str, str, str, bool]]:
+    base = Path(kb_dir)
+    if not base.exists() or not base.is_dir():
+        raise SystemExit(f"KB_DIR not found: {kb_dir}")
+
+    files = [p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS]
+    files = files[:MAX_DOCS]
+
+    docs = []
+    for p in sorted(files):
+        try:
+            txt = extract_text_from_file(p)
+            txt = (txt or "").strip()
+            if not txt:
+                continue
+            txt = txt[:MAX_CHARS_PER_DOC]
+            docs.append((str(p), p.name, txt, is_maily_filename(p)))
+        except Exception:
+            continue
+    return docs
+
+def doc_priority_adjustment(filename: str) -> float:
+    fn = (filename or "").lower()
+    score = 0.0
+    if fn.startswith(MAILY_PREFIXES):
+        score -= 0.80
+    if any(h in fn for h in MAILY_HINTS):
+        score -= 0.25
+    if re.search(r"(?i)\b(mbn|din|iso|vda|standard|policy|guideline|kapitel|chapter|requirements|norm)\b", fn):
+        score += 0.30
+    return score
+
+def rank_docs_simple(docs, query: str, include_maily: bool, top_k: int) -> List[Tuple[float, str, str, str, bool]]:
+    q_toks = set(tokenize(query))
+    scored = []
+    for fullpath, fname, text, is_maily in docs:
+        if (not include_maily) and is_maily:
+            continue
+        tl = text.lower()
+        overlap = sum(1 for tk in q_toks if tk in tl)
+        base = overlap / max(1, len(q_toks))
+        score = float(base) + doc_priority_adjustment(fname)
+        scored.append((score, fullpath, fname, text, is_maily))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:top_k]
+
+
+# =========================
+# FINDINGS EXTRACTION
+# =========================
+REQ_LINE_RE = re.compile(
+    r"(?i)\b(must|shall|required|requirement|need to|has to|steps|process|procedure|"
+    r"muss|soll|verpflicht|erforder|anforder|"
+    r"gemäß|in\s+accordance|nachweis|beleg|offenlegung|disclose|submit|"
+    r"CMRT|RMAP|SAQ|DDQ|SupplierAssurance|tier[-\s]*n|lieferkette|transparenz|"
+    r"CO2|CO₂|Sekundärmaterial|Rezyklat|Grünstrom|renewable|awarding|Vergabe)\b"
+)
+SECTION_RE = re.compile(r"^\s*(\d+(\.\d+){0,3})\s+|^\s*(Kapitel|Chapter)\s+\d+", re.I)
+
+def extract_requirement_lines(text: str) -> List[str]:
+    if not text:
+        return []
+    raw = re.split(r"\n+|(?<=[\.\!\?])\s+", text)
+    out = []
+    for r in raw:
+        s = clean_ws(r)
+        if not s or len(s) < 18:
+            continue
+        s = re.sub(r"\s*\|\s*", " | ", s)
+        s = re.sub(r"(\b\w+\b)( \| \1){2,}", r"\1", s, flags=re.I)
+        if SECTION_RE.search(s) or REQ_LINE_RE.search(s):
+            if len(s) > MAX_EVIDENCE_CHARS_PER_LINE:
+                s = s[:MAX_EVIDENCE_CHARS_PER_LINE] + "…"
+            out.append(s)
+    seen = set()
+    uniq = []
+    for s in out:
+        k = s.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(s)
+    return uniq
+
+def build_requirement_pack(top_docs, question: str, max_lines: int) -> Tuple[List[Tuple[str, str, bool]], List[str]]:
+    q_toks = set(tokenize(question))
+    findings = []
+
+    for score, fullpath, fname, text, is_maily in top_docs:
+        lines = extract_requirement_lines(text)
+        scored_lines = []
+        for ln in lines:
+            ltoks = set(tokenize(ln))
+            overlap = len(q_toks & ltoks)
+            anchor = 0
+            if REQ_LINE_RE.search(ln):
+                anchor += 2
+            scored_lines.append((overlap + anchor, ln))
+
+        scored_lines.sort(key=lambda x: x[0], reverse=True)
+        take = 70 if not is_maily else 18
+        for s, ln in scored_lines[:take]:
+            if s <= 0 and not REQ_LINE_RE.search(ln):
+                continue
+            findings.append((fname, ln, is_maily))
+
+    seen = set()
+    final = []
+    for fname, ln, is_maily in findings:
+        k = (fname.lower(), ln.lower())
+        if k in seen:
+            continue
+        seen.add(k)
+        final.append((fname, ln, is_maily))
+        if len(final) >= max_lines:
+            break
+
+    sources = []
+    for fname, _, _ in final:
+        if fname.lower().startswith(EXCLUDE_AS_SOURCES_PREFIXES):
+            continue
+        if fname not in sources:
+            sources.append(fname)
+    sources = sources[:8]
+    return final, sources
+
+def build_findings_text(findings: List[Tuple[str, str, bool]]) -> str:
+    lines = []
+    for i, (fname, ln, is_maily) in enumerate(findings, start=1):
+        tag = "MAIL-CHAIN" if is_maily else "DOC"
+        safe_ln = redact_for_llm_input(ln)
+        lines.append(f"[{i}] ({tag}) {fname}: {safe_ln}")
+    return "\n".join(lines)
+
+
+# =========================
+# LLM
+# =========================
+def strip_subject_lines(text: str) -> str:
+    if not text:
+        return text
+    # Remove leading Subject/Betreff lines if the model still outputs them
+    t = re.sub(r"(?im)^\s*(subject|betreff)\s*:\s*.*\n+", "", text).strip()
+    return t
+
+def ensure_greetings(text: str, greeting_name: str, question: str) -> str:
+    """
+    Ensure both language greetings exist.
+    We keep your existing behavior: whichever order model used, we don't reorder; just ensure greetings exist.
+    """
+    if not text:
+        return text
+    t = text.strip()
+
+    # If it contains a separator, ensure both sides have greeting lines
+    if "\n---\n" in t:
+        left, right = t.split("\n---\n", 1)
+        left = left.strip()
+        right = right.strip()
+
+        # German side heuristics: contains "Mit freundlichen Grüßen" or many umlauts etc.
+        if "Mit freundlichen Grüßen" in left or re.search(r"[äöüß]", left):
+            de = left
+            en = right
+        else:
+            en = left
+            de = right
+
+        if not re.search(r"(?im)^\s*Hallo\s+", de):
+            de = f"Hallo {greeting_name},\n" + de
+        if not re.search(r"(?im)^\s*Hello\s+", en):
+            en = f"Hello {greeting_name},\n" + en
+
+        # Rebuild in original order
+        if "Mit freundlichen Grüßen" in left or re.search(r"[äöüß]", left):
+            return de.strip() + "\n---\n" + en.strip()
+        else:
+            return en.strip() + "\n---\n" + de.strip()
+
+    # If no separator: just ensure at least one greeting
+    if not (re.search(r"(?im)^\s*Hallo\s+", t) or re.search(r"(?im)^\s*Hello\s+", t)):
+        t = f"Hallo {greeting_name},\n" + t
+    return t
+
+def enforce_mb_pov(text: str) -> str:
+    """
+    Minimal post-fix: remove wrong 'I deliver to Mercedes-Benz' phrasing if it slips through.
+    """
+    if not text:
+        return text
+    t = text
+
+    # English: fix "I deliver to Mercedes-Benz" patterns
+    t = re.sub(r"(?i)\ball products that i deliver to mercedes-?benz\b", "all products delivered to Mercedes-Benz", t)
+    t = re.sub(r"(?i)\bthat i deliver to mercedes-?benz\b", "delivered to Mercedes-Benz", t)
+    t = re.sub(r"(?i)\bi deliver to mercedes-?benz\b", "products are delivered to Mercedes-Benz", t)
+
+    # German: fix "die ich an Mercedes-Benz liefere"
+    t = re.sub(r"(?i)\bdie\s+ich\s+an\s+mercedes-?benz\s+liefere\b", "die an Mercedes-Benz geliefert werden", t)
+
+    return t
+
+def build_llm_prompt(question: str, greeting_name: str, signature_name: str, sources: List[str], findings_text: str) -> str:
+    src_line = ", ".join(sources) if sources else "(none)"
+    q_safe = redact_for_llm_input(question)
+    en_first = looks_english(question)
+
+    order_note = "English section first, then a line with exactly: --- , then German." if en_first else \
+                 "German section first, then a line with exactly: --- , then English."
+
+    return f"""
+You are drafting an email reply that will be sent directly by the user.
+The sender is Mercedes-Benz (internal procurement/sustainability). This is critical.
+
+STRICT GROUNDING:
+- Use ONLY the FINDINGS below. Do NOT invent facts.
+- Answer ONLY the user’s question.
+
+VOICE / POV (critical):
+- Write in FIRST PERSON PLURAL from Mercedes-Benz’s perspective:
+  German: use "wir/unser" (NOT "ich/mein").
+  English: use "we/our" (NOT "I/my").
+- Never write phrases like "products that I deliver to Mercedes-Benz" or "I deliver to Mercedes-Benz".
+  If a delivery relationship is needed, phrase it as:
+  "products delivered to Mercedes-Benz" / "products supplied to Mercedes-Benz" / "products delivered to us".
+
+OUTPUT ORDER (must follow exactly):
+- {order_note}
+
+STYLE (clean + Outlook-friendly):
+- Do NOT include any "Subject:" or "Betreff:" lines.
+- Each language section MUST start with a greeting line:
+  German: "Hallo {greeting_name},"
+  English: "Hello {greeting_name},"
+- After the greeting: 1 short intro sentence.
+- Then use **bold headings** and ONLY bullet points under headings (lines start with "- ").
+- No numbering.
+- Each bullet is one sentence.
+- End with one short closing sentence offering clarification.
+- Then the closing:
+  German: "Mit freundlichen Grüßen" + "{signature_name}"
+  English: "Best regards," + "{signature_name}"
+- At end of each language section add:
+  "Sources used: <doc titles only from allowed list>"
+
+If FINDINGS are insufficient:
+- Ask 1–2 short clarifying questions instead of guessing.
+
+Question:
+{q_safe}
+
+Allowed sources list:
+{src_line}
+
+FINDINGS:
+{findings_text if findings_text.strip() else "(no findings)"}
+""".strip()
+
+def build_general_llm_prompt(question: str, greeting_name: str, signature_name: str) -> str:
+    en_first = looks_english(question)
+    order_note = "English section first, then a line with exactly: --- , then German." if en_first else \
+                 "German section first, then a line with exactly: --- , then English."
+    q_safe = redact_for_llm_input(question)
+
+    return f"""
+You are drafting an email reply that will be sent directly by the user.
+The sender is Mercedes-Benz. This is critical.
+
+IMPORTANT:
+- The grounded evidence output was unavailable.
+- Provide GENERAL best-practice guidance (not document-specific).
+- Be explicit that this is general guidance and the exact internal documents should be checked.
+
+VOICE / POV:
+- First person plural from Mercedes-Benz ("we/our", "wir/unser").
+- Never "I deliver to Mercedes-Benz".
+
+OUTPUT ORDER:
+- {order_note}
+
+STYLE:
+- Do NOT include any "Subject:" or "Betreff:" lines.
+- Start each language section with its greeting ("Hello..." / "Hallo...").
+- **Bold headings** + bullet points only.
+- No numbering.
+- End with the correct closing lines + signature.
+
+Question:
+{q_safe}
+""".strip()
+
+def build_azure_client() -> AzureOpenAI:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise SystemExit("OPENAI_API_KEY env var missing (GenAI-Nexus key).")
+    return AzureOpenAI(
+        api_key=key,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_version=AZURE_API_VERSION,
+    )
+
+def _extract_chat_text(resp) -> str:
+    try:
+        mc = resp.choices[0].message.content
+        if isinstance(mc, str):
+            return mc.strip()
+    except Exception:
+        pass
+    try:
+        d = resp.model_dump()
+        s = d.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return (s or "").strip()
+    except Exception:
+        return ""
+
+def call_llm(client: AzureOpenAI, prompt: str) -> Tuple[str, Any]:
+    resp = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+        temperature=LLM_TEMPERATURE,
+        max_completion_tokens=LLM_MAX_COMPLETION_TOKENS,
+        messages=[
+            {"role": "system", "content": "Follow the required format exactly."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+
+    txt = _extract_chat_text(resp)
+
+    if DEBUG_PRINT_LLM_META:
+        try:
+            fr = getattr(resp.choices[0], "finish_reason", None)
+            print("DEBUG finish_reason:", fr)
+        except Exception:
+            pass
+        try:
+            refusal = getattr(resp.choices[0].message, "refusal", None)
+            if refusal:
+                print("DEBUG refusal present:", repr(refusal)[:240])
+        except Exception:
+            pass
+        try:
+            cfr = getattr(resp.choices[0], "content_filter_results", None)
+            if cfr is not None:
+                print("DEBUG content_filter_results present")
+        except Exception:
+            pass
+
+    if DEBUG_PRINT_LLM_PREVIEW:
+        try:
+            mc = resp.choices[0].message.content
+            print("DEBUG message.content type:", type(mc))
+        except Exception:
+            print("DEBUG could not inspect message.content")
+
+    return (txt or "").strip(), resp
+
+
+# =========================
+# OUTLOOK HELPERS
+# =========================
+def get_sender_smtp(mail) -> str:
+    try:
+        addr = (mail.SenderEmailAddress or "").lower()
+        if addr.startswith("/o="):
+            ex = mail.Sender.GetExchangeUser()
+            if ex:
+                return (ex.PrimarySmtpAddress or "").lower()
+        return addr
+    except Exception:
+        return (mail.SenderEmailAddress or "").lower()
+
+def get_target_folder():
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    target_store = None
+    for st in ns.Stores:
+        if TARGET_MAILBOX.lower() in (st.DisplayName or "").lower():
+            target_store = st
+            break
+    if not target_store:
+        print("Available stores (use one of these in TARGET_MAILBOX):")
+        for st in ns.Stores:
+            print(" -", st.DisplayName)
+        raise SystemExit("Target mailbox not found.")
+
+    inbox = target_store.GetDefaultFolder(6)  # Inbox
+    if WATCH_FOLDER_NAME.lower() == "inbox":
+        return ns, inbox, target_store.DisplayName, "Inbox"
+
+    for f in inbox.Folders:
+        if (f.Name or "").lower() == WATCH_FOLDER_NAME.lower():
+            return ns, f, target_store.DisplayName, f.Name
+
+    raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
+
+def add_processed_category(mail):
+    try:
+        cats = mail.Categories or ""
+        if PROCESSED_CATEGORY.lower() not in cats.lower():
+            mail.Categories = (cats + "," + PROCESSED_CATEGORY).strip(",")
+        mail.Save()
+    except Exception:
+        pass
+
+def mark_read(mail):
+    try:
+        mail.UnRead = False
+        mail.Save()
+    except Exception:
+        pass
+
+def get_account_for_mailbox(ns, mailbox_substring: str):
+    try:
+        for acc in ns.Session.Accounts:
+            smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
+            if mailbox_substring.lower() in smtp or smtp in mailbox_substring.lower():
+                return acc
+    except Exception:
+        pass
+    return None
+
+def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
+    msg = ns.Application.CreateItem(0)
+    msg.To = to_addr
+    msg.Subject = f"Draft created (review needed): {orig_subject}"
+    msg.Body = (
+        "A draft reply has been created in Outlook.\n\n"
+        f"Original subject: {orig_subject}\n"
+        f"Requester: {requester_email}\n\n"
+        "Please review the draft carefully before sending.\n"
+    )
+    acc = get_account_for_mailbox(ns, from_mailbox)
+    if acc:
+        try:
+            msg.SendUsingAccount = acc
+        except Exception:
+            pass
+    msg.Send()
+
+def create_outlook_task_reminder(ns, subject: str, days: int = 2):
+    try:
+        task = ns.Application.CreateItem(3)  # olTaskItem
+        task.Subject = f"Reminder: review/send draft for '{subject}'"
+        task.DueDate = (datetime.now() + timedelta(days=days)).date()
+        task.ReminderSet = True
+        task.ReminderTime = datetime.now() + timedelta(days=days)
+        task.Body = "A draft reply was created by the bot. Please review and send it."
+        task.Save()
+    except Exception:
+        pass
+
+
+# =========================
+# MAIN
+# =========================
+def run_bot_once():
+    if PRINT_RUN_TIMESTAMP:
+        print("\n=== RUN START ===")
+        print("Run timestamp:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        print("=================\n")
+
+    time.sleep(STARTUP_DELAY_SEC)
+
+    print("Loading KB docs from:", KB_DIR)
+    docs = load_kb_docs(KB_DIR)
+    print("KB docs:", len(docs))
+
+    client = build_azure_client()
+
+    ns, folder, store_name, folder_name = get_target_folder()
+    print(f"Mailbox={store_name} | Folder={folder_name}")
+
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True)
+
+    drafted = 0
+    checked = 0
+
+    signature_name = FORCE_SIGNATURE_NAME or safe_firstname_from_email(TARGET_MAILBOX)
+
+    for mail in items:
+        checked += 1
+        if checked > SCAN_LIMIT:
+            break
+        if drafted >= PROCESS_PER_RUN:
+            break
+
+        try:
+            if getattr(mail, "Class", None) != 43:
+                continue
+
+            if PROCESSED_CATEGORY.lower() in (mail.Categories or "").lower():
+                continue
+
+            if REQUIRE_UNREAD and not mail.UnRead:
+                continue
+
+            subject = mail.Subject or ""
+            if not strict_subject_ok(subject):
+                continue
+
+            sender = get_sender_smtp(mail)
+            greeting_name = safe_firstname_from_email(sender)
+
+            body_text = clean_html_to_text(mail.HTMLBody or "")
+            question = re.split(r"(?i)\b(von:|from:|gesendet:|sent:|-----original message-----)\b", body_text)[0].strip()
+            if not question:
+                question = body_text.strip()
+            question = clean_question(question)
+
+            print("\n[PASS] bot mail:", sender)
+            print("Question:", question)
+
+            # Pass A: non-mail docs
+            topA = rank_docs_simple(docs, question, include_maily=False, top_k=TOP_DOCS_PASS_A)
+
+            # Pass B: mail docs (secondary)
+            mail_candidates = []
+            if TOP_DOCS_PASS_B > 0:
+                topB = rank_docs_simple(docs, question, include_maily=True, top_k=40)
+                mail_candidates = [d for d in topB if d[4] is True][:TOP_DOCS_PASS_B]
+
+            top_docs = topA + mail_candidates
+            print("Top docs:", [d[2] for d in top_docs])
+
+            # Try FULL -> SMALL -> TINY
+            attempt_plan = [
+                ("FULL", FINDINGS_FULL),
+                ("SMALL", FINDINGS_SMALL),
+                ("TINY", FINDINGS_TINY),
+            ]
+
+            reply_text = ""
+
+            for label, n_lines in attempt_plan:
+                findings, sources = build_requirement_pack(top_docs, question, max_lines=n_lines)
+                findings_text = build_findings_text(findings)
+
+                print(f"Findings pack {label}: lines={len(findings)} sources={sources}")
+
+                prompt = build_llm_prompt(
+                    question=question,
+                    greeting_name=greeting_name,
+                    signature_name=signature_name,
+                    sources=sources,
+                    findings_text=findings_text,
+                )
+
+                reply_text, _ = call_llm(client, prompt)
+                print(f"LLM reply len ({label}):", len(reply_text))
+                if DEBUG_PRINT_LLM_PREVIEW:
+                    print("LLM preview:", repr(reply_text[:220]))
+
+                if reply_text.strip():
+                    break
+
+            # If still empty -> general guidance LLM (still LLM, always answers)
+            if not reply_text.strip():
+                print("WARNING: grounded LLM output blanked. Using GENERAL LLM fallback (still LLM).")
+                prompt_general = build_general_llm_prompt(
+                    question=question,
+                    greeting_name=greeting_name,
+                    signature_name=signature_name,
+                )
+                reply_text, _ = call_llm(client, prompt_general)
+                print("LLM reply len (GENERAL):", len(reply_text))
+
+            # Absolute last fallback (deterministic)
+            if not reply_text.strip():
+                print("WARNING: LLM still empty. Using deterministic fallback.")
+                reply_text = (
+                    f"Hello {greeting_name},\n"
+                    f"We could not generate a response from the current document excerpts.\n"
+                    f"Could you please point to the exact internal document/section you mean?\n\n"
+                    f"Best regards,\n{signature_name}\n\n---\n\n"
+                    f"Hallo {greeting_name},\n"
+                    f"wir konnten aus den aktuell gefundenen Dokumentstellen keine Antwort generieren.\n"
+                    f"Können Sie bitte den konkreten Dokumentnamen oder Abschnitt nennen?\n\n"
+                    f"Mit freundlichen Grüßen\n{signature_name}"
+                )
+
+            # === Post-processing (keep minimal) ===
+            # 1) remove Subject/Betreff if the model outputs it anyway
+            reply_text = strip_subject_lines(reply_text)
+
+            # 2) ensure greetings exist on both sides
+            reply_text = ensure_greetings(reply_text, greeting_name=greeting_name, question=question)
+
+            # 3) enforce Mercedes POV (no "I deliver to Mercedes-Benz")
+            reply_text = enforce_mb_pov(reply_text)
+
+            # Render bold and HTML
+            reply_text_html_ready = md_bold_to_html(reply_text)
+
+            reply = mail.Reply()
+            reply.HTMLBody = f"<div>{format_outlook_html(reply_text_html_ready)}</div><hr>" + reply.HTMLBody
+            reply.Save()
+
+            mark_read(mail)
+            add_processed_category(mail)
+
+            drafted += 1
+            print("Draft created for:", subject)
+
+            if SELF_NOTIFY:
+                send_self_notification(ns, TARGET_MAILBOX, SELF_NOTIFY_TO, subject, sender)
+
+            if CREATE_REMINDER_TASK:
+                create_outlook_task_reminder(ns, subject=subject, days=REMINDER_DAYS)
+
+        except Exception as e:
+            print("Mail error:", getattr(mail, "Subject", "<no subject>"), "-", repr(e))
+
+    print(f"\nDone. Checked={checked}, Drafted={drafted}")
+
+
+# Notebook: run_bot_once()
+if __name__ == "__main__":
+    run_bot_once()
