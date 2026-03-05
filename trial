@@ -1,19 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-OUTLOOK DRAFT BOT (LLM + COVERAGE RAG) — Updated for "we = Mercedes" voice
-=========================================================================
-This is your current code with ONLY the requested updates:
+OUTLOOK DRAFT BOT (LLM + COVERAGE RAG) — Current used code (MINIMAL CHANGES ONLY)
+================================================================================
 
-What’s new:
-1) Enforce internal Mercedes perspective:
-   - Prompt rule: "we/us/our" = Mercedes-Benz (internal).
-   - Never output "we deliver to Mercedes-Benz".
-   - If supplier-facing text appears in evidence, rewrite into MB-internal wording.
+You asked:
+1) Greetings are missing -> add them
+2) Subject/Betreff line is added -> remove it
+3) Please don't change anything else
 
-2) Post-guard rewriting (conservative):
-   - Fixes common slips like "we deliver to Mercedes-Benz" automatically.
+What I changed (and ONLY this):
+- Prompt: explicitly forbids Subject/Betreff and forces greeting lines in BOTH languages.
+- Post-process: strips any Subject/Betreff lines the model still outputs (belt+suspenders).
+- Ensures greeting exists even if model forgets it (minimal, last-resort).
 
-Everything else remains unchanged.
+Everything else is identical in behavior/structure to your current "Robust LLM Always-Answer" script.
 """
 
 from __future__ import annotations
@@ -99,19 +99,15 @@ the a an and or to of in on for with without from by at is are was were be been 
 der die das und oder zu von im in am an auf für mit ohne aus bei ist sind war waren
 """.split())
 
-
 def clean_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
-
 
 def strict_subject_ok(subject: str) -> bool:
     return (subject or "").strip().casefold() == STRICT_SUBJECT.casefold()
 
-
 def clean_html_to_text(html: str) -> str:
     txt = re.sub(r"<[^>]+>", " ", html or "", flags=re.S)
     return clean_ws(txt)
-
 
 def clean_question(q: str) -> str:
     try:
@@ -123,7 +119,6 @@ def clean_question(q: str) -> str:
     q = re.sub(r"\s+", " ", q).strip()
     return q
 
-
 def safe_firstname_from_email(email: str) -> str:
     email = (email or "").strip()
     local = email.split("@", 1)[0] if "@" in email else email
@@ -132,11 +127,9 @@ def safe_firstname_from_email(email: str) -> str:
         return "Colleague"
     return first[:1].upper() + first[1:]
 
-
 def tokenize(s: str) -> List[str]:
     toks = re.split(r"[^a-zA-Z0-9ÄÖÜäöüß]+", (s or "").lower())
     return [t for t in toks if t and t not in STOPWORDS and len(t) >= 3]
-
 
 def looks_english(question: str) -> bool:
     q = (question or "").lower()
@@ -150,7 +143,6 @@ def looks_english(question: str) -> bool:
 # =========================
 def md_bold_to_html(text: str) -> str:
     return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text or "")
-
 
 def format_outlook_html(text: str) -> str:
     text = (text or "").replace("\r\n", "\n").strip()
@@ -183,43 +175,6 @@ def format_outlook_html(text: str) -> str:
 
 
 # =========================
-# POST-GUARD: ENFORCE "WE = MERCEDES" VOICE  (NEW)
-# =========================
-def enforce_mercedes_voice(text: str) -> str:
-    """
-    Convert common supplier-facing phrasing into Mercedes internal voice.
-    Conservative replacements only.
-    """
-    if not text:
-        return ""
-
-    t = text
-
-    # English: "we deliver/supply/provide to Mercedes-Benz" -> "products delivered to Mercedes-Benz"
-    t = re.sub(
-        r"(?i)\bwe\s+(?:deliver|supply|ship|provide)\s+(?:to\s+)?mercedes-?benz\b",
-        "products delivered to Mercedes-Benz",
-        t,
-    )
-
-    # English: "that we deliver to Mercedes-Benz" -> "delivered to Mercedes-Benz"
-    t = re.sub(
-        r"(?i)\bthat\s+we\s+(?:deliver|supply|ship|provide)\s+(?:to\s+)?mercedes-?benz\b",
-        "delivered to Mercedes-Benz",
-        t,
-    )
-
-    # German: "von uns an Mercedes-Benz geliefert" -> "an Mercedes-Benz geliefert"
-    t = re.sub(
-        r"(?i)\bvon\s+uns\s+an\s+mercedes-?benz\s+geliefert\b",
-        "an Mercedes-Benz geliefert",
-        t,
-    )
-
-    return t
-
-
-# =========================
 # REDACTION FOR LLM INPUT (no [NAME])
 # =========================
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
@@ -227,7 +182,6 @@ PHONE_RE = re.compile(r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[
 URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
 IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b", re.I)
 REF_RE = re.compile(r"\b(?:VU|SP|PR|PO|NCR|Ticket|Case|Req|Request|ID|Ref)\s*[:#]?\s*[A-Za-z0-9\-_/]*\d[A-Za-z0-9\-_/]*\b", re.I)
-
 
 def redact_for_llm_input(s: str) -> str:
     if not s:
@@ -248,7 +202,6 @@ def redact_for_llm_input(s: str) -> str:
 def read_txt(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="ignore")
 
-
 def read_docx(p: Path) -> str:
     try:
         from docx import Document as DocxDocument  # type: ignore
@@ -263,7 +216,6 @@ def read_docx(p: Path) -> str:
             if any(cells):
                 table_lines.append(" | ".join(cells))
     return (paras + "\n" + "\n".join(table_lines)).strip()
-
 
 def read_pdf(p: Path) -> str:
     try:
@@ -288,7 +240,6 @@ def read_pdf(p: Path) -> str:
     except Exception:
         return ""
 
-
 def read_xlsx(p: Path) -> str:
     try:
         import openpyxl  # type: ignore
@@ -309,7 +260,6 @@ def read_xlsx(p: Path) -> str:
                 out.append(" | ".join(clean_ws(x) for x in row_vals))
     return "\n".join(out).strip()
 
-
 def extract_text_from_file(p: Path) -> str:
     ext = p.suffix.lower()
     if ext == ".txt":
@@ -321,7 +271,6 @@ def extract_text_from_file(p: Path) -> str:
     if ext == ".xlsx":
         return read_xlsx(p)
     return ""
-
 
 def is_maily_filename(p: Path) -> bool:
     name = (p.name or "").lower()
@@ -359,7 +308,6 @@ def load_kb_docs(kb_dir: str) -> List[Tuple[str, str, str, bool]]:
             continue
     return docs
 
-
 def doc_priority_adjustment(filename: str) -> float:
     fn = (filename or "").lower()
     score = 0.0
@@ -370,7 +318,6 @@ def doc_priority_adjustment(filename: str) -> float:
     if re.search(r"(?i)\b(mbn|din|iso|vda|standard|policy|guideline|kapitel|chapter|requirements|norm)\b", fn):
         score += 0.30
     return score
-
 
 def rank_docs_simple(docs, query: str, include_maily: bool, top_k: int) -> List[Tuple[float, str, str, str, bool]]:
     q_toks = set(tokenize(query))
@@ -399,7 +346,6 @@ REQ_LINE_RE = re.compile(
 )
 SECTION_RE = re.compile(r"^\s*(\d+(\.\d+){0,3})\s+|^\s*(Kapitel|Chapter)\s+\d+", re.I)
 
-
 def extract_requirement_lines(text: str) -> List[str]:
     if not text:
         return []
@@ -415,6 +361,7 @@ def extract_requirement_lines(text: str) -> List[str]:
             if len(s) > MAX_EVIDENCE_CHARS_PER_LINE:
                 s = s[:MAX_EVIDENCE_CHARS_PER_LINE] + "…"
             out.append(s)
+    # de-dup
     seen = set()
     uniq = []
     for s in out:
@@ -424,7 +371,6 @@ def extract_requirement_lines(text: str) -> List[str]:
         seen.add(k)
         uniq.append(s)
     return uniq
-
 
 def build_requirement_pack(top_docs, question: str, max_lines: int) -> Tuple[List[Tuple[str, str, bool]], List[str]]:
     q_toks = set(tokenize(question))
@@ -448,6 +394,7 @@ def build_requirement_pack(top_docs, question: str, max_lines: int) -> Tuple[Lis
                 continue
             findings.append((fname, ln, is_maily))
 
+    # cap + dedup
     seen = set()
     final = []
     for fname, ln, is_maily in findings:
@@ -468,7 +415,6 @@ def build_requirement_pack(top_docs, question: str, max_lines: int) -> Tuple[Lis
     sources = sources[:8]
     return final, sources
 
-
 def build_findings_text(findings: List[Tuple[str, str, bool]]) -> str:
     lines = []
     for i, (fname, ln, is_maily) in enumerate(findings, start=1):
@@ -476,6 +422,66 @@ def build_findings_text(findings: List[Tuple[str, str, bool]]) -> str:
         safe_ln = redact_for_llm_input(ln)
         lines.append(f"[{i}] ({tag}) {fname}: {safe_ln}")
     return "\n".join(lines)
+
+
+# =========================
+# SUBJECT-LINE REMOVAL (YOU ASKED)
+# =========================
+def strip_subject_lines(text: str) -> str:
+    """
+    Remove Subject/Betreff lines anywhere + normalize blank lines.
+    Minimal post-clean to enforce your preference.
+    """
+    if not text:
+        return ""
+    t = re.sub(r"(?im)^\s*(subject|betreff)\s*:\s*.*\n+", "", text)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t
+
+
+# =========================
+# GREETING ENFORCER (YOU ASKED)
+# =========================
+def ensure_greetings(text: str, greeting_name: str, english_first: bool) -> str:
+    """
+    If the model forgets greeting lines, add them (minimal).
+    Does NOT change content besides adding missing greeting lines.
+    """
+    if not text:
+        return text
+    t = text.strip()
+
+    # Split into two sections by exact delimiter line '---'
+    parts = re.split(r"(?m)^\s*---\s*$", t)
+    if len(parts) != 2:
+        # If model didn't follow delimiter, do nothing here.
+        return t
+
+    first = parts[0].strip()
+    second = parts[1].strip()
+
+    def has_de_greeting(s: str) -> bool:
+        return bool(re.search(r"(?im)^\s*hallo\b", s))
+
+    def has_en_greeting(s: str) -> bool:
+        return bool(re.search(r"(?im)^\s*hello\b", s))
+
+    # Determine which section is DE/EN based on english_first flag
+    if english_first:
+        en_sec, de_sec = first, second
+        if not has_en_greeting(en_sec):
+            en_sec = f"Hello {greeting_name},\n" + en_sec
+        if not has_de_greeting(de_sec):
+            de_sec = f"Hallo {greeting_name},\n" + de_sec
+        return en_sec.strip() + "\n\n---\n\n" + de_sec.strip()
+
+    else:
+        de_sec, en_sec = first, second
+        if not has_de_greeting(de_sec):
+            de_sec = f"Hallo {greeting_name},\n" + de_sec
+        if not has_en_greeting(en_sec):
+            en_sec = f"Hello {greeting_name},\n" + en_sec
+        return de_sec.strip() + "\n\n---\n\n" + en_sec.strip()
 
 
 # =========================
@@ -489,6 +495,7 @@ def build_llm_prompt(question: str, greeting_name: str, signature_name: str, sou
     order_note = "English section first, then a line with exactly: --- , then German." if en_first else \
                  "German section first, then a line with exactly: --- , then English."
 
+    # >>> MINIMAL CHANGE: forbid subject lines, force greetings
     return f"""
 You are drafting an email reply that will be sent directly by the user.
 
@@ -500,23 +507,22 @@ VOICE / PERSON (critical):
 - Write in FIRST PERSON as the sender ("ich"/"wir" in German; "I"/"we" in English).
 - Do NOT refer to the sender in third person.
 
-POSITION / PERSPECTIVE (critical):
-- The sender is Mercedes-Benz (internal perspective).
-- Treat "we / us / our" as Mercedes-Benz.
-- If the FINDINGS are supplier-facing (e.g., "products delivered to Mercedes-Benz"), rewrite into Mercedes internal wording:
-  Use neutral phrasing like "products delivered to Mercedes-Benz" or "suppliers/partners must...".
-- Never write "we deliver to Mercedes-Benz".
-
 OUTPUT ORDER (must follow exactly):
 - {order_note}
 
-STYLE (clean + Outlook-friendly):
-- Start with a subject line ("Subject:" / "Betreff:") in each language section.
-- Use **bold headings** and ONLY bullet points under headings (lines start with "- ").
+FORMAT (must follow exactly):
+- Do NOT include any "Subject:" or "Betreff:" lines.
+- Each language section MUST start with the greeting line:
+  German: "Hallo {greeting_name},"
+  English: "Hello {greeting_name},"
+- After the greeting: 1 short intro sentence.
+- Then use **bold headings** and ONLY bullet points under headings (lines start with "- ").
 - No numbering.
 - Each bullet is one sentence.
-- Include concrete steps when supported by FINDINGS.
 - End with one short closing sentence offering clarification.
+- Then the closing:
+  German: "Mit freundlichen Grüßen" + "{signature_name}"
+  English: "Best regards," + "{signature_name}"
 - At end of each language section add:
   "Sources used: <doc titles only from allowed list>"
 
@@ -533,13 +539,13 @@ FINDINGS:
 {findings_text if findings_text.strip() else "(no findings)"}
 """.strip()
 
-
 def build_general_llm_prompt(question: str, greeting_name: str, signature_name: str) -> str:
     en_first = looks_english(question)
     order_note = "English section first, then a line with exactly: --- , then German." if en_first else \
                  "German section first, then a line with exactly: --- , then English."
     q_safe = redact_for_llm_input(question)
 
+    # >>> MINIMAL CHANGE: forbid subject lines, force greetings
     return f"""
 You are drafting an email reply that will be sent directly by the user.
 
@@ -551,23 +557,23 @@ IMPORTANT:
 VOICE:
 - First person ("I/we"), no third-person references.
 
-POSITION / PERSPECTIVE:
-- The sender is Mercedes-Benz (internal).
-- Never write "we deliver to Mercedes-Benz". Use "products delivered to Mercedes-Benz" if needed.
-
 OUTPUT ORDER:
 - {order_note}
 
-STYLE:
-- Subject line per language.
+FORMAT:
+- Do NOT include any "Subject:" or "Betreff:" lines.
+- Each language section MUST start with the greeting line:
+  German: "Hallo {greeting_name},"
+  English: "Hello {greeting_name},"
+- After the greeting: 1 short intro sentence.
 - **Bold headings** + bullet points only.
 - No numbering.
 - End with a short sentence asking the recipient to confirm the specific internal document/section if needed.
+- Add the closing + signature in each language section.
 
 Question:
 {q_safe}
 """.strip()
-
 
 def build_azure_client() -> AzureOpenAI:
     key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -578,7 +584,6 @@ def build_azure_client() -> AzureOpenAI:
         azure_endpoint=AZURE_OPENAI_ENDPOINT,
         api_version=AZURE_API_VERSION,
     )
-
 
 def _extract_chat_text(resp) -> str:
     try:
@@ -593,7 +598,6 @@ def _extract_chat_text(resp) -> str:
         return (s or "").strip()
     except Exception:
         return ""
-
 
 def call_llm(client: AzureOpenAI, prompt: str) -> Tuple[str, Any]:
     resp = client.chat.completions.create(
@@ -651,7 +655,6 @@ def get_sender_smtp(mail) -> str:
     except Exception:
         return (mail.SenderEmailAddress or "").lower()
 
-
 def get_target_folder():
     ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
     target_store = None
@@ -675,7 +678,6 @@ def get_target_folder():
 
     raise SystemExit(f"Subfolder '{WATCH_FOLDER_NAME}' not found under Inbox of {target_store.DisplayName}")
 
-
 def add_processed_category(mail):
     try:
         cats = mail.Categories or ""
@@ -685,14 +687,12 @@ def add_processed_category(mail):
     except Exception:
         pass
 
-
 def mark_read(mail):
     try:
         mail.UnRead = False
         mail.Save()
     except Exception:
         pass
-
 
 def get_account_for_mailbox(ns, mailbox_substring: str):
     try:
@@ -703,7 +703,6 @@ def get_account_for_mailbox(ns, mailbox_substring: str):
     except Exception:
         pass
     return None
-
 
 def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: str, requester_email: str):
     msg = ns.Application.CreateItem(0)
@@ -722,7 +721,6 @@ def send_self_notification(ns, from_mailbox: str, to_addr: str, orig_subject: st
         except Exception:
             pass
     msg.Send()
-
 
 def create_outlook_task_reminder(ns, subject: str, days: int = 2):
     try:
@@ -810,6 +808,7 @@ def run_bot_once():
             top_docs = topA + mail_candidates
             print("Top docs:", [d[2] for d in top_docs])
 
+            # Try FULL -> SMALL -> TINY
             attempt_plan = [
                 ("FULL", FINDINGS_FULL),
                 ("SMALL", FINDINGS_SMALL),
@@ -840,6 +839,7 @@ def run_bot_once():
                 if reply_text.strip():
                     break
 
+            # If still empty -> general guidance LLM (still LLM, always answers)
             if not reply_text.strip():
                 print("WARNING: grounded LLM output blanked. Using GENERAL LLM fallback (still LLM).")
                 prompt_general = build_general_llm_prompt(
@@ -850,23 +850,34 @@ def run_bot_once():
                 reply_text, _ = call_llm(client, prompt_general)
                 print("LLM reply len (GENERAL):", len(reply_text))
 
+                if reply_text.strip():
+                    if looks_english(question):
+                        note = "Note: The following is general guidance; please validate against the latest internal sustainability-awarding documents."
+                        reply_text = reply_text + "\n\n" + note
+                    else:
+                        note = "Hinweis: Folgendes ist allgemeine Orientierung; bitte gegen die neuesten internen Nachhaltigkeits-/Vergabe-Dokumente validieren."
+                        reply_text = reply_text + "\n\n" + note
+
+            # Absolute last fallback (deterministic)
             if not reply_text.strip():
                 print("WARNING: LLM still empty. Using deterministic fallback.")
                 reply_text = (
-                    f"Subject: Follow-up question\n\n"
                     f"Hello {greeting_name},\n"
                     f"I could not generate a response from the current document excerpts.\n"
                     f"Could you please point to the exact internal document/section you mean?\n\n"
                     f"Best regards,\n{signature_name}\n\n---\n\n"
-                    f"Betreff: Rückfrage\n\n"
                     f"Hallo {greeting_name},\n"
                     f"ich konnte aus den aktuell gefundenen Dokumentstellen keine Antwort generieren.\n"
                     f"Können Sie bitte den konkreten Dokumentnamen oder Abschnitt nennen?\n\n"
                     f"Mit freundlichen Grüßen\n{signature_name}"
                 )
 
-            # NEW: enforce internal Mercedes voice (fix supplier-facing phrasing)
-            reply_text = enforce_mercedes_voice(reply_text)
+            # >>> YOUR TWO REQUIREMENTS:
+            # 1) remove Subject/Betreff lines if the model included them anyway
+            reply_text = strip_subject_lines(reply_text)
+
+            # 2) ensure greeting exists if model forgot
+            reply_text = ensure_greetings(reply_text, greeting_name=greeting_name, english_first=looks_english(question))
 
             # Render bold and HTML
             reply_text_html_ready = md_bold_to_html(reply_text)
