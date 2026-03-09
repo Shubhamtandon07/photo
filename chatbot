@@ -1,31 +1,9 @@
-from pathlib import Path
+import subprocess, textwrap
 
-roots = [
-    r"C:\Program Files",
-    r"C:\Program Files (x86)",
-    r"C:\Users",
-    r"C:\ProgramData",
-    r"C:\Windows",
-]
-
-hits = []
-for r in roots:
-    base = Path(r)
-    if not base.exists():
-        continue
-    try:
-        # search only 5 levels deep to avoid insane runtime
-        for p in base.rglob("tesseract.exe"):
-            hits.append(str(p))
-            if len(hits) >= 30:
-                break
-    except Exception as e:
-        print("skip", r, "->", repr(e))
-    if len(hits) >= 30:
-        break
-
-print("Hits:", hits[:30])
-print("Total hits found (capped):", len(hits))
-
-Hits: []
-Total hits found (capped): 0
+p = subprocess.run(
+    ["winget", "list", "--id", "UB-Mannheim.TesseractOCR"],
+    capture_output=True, text=True
+)
+print("rc:", p.returncode)
+print("stdout:\n", p.stdout)
+print("stderr:\n", p.stderr)
