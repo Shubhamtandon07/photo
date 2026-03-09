@@ -3,4 +3,21 @@ C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 -
 C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus
 
 import subprocess
-subprocess.run(["winget", "install", "--id", "UB-Mannheim.TesseractOCR", "-e"], check=False)
+subprocess.run(["taskkill", "/F", "/IM", "winget.exe"], check=False)
+subprocess.run(["taskkill", "/F", "/IM", "AppInstaller.exe"], check=False)
+
+import subprocess, textwrap
+
+cmd = [
+    "winget","install",
+    "--id","UB-Mannheim.TesseractOCR",
+    "-e",
+    "--accept-source-agreements",
+    "--accept-package-agreements",
+    "--silent",
+    "--disable-interactivity",
+]
+p = subprocess.run(cmd, capture_output=True, text=True)
+print("returncode:", p.returncode)
+print("\nSTDOUT:\n", p.stdout[:4000])
+print("\nSTDERR:\n", p.stderr[:4000])
