@@ -1,13 +1,28 @@
-C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Birgit
-C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Athanasia RSS
-C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus
-
 from pathlib import Path
 
-candidates = [
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+roots = [
+    r"C:\Program Files",
+    r"C:\Program Files (x86)",
+    r"C:\Users",
+    r"C:\ProgramData",
+    r"C:\Windows",
 ]
 
-found = [p for p in candidates if Path(p).exists()]
-print("Found:", found)
+hits = []
+for r in roots:
+    base = Path(r)
+    if not base.exists():
+        continue
+    try:
+        # search only 5 levels deep to avoid insane runtime
+        for p in base.rglob("tesseract.exe"):
+            hits.append(str(p))
+            if len(hits) >= 30:
+                break
+    except Exception as e:
+        print("skip", r, "->", repr(e))
+    if len(hits) >= 30:
+        break
+
+print("Hits:", hits[:30])
+print("Total hits found (capped):", len(hits))
