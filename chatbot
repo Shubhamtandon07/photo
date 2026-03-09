@@ -1,11 +1,35 @@
-from pathlib import Path
+import os, base64
+from openai import AzureOpenAI
 
-log = Path(r"C:\Users\SHTANDO\AppData\Local\Temp\winget_tesseract_install.log")
-print("exists:", log.exists(), "size:", log.stat().st_size if log.exists() else None)
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"
+AZURE_API_VERSION = "2024-06-01"          # keep your current; if it fails, try "2024-10-01"
+VISION_DEPLOYMENT = "gpt-5.1"             # this must be a vision-enabled deployment on Nexus
 
-if log.exists():
-    txt = log.read_text(errors="ignore")
-    lines = txt.splitlines()
-    tail = "\n".join(lines[-300:])
-    print("\n=== LOG TAIL (last 300 lines) ===\n")
-    print(tail)
+client = AzureOpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_version=AZURE_API_VERSION,
+)
+
+def b64_data_url(path: str) -> str:
+    with open(path, "rb") as f:
+        b = base64.b64encode(f.read()).decode("utf-8")
+    # adjust mime if needed
+    return "data:image/png;base64," + b
+
+img_path = r"C:\path\to\sample.png"  # <-- change
+
+resp = client.chat.completions.create(
+    model=VISION_DEPLOYMENT,
+    temperature=0.0,
+    max_completion_tokens=80,
+    messages=[
+        {"role": "system", "content": "Reply with exactly OK."},
+        {"role": "user", "content": [
+            {"type": "text", "text": "ping"},
+            {"type": "image_url", "image_url": {"url": b64_data_url(img_path)}},
+        ]},
+    ],
+)
+
+print(resp.choices[0].message.content)
