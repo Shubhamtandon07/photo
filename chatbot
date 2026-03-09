@@ -2,40 +2,12 @@ C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 -
 C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Athanasia RSS
 C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus
 
-import subprocess
-subprocess.run(["taskkill", "/F", "/IM", "winget.exe"], check=False)
-subprocess.run(["taskkill", "/F", "/IM", "AppInstaller.exe"], check=False)
+from pathlib import Path
 
-import subprocess, textwrap
-
-cmd = [
-    "winget","install",
-    "--id","UB-Mannheim.TesseractOCR",
-    "-e",
-    "--accept-source-agreements",
-    "--accept-package-agreements",
-    "--silent",
-    "--disable-interactivity",
+candidates = [
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
 ]
-p = subprocess.run(cmd, capture_output=True, text=True)
-print("returncode:", p.returncode)
-print("\nSTDOUT:\n", p.stdout[:4000])
-print("\nSTDERR:\n", p.stderr[:4000])
 
-
-Images found: 185
-
-[image001.png] OCR ERROR: TesseractNotFoundError("tesseract is not installed or it's not in your PATH. See README file for more information.")
-
-[image002.png] OCR ERROR: TesseractNotFoundError("tesseract is not installed or it's not in your PATH. See README file for more information.")
-
-[image002.jpg] OCR ERROR: TesseractNotFoundError("tesseract is not installed or it's not in your PATH. See README file for more information.")
-
-[image003.png] OCR ERROR: TesseractNotFoundError("tesseract is not installed or it's not in your PATH. See README file for more information.")
-
-[image001.png] OCR ERROR: TesseractNotFoundError("tesseract is not installed or it's not in your PATH. See README file for more information.")
-
-=== OCR SUMMARY (sample) ===
-sampled: 5
-nonempty: 0
-useful (>= 20 chars): 0
+found = [p for p in candidates if Path(p).exists()]
+print("Found:", found)
