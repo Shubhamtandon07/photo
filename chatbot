@@ -1,35 +1,35 @@
-import os, base64
-from openai import AzureOpenAI
+---------------------------------------------------------------------------
+PermissionError                           Traceback (most recent call last)
+Cell In[11], line 30
+     18     return "data:image/png;base64," + b
+     20 img_path = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails\_exports\collect_att_20260224_092225\images"  # <-- change
+     22 resp = client.chat.completions.create(
+     23     model=VISION_DEPLOYMENT,
+     24     temperature=0.0,
+     25     max_completion_tokens=80,
+     26     messages=[
+     27         {"role": "system", "content": "Reply with exactly OK."},
+     28         {"role": "user", "content": [
+     29             {"type": "text", "text": "ping"},
+---> 30             {"type": "image_url", "image_url": {"url": b64_data_url(img_path)}},
+     31         ]},
+     32     ],
+     33 )
+     35 print(resp.choices[0].message.content)
 
-AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"
-AZURE_API_VERSION = "2024-06-01"          # keep your current; if it fails, try "2024-10-01"
-VISION_DEPLOYMENT = "gpt-5.1"             # this must be a vision-enabled deployment on Nexus
+Cell In[11], line 15, in b64_data_url(path)
+     14 def b64_data_url(path: str) -> str:
+---> 15     with open(path, "rb") as f:
+     16         b = base64.b64encode(f.read()).decode("utf-8")
+     17     # adjust mime if needed
 
-client = AzureOpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_version=AZURE_API_VERSION,
-)
+File ~\AppData\Roaming\Python\Python314\site-packages\IPython\core\interactiveshell.py:343, in _modified_open(file, *args, **kwargs)
+    336 if file in {0, 1, 2}:
+    337     raise ValueError(
+    338         f"IPython won't let you open fd={file} by default "
+    339         "as it is likely to crash IPython. If you know what you are doing, "
+    340         "you can use builtins' open."
+    341     )
+--> 343 return io_open(file, *args, **kwargs)
 
-def b64_data_url(path: str) -> str:
-    with open(path, "rb") as f:
-        b = base64.b64encode(f.read()).decode("utf-8")
-    # adjust mime if needed
-    return "data:image/png;base64," + b
-
-img_path = r"C:\path\to\sample.png"  # <-- change
-
-resp = client.chat.completions.create(
-    model=VISION_DEPLOYMENT,
-    temperature=0.0,
-    max_completion_tokens=80,
-    messages=[
-        {"role": "system", "content": "Reply with exactly OK."},
-        {"role": "user", "content": [
-            {"type": "text", "text": "ping"},
-            {"type": "image_url", "image_url": {"url": b64_data_url(img_path)}},
-        ]},
-    ],
-)
-
-print(resp.choices[0].message.content)
+PermissionError: [Errno 13] Permission denied: 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails\\_exports\\collect_att_20260224_092225\\images'
