@@ -1,7 +1,23 @@
-import subprocess
+import subprocess, os, textwrap, tempfile
+from pathlib import Path
 
-p = subprocess.run(["winget", "list"], capture_output=True, text=True)
+log = Path(tempfile.gettempdir()) / "winget_tesseract_install.log"
+
+cmd = [
+    "winget","install",
+    "--id","UB-Mannheim.TesseractOCR",
+    "-e",
+    "--accept-source-agreements",
+    "--accept-package-agreements",
+    "--disable-interactivity",
+    "--verbose",
+    "--log", str(log),
+]
+p = subprocess.run(cmd, capture_output=True, text=True)
 print("rc:", p.returncode)
-out = (p.stdout or "") + "\n" + (p.stderr or "")
-hits = [line for line in out.splitlines() if "tesseract" in line.lower()]
-print("hits:", hits[:50])
+print("stdout:\n", (p.stdout or "")[:2000])
+print("stderr:\n", (p.stderr or "")[:2000])
+print("\nlog path:", log)
+if log.exists():
+    print("\n=== LOG TAIL ===")
+    print(log.read_text(errors="ignore")[-4000:])
