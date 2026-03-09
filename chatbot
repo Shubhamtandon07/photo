@@ -1,3 +1,73 @@
 C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Birgit
 C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Athanasia RSS
 C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus
+
+# QUICK CHECK: are image files discoverable + is OCR working?
+# Run this in the SAME notebook/session (uses your existing folders & read_image_ocr if present).
+
+from pathlib import Path
+import os
+
+# --- set these to your folders (same as in your bot) ---
+KB_DIR_MAIN = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Test Data"
+KB_DIR_EXPORTS = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails\_exports\collect_att_20260224_092225"
+KB_DIRS = [KB_DIR_MAIN, KB_DIR_EXPORTS]
+
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
+MAX_SAMPLES = 5
+MIN_CHARS_USEFUL = 20
+
+def find_images(kb_dirs):
+    imgs = []
+    for d in kb_dirs:
+        base = Path(d)
+        if not base.exists():
+            print("Missing folder:", d)
+            continue
+        imgs.extend([p for p in base.rglob("*") if p.is_file() and p.suffix.lower() in IMG_EXTS])
+    return sorted(imgs)
+
+imgs = find_images(KB_DIRS)
+print("Images found:", len(imgs))
+if not imgs:
+    raise SystemExit("No images found in KB_DIRS (check paths).")
+
+# --- Check OCR deps ---
+try:
+    from PIL import Image  # noqa
+    import pytesseract  # noqa
+    OCR_DEPS_OK = True
+except Exception as e:
+    OCR_DEPS_OK = False
+    print("\nOCR deps missing:", repr(e))
+    print("Install (user): python -m pip install --user pillow pytesseract")
+    print("Also ensure Tesseract is installed on Windows and on PATH.\n")
+
+# --- OCR test on a few images ---
+if OCR_DEPS_OK:
+    import pytesseract
+    from PIL import Image
+
+    nonempty = 0
+    useful = 0
+
+    for p in imgs[:MAX_SAMPLES]:
+        try:
+            txt = pytesseract.image_to_string(Image.open(str(p)), lang="eng")
+            txt = " ".join((txt or "").split())
+            if txt:
+                nonempty += 1
+            if len(txt) >= MIN_CHARS_USEFUL:
+                useful += 1
+
+            print(f"\n[{p.name}]")
+            print("path:", p)
+            print("ocr chars:", len(txt))
+            print("preview:", repr(txt[:250]))
+        except Exception as e:
+            print(f"\n[{p.name}] OCR ERROR:", repr(e))
+
+    print("\n=== OCR SUMMARY (sample) ===")
+    print("sampled:", min(MAX_SAMPLES, len(imgs)))
+    print("nonempty:", nonempty)
+    print("useful (>= %d chars):" % MIN_CHARS_USEFUL, useful)
