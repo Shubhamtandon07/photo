@@ -26,3 +26,6 @@ for r in roots:
 
 print("Hits:", hits[:30])
 print("Total hits found (capped):", len(hits))
+
+Hits: []
+Total hits found (capped): 0
