@@ -1,1 +1,1 @@
--NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "py -m papermill \"C:\Users\SHTANDO\Chatbotcode.ipynb\" \"C:\Users\SHTANDO\Chatbotcode__run.ipynb\""
+C:\Users\SHTANDO
