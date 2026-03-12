@@ -1,10 +1,4 @@
-import sys, subprocess
-
-print("Python:", sys.version)
-print("Executable:", sys.executable)
-
-p = subprocess.run(["py", "--version"], capture_output=True, text=True)
-print("py --version:", p.stdout.strip() or p.stderr.strip())
-
-p = subprocess.run(["py", "-m", "pip", "--version"], capture_output=True, text=True)
-print("pip:", p.stdout.strip() or p.stderr.strip())
+@echo off
+py -m pip install --user -q papermill
+py -m papermill "C:\PATH\TO\your_notebook.ipynb" "C:\PATH\TO\_runs\run_output.ipynb"
+pause
