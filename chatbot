@@ -1,4 +1,22 @@
-@echo off
-py -m pip install --user -q papermill
-py -m papermill "C:\PATH\TO\your_notebook.ipynb" "C:\PATH\TO\_runs\run_output.ipynb"
-pause
+import os, json
+from pathlib import Path
+
+def print_notebook_path():
+    # 1) Jupyter / VSCode usually exposes this
+    nb_path = os.environ.get("JPY_NOTEBOOK_PATH") or os.environ.get("NOTEBOOK_PATH")
+    if nb_path and Path(nb_path).exists():
+        print("Notebook path (env):", str(Path(nb_path).resolve()))
+        return
+
+    # 2) VS Code Jupyter often provides a runtime file, but not always.
+    # Fallback: list likely .ipynb files in current working dir tree and show best guess.
+    cwd = Path.cwd()
+    ipynbs = list(cwd.rglob("*.ipynb"))
+    print("Current working directory:", str(cwd.resolve()))
+    print("Found .ipynb under cwd:", len(ipynbs))
+    for p in ipynbs[:20]:
+        print(" -", str(p.resolve()))
+    print("\nIf the notebook file isn't in this list, it means your cwd is different.")
+    print("Tip: in VS Code, open the notebook file, right click its tab -> 'Copy Path' (if available).")
+
+print_notebook_path()
