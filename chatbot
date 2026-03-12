@@ -1,1 +1,466 @@
-C:\Users\SHTANDO
+# -*- coding: utf-8 -*-
+r"""
+MAIL-CHAIN SUMMARIZER (MSG + PDFs + PNG/JPG) — Notebook-safe, Python 3.14
+========================================================================
+
+What it does
+- Recursively scans these folders:
+  1) ...\Available data\Mails
+  2) ...\Available data\Mails Rasmus
+  3) ...\Available data\Mails Birgit
+- For each .msg:
+  - Extracts Subject + Body (tries to split the chain into messages)
+  - Re-orders so the OLDEST message is treated as the “first message” (bottom of chain)
+  - Extracts text from attached PDFs (either embedded in .msg OR nearby exported PDFs in folders)
+  - Extracts image text/meaning from attached images:
+      Option A (recommended): Vision LLM (if you have a vision deployment)
+      Option B (fallback): OCR via pytesseract (only if you have it installed & working)
+
+- Then creates ONE combined summary of ALL conversations:
+  - <= 2500 words (hard cap enforced)
+  - Bullet points + headings
+  - Includes: recurring questions, decisions/answers, requirements, open points, owners (if present), deadlines (if present)
+
+Dependencies
+- pip install --user extract-msg openai
+- Optional: pip install --user pdfplumber pypdf pillow pytesseract
+
+IMPORTANT NOTES
+- If you do NOT have a vision-capable deployment name, leave VISION_DEPLOYMENT=None.
+- If you do have a vision deployment, set VISION_DEPLOYMENT to that deployment name.
+
+Outputs
+- Writes a markdown summary file to OUTPUT_DIR, plus a small JSON stats file.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import json
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
+
+# ====== CONFIG ======
+MAIL_DIRS = [
+    r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails",
+    r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus",
+    r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Birgit",
+]
+
+OUTPUT_DIR = Path(r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\new data\mail_summaries")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# LLM (for summarization)
+# Uses your existing env var:
+# os.environ["OPENAI_API_KEY"] = "..."
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"
+AZURE_API_VERSION = "2024-06-01"
+TEXT_MODEL_DEPLOYMENT = "gpt-5.1"
+
+# Vision (optional). Set to your vision-capable deployment name if you have one.
+VISION_DEPLOYMENT: Optional[str] = None  # e.g. "gpt-4o-vision" / "gpt-4.1-vision" / your Nexus vision deployment
+
+# Summary constraints
+MAX_SUMMARY_WORDS = 2500
+
+# How many mails to process (safety cap)
+MAX_MSG_FILES = 5000
+MAX_TEXT_CHARS_PER_MSG = 250_000
+
+# Evidence caps (avoid giant prompts)
+MAX_COMBINED_INPUT_CHARS = 450_000  # total text passed into summarizer LLM
+MAX_PDF_CHARS_PER_FILE = 80_000
+MAX_IMAGE_DESC_CHARS = 2_000
+
+# Nearby exported attachments (if your folder also contains loose pdf/png next to msg)
+PDF_EXTS = {".pdf"}
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
+
+# ====== HELPERS ======
+def now_tag() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def safe_read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+def truncate(s: str, n: int) -> str:
+    s = s or ""
+    return s if len(s) <= n else s[:n] + "…"
+
+# Very light PII redaction (keeps meaning but removes emails/phones/URLs)
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
+PHONE_RE = re.compile(r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d")
+def redact_basic(text: str) -> str:
+    t = text or ""
+    t = EMAIL_RE.sub("[EMAIL]", t)
+    t = URL_RE.sub("[URL]", t)
+    t = PHONE_RE.sub("[PHONE]", t)
+    return t
+
+# ====== FILE EXTRACTORS ======
+def extract_pdf_text(pdf_path: Path) -> str:
+    # prefer pdfplumber
+    try:
+        import pdfplumber  # type: ignore
+        out = []
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            for page in pdf.pages:
+                out.append(page.extract_text() or "")
+        return clean_ws("\n".join(out))[:MAX_PDF_CHARS_PER_FILE]
+    except Exception:
+        pass
+
+    # fallback pypdf
+    try:
+        from pypdf import PdfReader  # type: ignore
+        r = PdfReader(str(pdf_path))
+        out = []
+        for pg in r.pages:
+            try:
+                out.append(pg.extract_text() or "")
+            except Exception:
+                pass
+        return clean_ws("\n".join(out))[:MAX_PDF_CHARS_PER_FILE]
+    except Exception:
+        return ""
+
+def try_ocr_image(image_path: Path) -> str:
+    # OCR fallback (only if user has pytesseract working)
+    try:
+        from PIL import Image  # type: ignore
+        import pytesseract  # type: ignore
+    except Exception:
+        return ""
+    try:
+        txt = pytesseract.image_to_string(Image.open(str(image_path)), lang="eng")
+        return clean_ws(txt)[:MAX_IMAGE_DESC_CHARS]
+    except Exception:
+        return ""
+
+def vision_describe_image_azure(image_path: Path) -> str:
+    """
+    Uses AzureOpenAI vision if VISION_DEPLOYMENT is set.
+    Returns short description + any text visible.
+    """
+    if not VISION_DEPLOYMENT:
+        return ""
+
+    import base64
+    from openai import AzureOpenAI
+
+    def b64_data_url(p: Path) -> str:
+        raw = p.read_bytes()
+        b64 = base64.b64encode(raw).decode("utf-8")
+        # infer mime
+        ext = p.suffix.lower()
+        mime = "image/png" if ext == ".png" else "image/jpeg"
+        return f"data:{mime};base64,{b64}"
+
+    client = AzureOpenAI(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_version=AZURE_API_VERSION,
+    )
+
+    data_url = b64_data_url(image_path)
+
+    resp = client.chat.completions.create(
+        model=VISION_DEPLOYMENT,
+        temperature=0.0,
+        max_completion_tokens=220,
+        messages=[
+            {"role": "system", "content": "Describe the image briefly and extract any visible text. Keep it concise."},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Describe this image and extract any visible text."},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]},
+        ],
+    )
+    out = (resp.choices[0].message.content or "").strip()
+    return truncate(clean_ws(out), MAX_IMAGE_DESC_CHARS)
+
+# ====== MSG PARSING ======
+def import_extract_msg():
+    try:
+        import extract_msg  # type: ignore
+        return extract_msg
+    except Exception as e:
+        raise RuntimeError(
+            "Missing dependency: extract-msg\n"
+            "Install:  py -m pip install --user extract-msg"
+        ) from e
+
+# Heuristic split of mail chains (German/English)
+CHAIN_SPLIT_RE = re.compile(
+    r"(?im)^(from:|von:|sent:|gesendet:|to:|an:|subject:|betreff:|-----original message-----)\s*.*$"
+)
+
+def split_chain_into_blocks(body_text: str) -> List[str]:
+    """
+    Tries to split a mail chain into blocks. Outlook bodies vary widely; this is best-effort.
+    Returns blocks in the order they appear in the text.
+    """
+    text = (body_text or "").replace("\r\n", "\n")
+    lines = text.split("\n")
+
+    blocks: List[List[str]] = []
+    current: List[str] = []
+    for ln in lines:
+        if CHAIN_SPLIT_RE.match(ln.strip()):
+            if current:
+                blocks.append(current)
+                current = []
+        current.append(ln)
+
+    if current:
+        blocks.append(current)
+
+    # join, cleanup
+    out = []
+    for b in blocks:
+        s = clean_ws("\n".join(b))
+        if len(s) >= 20:
+            out.append(s)
+    return out
+
+def parse_msg_file(msg_path: Path) -> Dict:
+    extract_msg = import_extract_msg()
+    m = extract_msg.Message(str(msg_path))
+
+    subject = clean_ws(getattr(m, "subject", "") or "")
+    # Prefer plain body, fallback HTML stripped
+    body = getattr(m, "body", None) or ""
+    if not body:
+        body = getattr(m, "htmlBody", None) or ""
+        body = re.sub(r"<[^>]+>", " ", body, flags=re.S)
+    body = body or ""
+    body = body[:MAX_TEXT_CHARS_PER_MSG]
+    body = redact_basic(body)
+
+    blocks = split_chain_into_blocks(body)
+
+    # We want: first message from bottom of chain => “oldest first”
+    # In most Outlook chains, the oldest message is at the bottom => reverse blocks for chronological order.
+    # (Best-effort; if not correct, still yields a coherent sequence.)
+    blocks_chrono = list(reversed(blocks)) if len(blocks) >= 2 else blocks
+
+    # Attachments inside .msg (optional)
+    embedded_pdfs: List[Tuple[str, str]] = []
+    embedded_imgs: List[Tuple[str, str]] = []
+
+    try:
+        atts = getattr(m, "attachments", []) or []
+        for att in atts:
+            fname = getattr(att, "longFilename", None) or getattr(att, "shortFilename", None) or "attachment"
+            ext = Path(fname).suffix.lower()
+            data = getattr(att, "data", None)
+            if not data:
+                continue
+
+            if ext in PDF_EXTS:
+                # write temp and extract
+                tmp = OUTPUT_DIR / "_tmp_att"
+                tmp.mkdir(parents=True, exist_ok=True)
+                outp = tmp / f"{msg_path.stem}__{Path(fname).name}"
+                outp.write_bytes(data)
+                txt = extract_pdf_text(outp)
+                if txt:
+                    embedded_pdfs.append((Path(fname).name, txt))
+            elif ext in IMG_EXTS:
+                tmp = OUTPUT_DIR / "_tmp_att"
+                tmp.mkdir(parents=True, exist_ok=True)
+                outp = tmp / f"{msg_path.stem}__{Path(fname).name}"
+                outp.write_bytes(data)
+                desc = vision_describe_image_azure(outp) or try_ocr_image(outp)
+                if desc:
+                    embedded_imgs.append((Path(fname).name, desc))
+    except Exception:
+        pass
+
+    return {
+        "path": str(msg_path),
+        "subject": subject,
+        "blocks_chrono": blocks_chrono,
+        "embedded_pdfs": embedded_pdfs,
+        "embedded_imgs": embedded_imgs,
+    }
+
+# ====== SCANNING ======
+def find_files(base_dirs: List[str]) -> Tuple[List[Path], List[Path], List[Path]]:
+    msg_files: List[Path] = []
+    pdf_files: List[Path] = []
+    img_files: List[Path] = []
+
+    for d in base_dirs:
+        base = Path(d)
+        if not base.exists():
+            print("Missing folder:", d)
+            continue
+
+        for p in base.rglob("*"):
+            if not p.is_file():
+                continue
+            ext = p.suffix.lower()
+            if ext == ".msg":
+                msg_files.append(p)
+            elif ext in PDF_EXTS:
+                pdf_files.append(p)
+            elif ext in IMG_EXTS:
+                img_files.append(p)
+
+    msg_files = sorted(msg_files)[:MAX_MSG_FILES]
+    return msg_files, pdf_files, img_files
+
+# ====== LLM SUMMARY ======
+def build_text_client():
+    from openai import AzureOpenAI
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise SystemExit("OPENAI_API_KEY missing in this session.")
+    return AzureOpenAI(
+        api_key=key,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_version=AZURE_API_VERSION,
+    )
+
+def hard_cap_words(text: str, max_words: int) -> str:
+    words = (text or "").split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words]) + " …"
+
+def summarize_all(conversations_blob: str) -> str:
+    """
+    Single summary of all conversations.
+    """
+    client = build_text_client()
+
+    prompt = f"""
+You are summarizing many corporate email conversations.
+
+Rules:
+- Output MUST be <= {MAX_SUMMARY_WORDS} words.
+- Prefer bullet points with clear headings.
+- Focus on substantive content only (requirements, decisions, answers, actions, open issues).
+- Ignore greetings/thanks/delegations unless they change responsibilities or decisions.
+- Keep it neutral and factual.
+- Do NOT output personal data (emails, phones, addresses). If present, omit it.
+- If multiple topics exist, group by topic.
+
+Input:
+{conversations_blob}
+""".strip()
+
+    resp = client.chat.completions.create(
+        model=TEXT_MODEL_DEPLOYMENT,
+        temperature=0.1,
+        max_completion_tokens=1400,
+        messages=[
+            {"role": "system", "content": "You produce concise, structured summaries that follow all rules."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    out = (resp.choices[0].message.content or "").strip()
+    return hard_cap_words(out, MAX_SUMMARY_WORDS)
+
+# ====== MAIN PIPELINE ======
+def build_conversations_blob(msg_parsed: List[Dict], loose_pdfs: List[Path], loose_imgs: List[Path]) -> str:
+    """
+    Build one big input text for summarizer LLM.
+    Priority:
+    - .msg bodies (chronological blocks)
+    - embedded pdf/image extracts from msg
+    - loose pdf/image extracts (if any)
+    """
+    parts: List[str] = []
+
+    # MSG content
+    for i, m in enumerate(msg_parsed, start=1):
+        subj = m.get("subject") or "(no subject)"
+        parts.append(f"=== CONVERSATION {i}: {subj} ===")
+
+        blocks = m.get("blocks_chrono") or []
+        # Keep only first N blocks if giant
+        for j, b in enumerate(blocks[:12], start=1):
+            parts.append(f"[Message {j} (chronological)] {truncate(b, 9000)}")
+
+        # embedded pdf snippets
+        for fname, txt in (m.get("embedded_pdfs") or [])[:6]:
+            parts.append(f"[Embedded PDF: {fname}] {truncate(txt, 5000)}")
+
+        # embedded image interpretations
+        for fname, desc in (m.get("embedded_imgs") or [])[:8]:
+            parts.append(f"[Embedded Image: {fname}] {truncate(desc, 1200)}")
+
+        parts.append("")  # spacer
+
+    # Loose PDFs (optional, only a few to avoid exploding)
+    for p in loose_pdfs[:40]:
+        t = extract_pdf_text(p)
+        if t:
+            parts.append(f"=== LOOSE PDF: {p.name} ===\n{truncate(t, 6000)}\n")
+
+    # Loose images (optional, only a few)
+    for p in loose_imgs[:40]:
+        desc = vision_describe_image_azure(p) or try_ocr_image(p)
+        if desc:
+            parts.append(f"=== LOOSE IMAGE: {p.name} ===\n{truncate(desc, 1200)}\n")
+
+    blob = "\n".join(parts)
+    blob = blob[:MAX_COMBINED_INPUT_CHARS]
+    return blob
+
+def run_summary():
+    msg_files, pdf_files, img_files = find_files(MAIL_DIRS)
+    print("Found .msg:", len(msg_files))
+    print("Found loose PDFs:", len(pdf_files))
+    print("Found loose images:", len(img_files))
+    print("Vision enabled:", bool(VISION_DEPLOYMENT))
+
+    # Parse MSGs
+    parsed: List[Dict] = []
+    for idx, p in enumerate(msg_files, start=1):
+        try:
+            d = parse_msg_file(p)
+            parsed.append(d)
+        except Exception as e:
+            print("MSG parse failed:", p, "->", repr(e))
+        if idx % 50 == 0:
+            print("Parsed:", idx)
+
+    blob = build_conversations_blob(parsed, pdf_files, img_files)
+    print("Combined input chars to summarizer:", len(blob))
+
+    summary = summarize_all(blob)
+
+    out_md = OUTPUT_DIR / f"mail_conversations_summary_{now_tag()}.md"
+    out_json = OUTPUT_DIR / f"mail_conversations_summary_{now_tag()}.json"
+
+    out_md.write_text(summary, encoding="utf-8")
+    stats = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "folders": MAIL_DIRS,
+        "msg_count": len(msg_files),
+        "parsed_msg_count": len(parsed),
+        "loose_pdf_count": len(pdf_files),
+        "loose_img_count": len(img_files),
+        "vision_enabled": bool(VISION_DEPLOYMENT),
+        "input_chars": len(blob),
+        "output_words": len(summary.split()),
+        "output_file": str(out_md),
+    }
+    out_json.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print("\nDONE")
+    print("Summary file:", out_md)
+    print("Stats file:", out_json)
+    return summary, stats
+
+# Run:
+# summary, stats = run_summary()
