@@ -1,22 +1,465 @@
----------------------------------------------------------------------------
-RuntimeError                              Traceback (most recent call last)
-Cell In[22], line 505
-    501     return summary, stats
-    504 # --- RUN (one-liner) ---
---> 505 summary, stats = run_summary()
-    506 summary[:1200]  # preview
+# -*- coding: utf-8 -*-
+r"""
+MAIL CHAINS -> ONE SUMMARY (DOCX + HTML + PDF) — Single-cell, notebook-friendly
+=============================================================================
 
-Cell In[22], line 462, in run_summary()
-    459 failures_log.write_text("\n".join(failures) if failures else "(none)", encoding="utf-8")
-    461 client = build_client()
---> 462 summary = map_reduce_summary(client, combined)
-    464 out_docx = OUT_DIR / f"mail_conversations_summary_{ts}.docx"
-    465 out_html = OUT_DIR / f"mail_conversations_summary_{ts}.html"
+Fix in this version:
+- Final reduce step no longer crashes if it returns empty.
+- It retries with smaller combined text and if still empty, falls back to a stitched summary.
 
-Cell In[22], line 359, in map_reduce_summary(client, full_text)
-    357 final = llm_summarize(client, final_prompt, max_completion_tokens=1200).strip()
-    358 if not final:
---> 359     raise RuntimeError("Final reduce step returned empty.")
-    360 return final
+Outputs:
+- DOCX + HTML + (optional) PDF + stats JSON + failures log
 
-RuntimeError: Final reduce step returned empty.
+Requirements:
+- OPENAI_API_KEY set in env (already in your notebook)
+- extract-msg installed for .msg parsing (recommended)
+- python-docx installed for docx output
+- reportlab optional for PDF output
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple
+
+from openai import AzureOpenAI
+
+# =========================
+# CONFIG
+# =========================
+MAIL_DIRS = [
+    r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails",
+    r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus",
+    r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Birgit",
+]
+
+OUT_DIR = Path(
+    r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\new data\mail_summaries"
+)
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# LLM (your Nexus)
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-5.1"
+
+# Limits
+MAX_MSG_FILES = 600
+MAX_PDF_FILES = 250
+MAX_IMG_FILES = 0              # keep 0 unless you enable local OCR
+MAX_CHARS_PER_ITEM = 30_000
+MAX_COMBINED_CHARS = 900_000
+
+CHUNK_SIZE = 28_000
+CHUNK_SIZE_RETRY = 16_000
+
+MAX_FINAL_WORDS = 2500
+
+# Local OCR disabled here (tesseract issues). Keep False.
+LOCAL_OCR_IMAGES = False
+
+# =========================
+# UTILS
+# =========================
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def now_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# =========================
+# FILTER HARDENING
+# =========================
+JAILBREAK_PATTERNS = [
+    r"\bignore (all|any|previous) instructions\b",
+    r"\bdisregard (all|any|previous) instructions\b",
+    r"\b(system prompt|developer message|hidden prompt)\b",
+    r"\byou are (now )?(chatgpt|an ai|a language model)\b",
+    r"\bact as\b",
+    r"\bjailbreak\b",
+    r"\bdo anything now\b",
+    r"\bdan\b",
+    r"\brole\s*:\s*(system|developer)\b",
+]
+JAILBREAK_RE = re.compile("|".join(JAILBREAK_PATTERNS), flags=re.IGNORECASE)
+
+EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+PHONE_RE = re.compile(r"(?:(?:\+|00)\d{1,3}[\s\-]?)?(?:\(?\d{2,5}\)?[\s\-]?)?\d[\d\s\-]{6,}\d")
+URL_RE = re.compile(r"\bhttps?://[^\s<>()]+\b", re.I)
+IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b", re.I)
+
+def sanitize_for_llm(text: str) -> str:
+    if not text:
+        return ""
+    # Remove jailbreak-like lines
+    lines = text.splitlines()
+    kept = []
+    for ln in lines:
+        if JAILBREAK_RE.search(ln):
+            continue
+        kept.append(ln)
+    t = "\n".join(kept)
+
+    # Redact basic PII patterns
+    t = EMAIL_RE.sub("[EMAIL]", t)
+    t = PHONE_RE.sub("[PHONE]", t)
+    t = URL_RE.sub("[URL]", t)
+    t = IBAN_RE.sub("[IBAN]", t)
+
+    t = t.replace("\x00", " ")
+    return t.strip()
+
+# =========================
+# FILE DISCOVERY
+# =========================
+MSG_EXT = {".msg"}
+PDF_EXT = {".pdf"}
+IMG_EXT = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
+
+def find_files(root_dirs: List[str], exts: set[str], cap: int) -> List[Path]:
+    out: List[Path] = []
+    for d in root_dirs:
+        base = Path(d)
+        if not base.exists():
+            continue
+        for p in base.rglob("*"):
+            if p.is_file() and p.suffix.lower() in exts:
+                out.append(p)
+                if len(out) >= cap:
+                    return sorted(out)
+    out.sort(key=lambda x: (x.name.lower(), str(x.parent).lower()))
+    return out
+
+# =========================
+# PARSERS
+# =========================
+def read_msg_extract(p: Path) -> Tuple[bool, str]:
+    try:
+        import extract_msg  # type: ignore
+    except Exception as e:
+        return (False, f"[MSG PARSE SKIP] extract_msg missing: {repr(e)}")
+
+    try:
+        m = extract_msg.Message(str(p))
+        subj = clean_ws(getattr(m, "subject", "") or "")
+        body = getattr(m, "body", None) or ""
+        if not body:
+            hb = getattr(m, "htmlBody", None) or ""
+            hb = re.sub(r"<[^>]+>", " ", hb, flags=re.S)
+            body = hb
+
+        body = (body or "").replace("\r\n", "\n").strip()
+
+        parts = []
+        if subj:
+            parts.append(f"Subject: {subj}")
+        if body:
+            parts.append(body)
+
+        txt = "\n\n".join(parts).strip()
+        return (True, txt[:MAX_CHARS_PER_ITEM])
+    except Exception as e:
+        return (False, f"[MSG PARSE FAIL] {p.name}: {repr(e)}")
+
+HEADER_SPLIT_RE = re.compile(
+    r"(?im)^\s*(from|von|sent|gesendet|to|an|cc|bcc|subject|betreff)\s*:\s*.*$"
+)
+
+def reorder_oldest_first(thread_text: str) -> str:
+    if not thread_text:
+        return ""
+
+    t = thread_text.replace("\r\n", "\n")
+    lines = t.splitlines()
+    blocks: List[List[str]] = []
+    cur: List[str] = []
+
+    for ln in lines:
+        if HEADER_SPLIT_RE.match(ln) and cur:
+            blocks.append(cur)
+            cur = [ln]
+        else:
+            cur.append(ln)
+    if cur:
+        blocks.append(cur)
+
+    if len(blocks) <= 1:
+        return t.strip()
+
+    blocks = list(reversed(blocks))
+    out = "\n".join("\n".join(b).strip() for b in blocks if "\n".join(b).strip())
+    return out.strip()
+
+def read_pdf_text(p: Path) -> Tuple[bool, str]:
+    try:
+        import pdfplumber  # type: ignore
+        out = []
+        with pdfplumber.open(str(p)) as pdf:
+            for page in pdf.pages[:40]:
+                out.append(page.extract_text() or "")
+        txt = "\n".join(out).strip()
+        return (True, txt[:MAX_CHARS_PER_ITEM])
+    except Exception:
+        pass
+
+    try:
+        from pypdf import PdfReader  # type: ignore
+        r = PdfReader(str(p))
+        out = []
+        for pg in r.pages[:40]:
+            out.append((pg.extract_text() or ""))
+        txt = "\n".join(out).strip()
+        return (True, txt[:MAX_CHARS_PER_ITEM])
+    except Exception as e:
+        return (False, f"[PDF PARSE FAIL] {p.name}: {repr(e)}")
+
+# =========================
+# LLM
+# =========================
+def build_client() -> AzureOpenAI:
+    k = os.getenv("OPENAI_API_KEY", "").strip()
+    if not k:
+        raise RuntimeError("OPENAI_API_KEY missing in environment")
+    return AzureOpenAI(api_key=k, azure_endpoint=AZURE_OPENAI_ENDPOINT, api_version=AZURE_API_VERSION)
+
+def llm_summarize(client: AzureOpenAI, prompt: str, max_completion_tokens: int) -> str:
+    try:
+        resp = client.chat.completions.create(
+            model=AZURE_DEPLOYMENT_NAME,
+            temperature=0.1,
+            max_completion_tokens=max_completion_tokens,
+            messages=[
+                {"role": "system", "content": "You summarize corporate email discussions. Do not output personal data."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        out = resp.choices[0].message.content or ""
+        return out.strip()
+    except Exception:
+        return ""
+
+def chunk_text(text: str, chunk_size: int) -> List[str]:
+    if not text:
+        return []
+    return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+def summarize_chunk(client: AzureOpenAI, chunk: str, idx: int, total: int) -> str:
+    safe = sanitize_for_llm(chunk)
+    prompt = (
+        "Summarize IMPORTANT content from these email conversations.\n"
+        "Ignore greetings, thanks, forwarding, scheduling, and delegation.\n"
+        "Extract only:\n"
+        "- key questions (buyers/suppliers)\n"
+        "- the answers/decisions\n"
+        "- requirements, deadlines, platforms, templates\n"
+        "- open points / follow-ups\n"
+        "Return bullet points only. Keep it factual. Do not include personal data.\n\n"
+        f"CHUNK {idx}/{total}:\n{safe}"
+    )
+    s = llm_summarize(client, prompt, max_completion_tokens=700)
+    if s:
+        return s
+
+    safe2 = safe[:CHUNK_SIZE_RETRY]
+    prompt2 = (
+        "Extract the key requirements + answers from the text below.\n"
+        "Bullets only. No personal data.\n\n"
+        f"CHUNK {idx}/{total} (retry):\n{safe2}"
+    )
+    s2 = llm_summarize(client, prompt2, max_completion_tokens=600)
+    return s2.strip()
+
+def map_reduce_summary(client: AzureOpenAI, full_text: str) -> str:
+    safe_full = sanitize_for_llm(full_text)[:MAX_COMBINED_CHARS]
+    chunks = chunk_text(safe_full, CHUNK_SIZE)
+    print(f"Chunks: {len(chunks)} | first chunk chars: {len(chunks[0]) if chunks else 0}")
+
+    partials: List[str] = []
+    for idx, ch in enumerate(chunks, start=1):
+        s = summarize_chunk(client, ch, idx, len(chunks))
+        print(f"chunk {idx}/{len(chunks)} -> summary chars:", len(s))
+        if s:
+            partials.append(s)
+
+    if not partials:
+        raise RuntimeError("All map summaries returned empty (likely content filter).")
+
+    # ---- FINAL REDUCE with retries ----
+    def _final_reduce(combined_text: str, label: str) -> str:
+        final_prompt = (
+            f"Combine these partial summaries into ONE coherent summary under {MAX_FINAL_WORDS} words.\n"
+            "Structure:\n"
+            "- Major themes\n"
+            "- Repeated buyer/supplier questions\n"
+            "- Our standard answers/positions\n"
+            "- Requirements & deadlines\n"
+            "- Open points\n"
+            "Use bullet points where helpful. Do not include personal data.\n\n"
+            f"{combined_text}"
+        )
+        out = llm_summarize(client, final_prompt, max_completion_tokens=1200).strip()
+        print(f"final reduce [{label}] -> chars:", len(out))
+        return out
+
+    combined = "\n\n".join(partials).strip()
+    combined = sanitize_for_llm(combined)
+
+    # Attempt 1: full combined
+    final = _final_reduce(combined, "full")
+    if final:
+        return final
+
+    # Attempt 2: only top 10 partials
+    top10 = "\n\n".join(partials[:10]).strip()
+    top10 = sanitize_for_llm(top10)
+    final = _final_reduce(top10, "top10")
+    if final:
+        return final
+
+    # Attempt 3: hard truncate combined to 60k chars
+    trunc = sanitize_for_llm(combined[:60_000])
+    final = _final_reduce(trunc, "trunc60k")
+    if final:
+        return final
+
+    # Fallback: stitched summary (still useful, no crash)
+    stitched = (
+        "Summary (stitched fallback):\n"
+        "- The final consolidation step returned empty repeatedly.\n"
+        "- Below are the extracted key points by chunk summaries (already cleaned):\n\n"
+        + "\n\n".join(partials[:20])
+    )
+    return stitched[:120_000]
+
+# =========================
+# OUTPUT WRITERS
+# =========================
+def write_docx(text: str, out_path: Path):
+    from docx import Document  # type: ignore
+    doc = Document()
+    for para in (text or "").split("\n"):
+        doc.add_paragraph(para)
+    doc.save(str(out_path))
+
+def write_html(text: str, out_path: Path):
+    html = "<html><head><meta charset='utf-8'></head><body>"
+    html += "<pre style='white-space:pre-wrap;font-family:Segoe UI, Arial; font-size:12pt;'>"
+    html += (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += "</pre></body></html>"
+    out_path.write_text(html, encoding="utf-8")
+
+def write_pdf(text: str, out_path: Path):
+    try:
+        from reportlab.lib.pagesizes import A4  # type: ignore
+        from reportlab.pdfgen import canvas  # type: ignore
+    except Exception:
+        print("PDF skipped: reportlab not installed.")
+        return
+
+    c = canvas.Canvas(str(out_path), pagesize=A4)
+    width, height = A4
+    x = 40
+    y = height - 50
+    line_h = 14
+
+    for line in (text or "").splitlines():
+        if y < 60:
+            c.showPage()
+            y = height - 50
+        c.drawString(x, y, line[:140])
+        y -= line_h
+
+    c.save()
+
+# =========================
+# MAIN
+# =========================
+def run_summary():
+    print("OPENAI_API_KEY present:", bool(os.getenv("OPENAI_API_KEY")), "len:", len(os.getenv("OPENAI_API_KEY","")))
+
+    msg_files = find_files(MAIL_DIRS, MSG_EXT, cap=MAX_MSG_FILES)
+    pdf_files = find_files(MAIL_DIRS, PDF_EXT, cap=MAX_PDF_FILES)
+
+    print("Found .msg:", len(msg_files))
+    print("Found loose PDFs:", len(pdf_files))
+    print("Local OCR images:", LOCAL_OCR_IMAGES)
+
+    failures: List[str] = []
+    parsed_ok = 0
+    items_text: List[str] = []
+
+    for p in msg_files:
+        ok, txt = read_msg_extract(p)
+        if ok:
+            parsed_ok += 1
+            txt = reorder_oldest_first(txt)
+            txt = txt[:MAX_CHARS_PER_ITEM]
+            items_text.append(f"\n\n=== MSG: {p.name} ===\n{txt}\n")
+        else:
+            failures.append(txt)
+
+    for p in pdf_files:
+        ok, txt = read_pdf_text(p)
+        if ok and txt.strip():
+            items_text.append(f"\n\n=== PDF: {p.name} ===\n{txt}\n")
+        elif not ok:
+            failures.append(txt)
+
+    combined = "\n".join(items_text)
+    combined = combined[:MAX_COMBINED_CHARS]
+    print("\nParsed OK:", parsed_ok, "| Failed:", len(failures))
+    print("Combined chars:", len(combined))
+
+    ts = now_stamp()
+    failures_log = OUT_DIR / f"parse_failures_{ts}.txt"
+    failures_log.write_text("\n".join(failures) if failures else "(none)", encoding="utf-8")
+
+    client = build_client()
+    summary = map_reduce_summary(client, combined)
+
+    out_docx = OUT_DIR / f"mail_conversations_summary_{ts}.docx"
+    out_html = OUT_DIR / f"mail_conversations_summary_{ts}.html"
+    out_pdf  = OUT_DIR / f"mail_conversations_summary_{ts}.pdf"
+    out_json = OUT_DIR / f"mail_conversations_summary_{ts}.json"
+
+    write_docx(summary, out_docx)
+    write_html(summary, out_html)
+    write_pdf(summary, out_pdf)
+
+    stats = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "folders": MAIL_DIRS,
+        "msg_found": len(msg_files),
+        "msg_parsed_ok": parsed_ok,
+        "msg_failed": len(failures),
+        "loose_pdf_count": len(pdf_files),
+        "local_ocr_images": LOCAL_OCR_IMAGES,
+        "combined_chars": len(combined),
+        "output_words_est": len(summary.split()),
+        "files": {
+            "docx": str(out_docx),
+            "html": str(out_html),
+            "pdf": str(out_pdf),
+            "stats_json": str(out_json),
+            "failures_log": str(failures_log),
+        },
+    }
+    out_json.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print("\nDONE")
+    print("DOCX:", out_docx)
+    print("HTML:", out_html)
+    print("PDF :", out_pdf)
+    print("STATS:", out_json)
+    print("FAIL :", failures_log)
+
+    return summary, stats
+
+
+# ---- RUN ----
+summary, stats = run_summary()
+summary[:1200]
