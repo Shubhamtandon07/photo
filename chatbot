@@ -1,8 +1,35 @@
-import sys
-!"{sys.executable}" -m pip install --user reportlab
+Found .msg: 126
+Found loose PDFs: 39
+Found loose images: 295
+Vision enabled: False
+Processed: 100
 
-import importlib.util
-print("extract_msg available:", importlib.util.find_spec("extract_msg") is not None)
+Parsed OK: 125
+Failed: 1
+Failures log: C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\new data\mail_summaries\parse_failures_20260313_131718.txt
+Combined input chars to summarizer: 450000
 
-import sys
-!"{sys.executable}" -m pip install --user extract-msg
+DONE
+DOCX: C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\new data\mail_summaries\mail_conversations_summary_20260313_131718.docx
+HTML: C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\new data\mail_summaries\mail_conversations_summary_20260313_131718.html
+PDF : C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\new data\mail_summaries\mail_conversations_summary_20260313_131718.pdf
+
+('',
+ {'timestamp': '2026-03-13T13:18:39',
+  'folders': ['C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails',
+   'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Rasmus',
+   'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\Mails Birgit'],
+  'msg_found': 126,
+  'msg_parsed_ok': 125,
+  'msg_failed': 1,
+  'loose_pdf_count': 39,
+  'loose_img_count': 295,
+  'vision_enabled': False,
+  'input_chars': 450000,
+  'output_words': 0,
+  'files': {'md': 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\new data\\mail_summaries\\mail_conversations_summary_20260313_131718.md',
+   'html': 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\new data\\mail_summaries\\mail_conversations_summary_20260313_131718.html',
+   'docx': 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\new data\\mail_summaries\\mail_conversations_summary_20260313_131718.docx',
+   'pdf': 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\new data\\mail_summaries\\mail_conversations_summary_20260313_131718.pdf',
+   'stats_json': 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\new data\\mail_summaries\\mail_conversations_summary_20260313_131718.json',
+   'failures_log': 'C:\\Users\\SHTANDO\\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\\DWT_MP_RM1 - Dokumente\\Project Chatbot\\Available data\\new data\\mail_summaries\\parse_failures_20260313_131718.txt'}})
