@@ -1,21 +1,12 @@
-Chunks: 0 | first chunk chars: 0
+from pathlib import Path
 
----------------------------------------------------------------------------
-RuntimeError                              Traceback (most recent call last)
-Cell In[16], line 7
-      4 text = Path(md_path).read_text(encoding="utf-8", errors="ignore")
-      6 # If md currently contains only headings, this will produce a tiny summary or fail — that’s expected.
-----> 7 final_summary = map_reduce_summary(text)
-      8 print("\nFINAL SUMMARY chars:", len(final_summary))
-      9 print(final_summary[:1200])
+md_path = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\new data\mail_summaries\mail_conversations_summary_20260313_131718.md"
+p = Path(md_path)
 
-Cell In[15], line 85, in map_reduce_summary(full_text)
-     79 final = llm_summarize(
-     80     "Combine these partial summaries into ONE coherent summary under 2500 words.\n\n" + combined,
-     81     max_completion_tokens=1200
-     82 ).strip()
-     84 if not final:
----> 85     raise RuntimeError("Final reduce step returned empty.")
-     86 return final
+print("exists:", p.exists())
+print("size bytes:", p.stat().st_size if p.exists() else None)
 
-RuntimeError: Final reduce step returned empty.
+txt = p.read_text(encoding="utf-8", errors="ignore") if p.exists() else ""
+print("len chars:", len(txt))
+print("first 400:", repr(txt[:400]))
+print("tail 400:", repr(txt[-400:]))
