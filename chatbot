@@ -1,5 +1,247 @@
-exists: True
-size bytes: 0
-len chars: 0
-first 400: ''
-tail 400: ''
+# ONE-CELL NOTEBOOK: summarize all .msg conversations into DOCX + HTML + PDF (<= ~2500 words)
+# - Reads .msg from your 3 folders (Mails, Mails Rasmus, Mails Birgit)
+# - Ignores greetings/chatter, extracts real Q/A + requirements + decisions
+# - Uses your Nexus AzureOpenAI (gpt-5.1) via OPENAI_API_KEY env var
+# - Writes outputs into: ...\Available data\new data\mail_summaries\
+#
+# Prereqs:
+#   py -m pip install --user openai extract-msg python-docx reportlab
+#   (You already have openai; reportlab/docx might already be installed now.)
+
+from __future__ import annotations
+
+import os, re
+from pathlib import Path
+from datetime import datetime
+from typing import List
+
+from openai import AzureOpenAI
+
+# -------------------------
+# CONFIG
+# -------------------------
+MAIL_DIRS = [
+    r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails",
+    r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Rasmus",
+    r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\Mails Birgit",
+]
+
+OUT_DIR = Path(r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\new data\mail_summaries")
+
+LIMIT_MSG = 200                 # increase if needed (e.g., 500)
+CHUNK_SIZE_CHARS = 55_000       # keep under gateway limits
+MAX_FINAL_WORDS = 2500          # target
+
+# Nexus / AzureOpenAI
+AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"
+AZURE_API_VERSION = "2024-06-01"
+AZURE_DEPLOYMENT_NAME = "gpt-5.1"
+
+# -------------------------
+# HELPERS
+# -------------------------
+def clean_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+def find_msg_files(mail_dirs: List[str]) -> List[Path]:
+    files: List[Path] = []
+    for d in mail_dirs:
+        base = Path(d)
+        if not base.exists():
+            print("Missing folder:", d)
+            continue
+        files.extend(sorted(base.rglob("*.msg")))
+    return files
+
+def read_msg_extract_msg(path: Path) -> str:
+    import extract_msg  # type: ignore
+    m = extract_msg.Message(str(path))
+    subj = clean_ws(getattr(m, "subject", "") or "")
+    body = getattr(m, "body", None) or ""
+    if not body:
+        body = getattr(m, "htmlBody", None) or ""
+        body = re.sub(r"<[^>]+>", " ", body, flags=re.S)
+    body = clean_ws(body)
+    parts = []
+    if subj:
+        parts.append(f"SUBJECT: {subj}")
+    if body:
+        parts.append(body)
+    return "\n".join(parts).strip()
+
+def build_combined_text(msg_paths: List[Path], limit_msgs: int) -> tuple[str, dict]:
+    ok, fail = 0, 0
+    combined_parts = []
+    failures = []
+    for p in msg_paths[:limit_msgs]:
+        try:
+            t = read_msg_extract_msg(p)
+            if t:
+                combined_parts.append(f"\n\n=== FILE: {p.name} ===\n{t}\n")
+                ok += 1
+            else:
+                fail += 1
+                failures.append(f"{p} :: empty")
+        except Exception as e:
+            fail += 1
+            failures.append(f"{p} :: {repr(e)}")
+
+    combined = "\n".join(combined_parts)
+    stats = {
+        "msg_found": len(msg_paths),
+        "msg_used": min(limit_msgs, len(msg_paths)),
+        "parsed_ok": ok,
+        "failed": fail,
+        "combined_chars": len(combined),
+        "failures": failures[:50],  # cap
+    }
+    return combined, stats
+
+def chunk_text(text: str, chunk_size: int) -> List[str]:
+    text = text or ""
+    if not text.strip():
+        return []
+    return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+def build_client() -> AzureOpenAI:
+    key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY env var missing in this notebook session.")
+    return AzureOpenAI(api_key=key, azure_endpoint=AZURE_OPENAI_ENDPOINT, api_version=AZURE_API_VERSION)
+
+def llm_summarize(client: AzureOpenAI, prompt: str, max_completion_tokens: int) -> str:
+    resp = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+        temperature=0.1,
+        max_completion_tokens=max_completion_tokens,
+        messages=[
+            {"role": "system", "content": "You are a precise summarizer. Do not include personal data."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    out = resp.choices[0].message.content or ""
+    return out.strip()
+
+def map_reduce_summary(client: AzureOpenAI, full_text: str) -> str:
+    chunks = chunk_text(full_text, CHUNK_SIZE_CHARS)
+    print("Chunks:", len(chunks), "| first chunk chars:", len(chunks[0]) if chunks else 0)
+    if not chunks:
+        raise RuntimeError("No input text to summarize (combined_text is empty).")
+
+    partials = []
+    for idx, ch in enumerate(chunks, start=1):
+        prompt = (
+            "Summarize IMPORTANT content from these email conversations.\n"
+            "Ignore greetings, thanking, forwarding, delegation, meeting scheduling, and small talk.\n"
+            "Extract:\n"
+            "- recurring buyer/supplier questions\n"
+            "- the actual answers/decisions\n"
+            "- key requirements, deadlines, platforms/templates, and document references\n"
+            "- open points / unclear items\n"
+            "Use bullet points and group by theme.\n\n"
+            f"CHUNK {idx}/{len(chunks)}:\n{ch}"
+        )
+        s = llm_summarize(client, prompt, max_completion_tokens=900)
+        if s:
+            partials.append(s)
+
+    combined = "\n\n".join(partials).strip()
+    if not combined:
+        raise RuntimeError("All map summaries returned empty.")
+
+    final_prompt = (
+        f"Combine these partial summaries into ONE coherent summary under {MAX_FINAL_WORDS} words.\n"
+        "Output structure:\n"
+        "- Top recurring questions (buyer/supplier)\n"
+        "- Key answers/decisions\n"
+        "- Key requirements + deadlines + platforms/templates\n"
+        "- Open points / unclear items\n"
+        "Use bullet points. Do not include personal data.\n\n"
+        f"{combined}"
+    )
+    final = llm_summarize(client, final_prompt, max_completion_tokens=1200)
+    if not final:
+        raise RuntimeError("Final reduce step returned empty.")
+    return final
+
+def write_docx(text: str, path: Path):
+    from docx import Document  # type: ignore
+    doc = Document()
+    for line in (text or "").splitlines():
+        doc.add_paragraph(line)
+    doc.save(str(path))
+
+def write_html(text: str, path: Path):
+    lines = (text or "").splitlines()
+    html = [
+        "<html><meta charset='utf-8'><body style='font-family:Segoe UI, Arial; white-space:pre-wrap'>",
+        "<h2>Mail Conversations Summary</h2>",
+        "\n".join(lines),
+        "</body></html>",
+    ]
+    path.write_text("\n".join(html), encoding="utf-8")
+
+def write_pdf(text: str, path: Path):
+    from reportlab.lib.pagesizes import A4  # type: ignore
+    from reportlab.pdfgen import canvas      # type: ignore
+    from reportlab.lib.units import mm       # type: ignore
+
+    c = canvas.Canvas(str(path), pagesize=A4)
+    width, height = A4
+    x = 15 * mm
+    y = height - 20 * mm
+    line_h = 5 * mm
+
+    c.setFont("Helvetica", 10)
+    c.drawString(x, y, "Mail Conversations Summary")
+    y -= 2 * line_h
+
+    for raw in (text or "").splitlines():
+        line = (raw or "").replace("\t", "    ")
+        while len(line) > 110:
+            c.drawString(x, y, line[:110])
+            line = line[110:]
+            y -= line_h
+            if y < 20 * mm:
+                c.showPage()
+                c.setFont("Helvetica", 10)
+                y = height - 20 * mm
+        c.drawString(x, y, line)
+        y -= line_h
+        if y < 20 * mm:
+            c.showPage()
+            c.setFont("Helvetica", 10)
+            y = height - 20 * mm
+    c.save()
+
+# -------------------------
+# RUN
+# -------------------------
+print("OPENAI_API_KEY present:", bool(os.getenv("OPENAI_API_KEY")), "len:", len(os.getenv("OPENAI_API_KEY","")))
+
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+msg_files = find_msg_files(MAIL_DIRS)
+print("Found .msg:", len(msg_files))
+
+combined_text, stats = build_combined_text(msg_files, LIMIT_MSG)
+print("Parsed OK:", stats["parsed_ok"], "| Failed:", stats["failed"])
+print("Combined chars:", stats["combined_chars"])
+
+client = build_client()
+final_summary = map_reduce_summary(client, combined_text)
+
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+out_docx = OUT_DIR / f"mail_conversations_summary_{ts}.docx"
+out_html = OUT_DIR / f"mail_conversations_summary_{ts}.html"
+out_pdf  = OUT_DIR / f"mail_conversations_summary_{ts}.pdf"
+
+write_docx(final_summary, out_docx)
+write_html(final_summary, out_html)
+write_pdf(final_summary, out_pdf)
+
+print("\nDONE")
+print("DOCX:", out_docx)
+print("HTML:", out_html)
+print("PDF :", out_pdf)
+print("\nPreview:\n", final_summary[:1200])
