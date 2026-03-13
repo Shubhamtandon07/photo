@@ -1,86 +1,9 @@
-import re
-from openai import AzureOpenAI
-import os
+from pathlib import Path
 
-AZURE_OPENAI_ENDPOINT = "https://genai-nexus.api.corpinter.net"
-AZURE_API_VERSION = "2024-06-01"
-AZURE_DEPLOYMENT_NAME = "gpt-5.1"
+md_path = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\new data\mail_summaries\mail_conversations_summary_20260313_131718.md"
+text = Path(md_path).read_text(encoding="utf-8", errors="ignore")
 
-client = AzureOpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_version=AZURE_API_VERSION,
-)
-
-def _clean(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
-
-def chunk_text(text: str, chunk_chars: int = 12000) -> list[str]:
-    text = text or ""
-    # split on blank lines first to keep email blocks together
-    blocks = re.split(r"\n\s*\n", text)
-    chunks, cur = [], ""
-    for b in blocks:
-        b = b.strip()
-        if not b:
-            continue
-        if len(cur) + len(b) + 2 <= chunk_chars:
-            cur = (cur + "\n\n" + b).strip()
-        else:
-            if cur:
-                chunks.append(cur)
-            cur = b
-    if cur:
-        chunks.append(cur)
-    return chunks
-
-def llm_summarize(text: str, max_completion_tokens: int = 900) -> str:
-    prompt = f"""
-Summarize the following Mercedes-Benz internal email conversations into actionable knowledge.
-
-Rules:
-- Ignore greetings/thanks/delegation chatter unless it changes responsibilities or decisions.
-- Extract: recurring questions from buyers/suppliers, our answers, key requirements, deadlines, templates/platforms, decisions, open points.
-- Use bullet points and short bold headings.
-- Do NOT include personal data (names, emails, phone numbers, addresses, IBAN, IDs).
-- Keep language: English output.
-
-Text:
-{text}
-""".strip()
-
-    resp = client.chat.completions.create(
-        model=AZURE_DEPLOYMENT_NAME,
-        temperature=0.1,
-        max_completion_tokens=max_completion_tokens,
-        messages=[
-            {"role": "system", "content": "You summarize strictly and do not output personal data."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    out = (resp.choices[0].message.content or "").strip()
-    return out
-
-def map_reduce_summary(full_text: str) -> str:
-    chunks = chunk_text(full_text, chunk_chars=12000)
-    print("Chunks:", len(chunks), "| first chunk chars:", len(chunks[0]) if chunks else 0)
-
-    partials = []
-    for i, ch in enumerate(chunks, start=1):
-        s = llm_summarize(ch, max_completion_tokens=700)
-        s = s.strip()
-        print(f"chunk {i}/{len(chunks)} summary chars:", len(s))
-        if not s:
-            # hard fail loud (do not silently continue)
-            raise RuntimeError(f"LLM returned empty on chunk {i}")
-        partials.append(s)
-
-    combined = "\n\n".join(partials)
-    final = llm_summarize(
-        "Combine these partial summaries into ONE coherent summary under 2500 words.\n\n" + combined,
-        max_completion_tokens=1200
-    ).strip()
-
-    if not final:
-        raise RuntimeError("Final reduce step returned empty.")
-    return final
+# If md currently contains only headings, this will produce a tiny summary or fail — that’s expected.
+final_summary = map_reduce_summary(text)
+print("\nFINAL SUMMARY chars:", len(final_summary))
+print(final_summary[:1200])
