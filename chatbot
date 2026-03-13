@@ -1,34 +1,8 @@
-Found .msg: 126
-Found loose PDFs: 39
-Found loose images: 295
-Vision enabled: False
-Processed: 100
+import sys
+!"{sys.executable}" -m pip install --user reportlab
 
-Parsed OK: 0
-Failed: 126
-Failures log: C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\new data\mail_summaries\parse_failures_20260313_130548.txt
-Combined input chars to summarizer: 187372
----------------------------------------------------------------------------
-ModuleNotFoundError                       Traceback (most recent call last)
-Cell In[8], line 1
-----> 1 run_summary()
+import importlib.util
+print("extract_msg available:", importlib.util.find_spec("extract_msg") is not None)
 
-Cell In[6], line 516, in run_summary()
-    513 write_docx(summary, out_docx)
-    515 # Save PDF
---> 516 write_pdf(summary, out_pdf)
-    518 stats = {
-    519     "timestamp": datetime.now().isoformat(timespec="seconds"),
-    520     "folders": MAIL_DIRS,
-   (...)    536     },
-    537 }
-    538 out_stats.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
-
-Cell In[6], line 434, in write_pdf(summary, out_path)
-    432 def write_pdf(summary: str, out_path: Path):
-    433     # simple PDF renderer (no fancy formatting)
---> 434     from reportlab.lib.pagesizes import A4  # type: ignore
-    435     from reportlab.pdfgen import canvas  # type: ignore
-    437     c = canvas.Canvas(str(out_path), pagesize=A4)
-
-ModuleNotFoundError: No module named 'reportlab'
+import sys
+!"{sys.executable}" -m pip install --user extract-msg
