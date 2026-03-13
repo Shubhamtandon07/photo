@@ -1,12 +1,5 @@
-from pathlib import Path
-
-md_path = r"C:\Users\SHTANDO\OneDrive - Mercedes-Benz (corpdir.onmicrosoft.com)\DWT_MP_RM1 - Dokumente\Project Chatbot\Available data\new data\mail_summaries\mail_conversations_summary_20260313_131718.md"
-p = Path(md_path)
-
-print("exists:", p.exists())
-print("size bytes:", p.stat().st_size if p.exists() else None)
-
-txt = p.read_text(encoding="utf-8", errors="ignore") if p.exists() else ""
-print("len chars:", len(txt))
-print("first 400:", repr(txt[:400]))
-print("tail 400:", repr(txt[-400:]))
+exists: True
+size bytes: 0
+len chars: 0
+first 400: ''
+tail 400: ''
